@@ -4,64 +4,70 @@
 // Module: bram_dma_ip (bram_dma_ip.v)
 //
 // Description:
-//   Store-and-Forward BRAM Hardware Accelerator with Memory-Mapped DMA Ingress,
-//   Hardware Doorbell Trigger Detection, Full 32-bit On-the-Fly CRC-32 Checking,
-//   Dedicated Status Register, and AXI-Stream S2MM Egress.
+//   Store-and-Forward BRAM Hardware Accelerator with AXI4-Stream DMA Ingress,
+//   Dedicated AXI4-Lite Control & Status Register (CSR) Space, Full 32-bit
+//   On-the-Fly CRC-32 Verification, and AXI4-Stream S2MM Egress.
 //
-// Memory Map (4 KB / 1024 words):
-//   - 0x000 - 0xFF4 (Words 0 .. 1021) : BRAM Data Buffer (Payload: up to 4088 bytes)
-//   - 0xFF8         (Word 1022)       : IP_STATUS_REG (Read-Only)
-//                                       Bit [0]   : ip_done_irq (Interrupt wire state)
-//                                       Bits [4:1]: state (Current FSM state)
-//                                       Bit [5]   : crc_err (1 = CRC mismatch)
-//                                       Bits [31:6]: Reserved (26'b0)
-//   - 0xFFC         (Word 1023)       : EXPECTED_CRC / CALC_CRC (R/W)
-//                                       Write: Configures expected_crc[31:0]
-//                                              (Write 0x0 to bypass CRC check; in S_DONE_IRQ/S_WAIT_EGRESS acts as reset)
-//                                       Read : Returns FULL 32-bit calculated crc_accum
+// AXI4-Lite Control & Status Register Map (Byte Offsets):
+//   - 0x00 (Word 0) : TRIGGER_ADDR      (Write-Only)
+//                     Write: Forces FSM reset/abort back to S_IDLE when in
+//                            S_DONE_IRQ or S_WAIT_EGRESS.
+//   - 0x04 (Word 1) : STATUS_ADDR       (R/W)
+//                     Read : Bit [0]    = ip_done_irq (Interrupt wire state)
+//                            Bits [4:1] = state (Current FSM state)
+//                            Bit [5]    = crc_err (1 = CRC mismatch)
+//                            Bits [31:6]= Reserved (26'b0)
+//                     Write: In S_IDLE       -> Bit [0]=1 triggers manual compute
+//                            In S_DONE_IRQ   -> Acknowledges & clears ip_done_irq
+//                            In S_WAIT_EGRESS-> Kicks M_AXIS S2MM egress stream
+//   - 0x08 (Word 2) : COMPUTE_CTRL_ADDR (R/W)
+//                     Read/Write: 32-bit compute configuration register (ctrl_reg)
+//   - 0x0C (Word 3) : EXPECTED_CRC_ADDR (R/W)
+//                     Write: Configures expected_crc[31:0] (0x0 bypasses check)
+//                     Read : Returns full 32-bit calculated crc_accum[31:0]
 //
 // Architecture & Workflow:
-//   1. Memory-Mapped Slave (S_AXI) & Streaming Slave (S_AXIS):
-//      - DMA MM2S streams payload data into BRAM Port A words [0 .. 1021].
-//      - As words arrive, on-the-fly CRC-32 accumulator updates each beat.
-//      - CPU writes expected_crc to EXPECTED_CRC (0x0FFC) before/during ingress.
-//      - Packet completion is signaled by s_axis_tlast (or writing 1 to STATUS_ADDR for manual CPU mode).
+//   1. AXI4-Lite Control Plane (S_AXI) & AXI4-Stream Data Plane (S_AXIS):
+//      - CPU pre-programs expected_crc at EXPECTED_CRC_ADDR (0x0C) via S_AXI.
+//      - DMA MM2S streams payload data directly into BRAM Port A words [0 .. 1023].
+//      - As words arrive on S_AXIS, on-the-fly CRC-32 accumulator updates each beat.
+//      - Packet completion is signaled by s_axis_tlast (or full BRAM_DEPTH), or
+//        manually triggered by writing bit 0 to STATUS_ADDR (0x04).
 //
-//   2. Hardware Trigger & CRC Verification (S_CHECK_CRC):
-//      - Triggered automatically on s_axis_tlast (DMA) or status_write with bit 0 (CPU).
+//   2. CRC Verification (S_CHECK_CRC):
 //      - If (crc_accum == expected_crc) or (expected_crc == 0):
 //          CRC PASSED -> Moves to S_COMP_READ to begin processing.
 //      - If (crc_accum != expected_crc):
 //          CRC FAILED -> Sets crc_err = 1, aborts compute, and raises ip_done_irq
 //          to alert PS of corrupted ingress buffer.
 //
-//   3. Dual-Port BRAM (Inferred RAMB36E1 Block RAM):
-//      - Port A: Dedicated to external AXI bus (writes from DMA / reads from CPU).
-//      - Port B: Dedicated to internal compute engine and M_AXIS egress streaming.
+//   3. Dual-Port BRAM (Inferred RAMB36E1 Block RAM, 4 KB / 1024 words):
+//      - Port A: Dedicated exclusively to S_AXIS MM2S streaming DMA ingress.
+//      - Port B: Dedicated to internal compute engine and M_AXIS S2MM egress.
 //
 //   4. Compute Engine:
 //      - Iterates across BRAM data in-place over Port B.
 //      - Modifies words and writes back responses.
 //
 //   5. Interrupt & Egress (M_AXIS to S2MM DMA):
-//      - Upon compute completion (or CRC error), asserts Level-High interrupt `ip_done_irq`.
-//      - When PS primes S2MM DMA, `m_axis_tready` asserts.
-//      - IP automatically deasserts `ip_done_irq` and streams out processed
-//        results onto M_AXIS with proper TLAST framing on the final word.
+//      - Upon compute completion (or CRC error), asserts Level-High `ip_done_irq`.
+//      - Driver ISR writes to STATUS_ADDR (0x04) to acknowledge and clear IRQ.
+//      - Driver read() primes S2MM DMA and writes to STATUS_ADDR (0x04) to kick
+//        M_AXIS egress streaming with TLAST asserted on the final word.
 // =============================================================================
 
 module bram_dma_ip #(
-    parameter integer DATA_WIDTH   = 32,
-    parameter integer BRAM_DEPTH   = 1024,   // 1024 words = 4096 bytes (4 KB)
-    parameter integer ADDR_WIDTH   = 10,     // 2^10 = 1024 words
-    parameter integer CFG_DEPTH    = 256,     // 256 words (configuration space)
+    parameter integer DATA_WIDTH     = 32,
+    parameter integer BRAM_DEPTH     = 1024, // 1024 words = 4096 bytes (4 KB)
+    parameter integer ADDR_WIDTH     = 10,   // 2^10 = 1024 words
+    parameter integer CFG_DEPTH      = 256,  // 256 words (configuration space)
     parameter integer CFG_ADDR_WIDTH = 8     // 2^8 = 256 words (configuration space)
 )(
     input  wire                      clk,
     input  wire                      rst_n,
 
     // -------------------------------------------------------------------------
-    // 1. AXI4-Lite / AXI4 Memory-Mapped Slave (BRAM Window: 0x000 - 0xFFC)
+    // 1. AXI4-Lite Memory-Mapped Slave (Control & Status Registers)
     // -------------------------------------------------------------------------
     input  wire [CFG_ADDR_WIDTH+1:0] s_axi_awaddr,
     input  wire                      s_axi_awvalid,
@@ -107,23 +113,23 @@ module bram_dma_ip #(
 );
 
     // =========================================================================
-    // Address Map Constants
+    // Address Map Constants (Word Indices: s_axi_a*addr[CFG_ADDR_WIDTH+1:2])
     // =========================================================================
-    localparam [CFG_ADDR_WIDTH-1:0] TRIGGER_ADDR = 8'h0;
-    localparam [CFG_ADDR_WIDTH-1:0] STATUS_ADDR = 8'h1;
-    localparam [CFG_ADDR_WIDTH-1:0] COMPUTE_CTRL_ADDR = 8'h2;
-    localparam [CFG_ADDR_WIDTH-1:0] EXPECTED_CRC_ADDR = 8'h3;
+    localparam [CFG_ADDR_WIDTH-1:0] TRIGGER_ADDR      = 8'h0; // Byte offset 0x00
+    localparam [CFG_ADDR_WIDTH-1:0] STATUS_ADDR       = 8'h1; // Byte offset 0x04
+    localparam [CFG_ADDR_WIDTH-1:0] COMPUTE_CTRL_ADDR = 8'h2; // Byte offset 0x08
+    localparam [CFG_ADDR_WIDTH-1:0] EXPECTED_CRC_ADDR = 8'h3; // Byte offset 0x0C
 
-    reg [31:0] ctrl_reg;
-    reg status_write_pulse;
-    reg trigger_detected;
+    reg [DATA_WIDTH-1:0] ctrl_reg;
+    reg                  status_write_pulse;
+    reg                  trigger_detected;
     reg [DATA_WIDTH-1:0] status_write_data;
 
     // =========================================================================
     // FSM State Definitions
     // =========================================================================
     localparam [3:0]
-        S_IDLE        = 4'd0, // Awaiting write to TRIGGER_ADDR
+        S_IDLE        = 4'd0, // Awaiting S_AXIS stream ingress or manual CPU start
         S_CHECK_CRC   = 4'd1, // Validate CRC accumulator against expected CRC
         S_COMP_READ   = 4'd2, // Read BRAM word for compute
         S_COMP_WAIT   = 4'd3, // Multi-cycle processing delay
@@ -138,16 +144,16 @@ module bram_dma_ip #(
 
     // =========================================================================
     // Dual-Port Inferred Block RAM (1024 x 32-bit = 4 KB)
-    // Port A: Servicing Memory-Mapped AXI writes/reads (DMA / CPU)
-    // Port B: Servicing Internal Compute and Egress Stream (M_AXIS)
+    // Port A: Servicing AXI-Stream MM2S Ingress (DMA -> BRAM)
+    // Port B: Servicing Internal Compute and Egress Stream (M_AXIS -> DMA)
     // =========================================================================
     (* ram_style = "block" *) reg [DATA_WIDTH-1:0] bram [0:BRAM_DEPTH-1];
 
-    // AXI-Stream Ingress signals (from AXI DMA MM2S)
-    reg  [ADDR_WIDTH-1:0]     rx_ptr;
+    // Port A: AXI-Stream Ingress signals (from AXI DMA MM2S)
+    reg  [ADDR_WIDTH-1:0] rx_ptr;
     assign s_axis_tready = (state == S_IDLE);
-    wire                      rx_handshake = s_axis_tvalid && s_axis_tready;
-    wire                      axis_wr      = rx_handshake && (state == S_IDLE);
+    wire                  rx_handshake = s_axis_tvalid && s_axis_tready;
+    wire                  axis_wr      = rx_handshake && (state == S_IDLE);
 
     always @(posedge clk) begin
         if (axis_wr) begin
@@ -155,17 +161,16 @@ module bram_dma_ip #(
         end
     end
 
-    // Port B signals
+    // Port B: Internal Compute Engine and M_AXIS Egress signals
     reg  [ADDR_WIDTH-1:0] portb_addr;
     reg  [DATA_WIDTH-1:0] portb_din;
     reg                   portb_we;
     reg  [DATA_WIDTH-1:0] portb_dout;
 
-    // Port B Servicing Internal Compute Engine and M_AXIS Egress
     always @(posedge clk) begin
         if (portb_we) begin
             bram[portb_addr] <= portb_din;
-        end 
+        end
         portb_dout <= bram[portb_addr];
     end
 
@@ -188,7 +193,7 @@ module bram_dma_ip #(
     reg        crc_err;
 
     // =========================================================================
-    // AXI Slave Write Channel, Trigger Detection & On-the-Fly CRC
+    // AXI4-Lite Slave Write Channel (Control & Status Registers)
     // =========================================================================
     assign s_axi_bresp = 2'b00; // OKAY
     assign s_axi_rresp = 2'b00; // OKAY
@@ -197,17 +202,17 @@ module bram_dma_ip #(
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            s_axi_awready    <= 1'b0;
-            s_axi_wready     <= 1'b0;
-            s_axi_bvalid     <= 1'b0;
-            ctrl_reg          <= 32'h0;
-            expected_crc     <= 32'h0;
+            s_axi_awready      <= 1'b0;
+            s_axi_wready       <= 1'b0;
+            s_axi_bvalid       <= 1'b0;
+            ctrl_reg           <= 32'h0;
+            expected_crc       <= 32'h0;
             status_write_pulse <= 1'b0;
             status_write_data  <= 32'h0;
-            trigger_detected <= 1'b0;
+            trigger_detected   <= 1'b0;
         end else begin
             status_write_pulse <= 1'b0;
-            trigger_detected <= 1'b0;
+            trigger_detected   <= 1'b0;
 
             if (reg_wr_fire) begin
                 s_axi_awready <= 1'b1;
@@ -235,16 +240,14 @@ module bram_dma_ip #(
                 s_axi_wready  <= 1'b0;
             end
 
-
-            // 4. Write Response Handshake
+            // Write response handshake
             if (s_axi_bvalid && s_axi_bready) begin
                 s_axi_bvalid <= 1'b0;
             end
         end
     end
 
-
-    // CRC Calcultation on the fly
+    // On-the-Fly CRC-32 Accumulation on S_AXIS Ingress
     always @(posedge clk) begin
         if (!rst_n) begin
             crc_accum <= 32'hFFFFFFFF;
@@ -257,18 +260,17 @@ module bram_dma_ip #(
     end
 
     // =========================================================================
-    // AXI Slave Read Channel: Separated Full 32-bit CRC & Status Registers
+    // AXI4-Lite Slave Read Channel (Control & Status Registers)
     // =========================================================================
     always @(posedge clk) begin
         if (!rst_n) begin
-            s_axi_arready   <= 1'b0;
-            s_axi_rvalid    <= 1'b0;
-            s_axi_rdata     <= 32'd0;
+            s_axi_arready <= 1'b0;
+            s_axi_rvalid  <= 1'b0;
+            s_axi_rdata   <= 32'd0;
         end else begin
             if (!s_axi_arready && s_axi_arvalid && !s_axi_rvalid) begin
                 s_axi_arready <= 1'b1;
-                s_axi_rdata    <= 32'd0;
-                s_axi_rvalid   <= 1'b1;
+                s_axi_rvalid  <= 1'b1;
                 case (s_axi_araddr[CFG_ADDR_WIDTH+1:2])
                     STATUS_ADDR: begin
                         s_axi_rdata <= {26'd0, crc_err, state, ip_done_irq};
@@ -302,7 +304,6 @@ module bram_dma_ip #(
     reg [ADDR_WIDTH:0] pkt_len;
     reg [15:0]         work_timer;
 
-
     assign m_axis_tkeep = {(DATA_WIDTH/8){1'b1}};
     wire   tx_handshake = m_axis_tvalid && m_axis_tready;
 
@@ -327,7 +328,7 @@ module bram_dma_ip #(
 
             case (state)
                 // -------------------------------------------------------------
-                // 1. IDLE: Wait for DMA stream (MM2S) or CPU write to land on TRIGGER_ADDR
+                // 1. IDLE: Wait for DMA stream (MM2S) or manual CPU start
                 // -------------------------------------------------------------
                 S_IDLE: begin
                     m_axis_tvalid <= 1'b0;
@@ -345,8 +346,9 @@ module bram_dma_ip #(
                             rx_ptr   <= rx_ptr + 1'b1;
                         end
                     end
+                    // Manual Software Start from CPU (write bit 0 to STATUS_ADDR 0x04):
                     else if (status_write_pulse && status_write_data[0]) begin
-                        pkt_len  <= BRAM_DEPTH; // CPU-triggered compute: Assume full buffer length
+                        pkt_len  <= BRAM_DEPTH; // Process full buffer length
                         comp_ptr <= 0;
                         rx_ptr   <= 0;
                         state    <= S_CHECK_CRC;
@@ -404,7 +406,7 @@ module bram_dma_ip #(
                 // 4. NOTIFY: Hold interrupt high until PS Kernel driver acks
                 // -------------------------------------------------------------
                 S_DONE_IRQ: begin
-                    // Nominal Path: Driver ISR writes to STATUS_ADDR (0x0FF8) to ACK
+                    // Nominal Path: Driver ISR writes to STATUS_ADDR (0x04) to ACK
                     if (status_write_pulse) begin
                         ip_done_irq <= 1'b0; // Lower interrupt line on CPU ACK
                         if (crc_err) begin
@@ -415,7 +417,7 @@ module bram_dma_ip #(
                             state   <= S_WAIT_EGRESS;
                         end
                     end
-                    // Abort/Reset Path: Driver writes to TRIGGER_ADDR to force reset
+                    // Abort/Reset Path: Driver writes to TRIGGER_ADDR (0x00) to force reset
                     else if (trigger_detected) begin
                         ip_done_irq <= 1'b0;
                         crc_err     <= 1'b0;
@@ -428,12 +430,12 @@ module bram_dma_ip #(
                 // 5. WAIT EGRESS: Wait for Driver read() to prime DMA and kick
                 // -------------------------------------------------------------
                 S_WAIT_EGRESS: begin
-                    // Nominal Path: Driver read() writes to STATUS_ADDR (0x0FF8) to kick egress
+                    // Nominal Path: Driver read() writes to STATUS_ADDR (0x04) to kick egress
                     if (status_write_pulse) begin
                         rd_ptr <= 0;
                         state  <= S_TX_FETCH;
                     end
-                    // Abort/Reset Path: Driver abandons read and forces reset
+                    // Abort/Reset Path: Driver abandons read and forces reset (0x00)
                     else if (trigger_detected) begin
                         rx_ptr <= 0;
                         state  <= S_IDLE;
