@@ -15,21 +15,20 @@
 //                                       Bits [4:1]: state (Current FSM state)
 //                                       Bit [5]   : crc_err (1 = CRC mismatch)
 //                                       Bits [31:6]: Reserved (26'b0)
-//   - 0xFFC         (Word 1023)       : DOORBELL_CRC_REG (R/W)
-//                                       Write: Arms trigger, passes expected_crc[31:0]
-//                                              (Write 0x0 to bypass CRC check)
+//   - 0xFFC         (Word 1023)       : EXPECTED_CRC / CALC_CRC (R/W)
+//                                       Write: Configures expected_crc[31:0]
+//                                              (Write 0x0 to bypass CRC check; in S_DONE_IRQ/S_WAIT_EGRESS acts as reset)
 //                                       Read : Returns FULL 32-bit calculated crc_accum
 //
 // Architecture & Workflow:
-//   1. Memory-Mapped Slave (S_AXI):
-//      - Exposes 4 KB BRAM address window (0x000 to 0xFFC) directly to DMA / CPU.
-//      - DMA / CPU writes payload data into BRAM words [0 .. 1021].
-//      - As words arrive on Port A, an on-the-fly CRC-32 accumulator updates each beat.
-//      - When DMA / CPU writes to DOORBELL_CRC_REG (0x0FFC / word 1023), the written
-//        word is captured as EXPECTED_CRC (or 0x0 to bypass CRC check).
+//   1. Memory-Mapped Slave (S_AXI) & Streaming Slave (S_AXIS):
+//      - DMA MM2S streams payload data into BRAM Port A words [0 .. 1021].
+//      - As words arrive, on-the-fly CRC-32 accumulator updates each beat.
+//      - CPU writes expected_crc to EXPECTED_CRC (0x0FFC) before/during ingress.
+//      - Packet completion is signaled by s_axis_tlast (or writing 1 to STATUS_ADDR for manual CPU mode).
 //
-//   2. Hardware Doorbell & CRC Verification (S_CHECK_CRC):
-//      - Writing to TRIGGER_ADDR fires `trigger_detected`.
+//   2. Hardware Trigger & CRC Verification (S_CHECK_CRC):
+//      - Triggered automatically on s_axis_tlast (DMA) or status_write with bit 0 (CPU).
 //      - If (crc_accum == expected_crc) or (expected_crc == 0):
 //          CRC PASSED -> Moves to S_COMP_READ to begin processing.
 //      - If (crc_accum != expected_crc):
@@ -407,8 +406,8 @@ module bram_dma_ip #(
                             rx_ptr   <= rx_ptr + 1'b1;
                         end
                     end
-                    // Or Doorbell Trigger from CPU AXI-Lite write:
-                    else if (trigger_detected || trigger_write) begin
+                    // Or Manual Software Doorbell Trigger from CPU (write 1 to STATUS_ADDR 0x0FF8):
+                    else if (status_write && porta_din[0]) begin
                         pkt_len  <= STATUS_ADDR; // Process all payload words [0 .. 1021]
                         comp_ptr <= 0;
                         rx_ptr   <= 0;
