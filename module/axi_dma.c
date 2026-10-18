@@ -170,8 +170,10 @@ static irqreturn_t axi_dma_isr(int irq, void* dev_id) {
             if (ip_status & BRAM_IP_STATUS_CRC_ERR) {
                 u32 calc_crc = ioread32(dev->ip_regs + BRAM_IP_TRIGGER_OFFSET);
                 dev->crc_err = 1;
-                pr_err("axi_dma: IP CRC mismatch! Calc CRC: 0x%08x, Status: 0x%08x\n",
-                       calc_crc, ip_status);
+                pr_err(
+                    "axi_dma: IP CRC mismatch! Calc CRC: 0x%08x, Status: "
+                    "0x%08x\n",
+                    calc_crc, ip_status);
                 /* Reset IP state by writing 0 to trigger offset */
                 iowrite32(0, dev->ip_regs + BRAM_IP_TRIGGER_OFFSET);
             } else {
@@ -239,7 +241,8 @@ static ssize_t axi_dma_read(struct file* file, char __user* buf, size_t count,
     /* 3. Write TAILDESC to prime receiver (asserts m_axis_tready to IP) */
     dma_write(dev, XAXIDMA_S2MM_TAILDESC_OFFSET, (u32)dev->rx_bd_phys);
 
-    /* 4. Kick egress streaming from Custom IP (transitions S_WAIT_EGRESS -> S_TX_FETCH) */
+    /* 4. Kick egress streaming from Custom IP (transitions S_WAIT_EGRESS ->
+     * S_TX_FETCH) */
     if (dev->ip_regs)
         iowrite32(1, dev->ip_regs + BRAM_IP_STATUS_OFFSET);
 
@@ -277,7 +280,8 @@ static ssize_t axi_dma_read(struct file* file, char __user* buf, size_t count,
     return rx_bytes;
 }
 
-/* Ingress transfer: Copy to BRAM -> On-the-fly CRC -> Doorbell Trigger -> Wait for compute */
+/* Ingress transfer: Copy to BRAM -> On-the-fly CRC -> Doorbell Trigger -> Wait
+ * for compute */
 static ssize_t axi_dma_write(struct file* file, const char __user* buf,
                              size_t count, loff_t* ppos) {
     struct axi_dma_dev* dev = file->private_data;
@@ -322,7 +326,8 @@ static ssize_t axi_dma_write(struct file* file, const char __user* buf,
     dev->tx_bd->next_desc = (u32)dev->tx_bd_phys;
     dev->tx_bd->buf_addr = (u32)dev->tx_buf_phys;
     dev->tx_bd->control = (transfer_len & XAXIDMA_BD_CTRL_LENGTH_MASK) |
-                          XAXIDMA_BD_CTRL_TXSOF_MASK | XAXIDMA_BD_CTRL_TXEOF_MASK;
+                          XAXIDMA_BD_CTRL_TXSOF_MASK |
+                          XAXIDMA_BD_CTRL_TXEOF_MASK;
     dev->tx_bd->status = 0;
     wmb();
 
@@ -344,8 +349,9 @@ static ssize_t axi_dma_write(struct file* file, const char __user* buf,
     ret = wait_event_interruptible_timeout(dev->tx_waitq, dev->tx_done != 0,
                                            msecs_to_jiffies(3000));
     if (ret == 0) {
-        pr_err("axi_dma: MM2S TX DMA timed out (DMASR: 0x%08x, BD STS: 0x%08x)\n",
-               dma_read(dev, XAXIDMA_MM2S_DMASR_OFFSET), dev->tx_bd->status);
+        pr_err(
+            "axi_dma: MM2S TX DMA timed out (DMASR: 0x%08x, BD STS: 0x%08x)\n",
+            dma_read(dev, XAXIDMA_MM2S_DMASR_OFFSET), dev->tx_bd->status);
         axi_dma_reset(dev);
         mutex_unlock(&dev->tx_lock);
         return -ETIMEDOUT;
@@ -431,9 +437,11 @@ static int axi_dma_probe(struct platform_device* pdev) {
         }
         dmadev->ip_regs_allocated = false;
     } else {
-        dev_info(dev, "BRAM IP not in DT resource, using static fallback 0x%08x\n",
+        dev_info(dev,
+                 "BRAM IP not in DT resource, using static fallback 0x%08x\n",
                  BRAM_IP_DEFAULT_BASEADDR);
-        dmadev->ip_regs = ioremap(BRAM_IP_DEFAULT_BASEADDR, BRAM_IP_DEFAULT_REG_SIZE);
+        dmadev->ip_regs =
+            ioremap(BRAM_IP_DEFAULT_BASEADDR, BRAM_IP_DEFAULT_REG_SIZE);
         if (!dmadev->ip_regs) {
             dev_err(dev, "failed to ioremap static BRAM IP window\n");
             return -ENOMEM;
@@ -491,11 +499,12 @@ static int axi_dma_probe(struct platform_device* pdev) {
     dmadev->rx_bd = dma_alloc_coherent(dev, sizeof(struct axi_dma_bd),
                                        &dmadev->rx_bd_phys, GFP_KERNEL);
     dmadev->tx_buf = dma_alloc_coherent(dev, XAXIDMA_DEFAULT_BUF_SIZE,
-                                         &dmadev->tx_buf_phys, GFP_KERNEL);
+                                        &dmadev->tx_buf_phys, GFP_KERNEL);
     dmadev->rx_buf = dma_alloc_coherent(dev, XAXIDMA_DEFAULT_BUF_SIZE,
-                                         &dmadev->rx_buf_phys, GFP_KERNEL);
+                                        &dmadev->rx_buf_phys, GFP_KERNEL);
 
-    if (!dmadev->tx_bd || !dmadev->rx_bd || !dmadev->tx_buf || !dmadev->rx_buf) {
+    if (!dmadev->tx_bd || !dmadev->rx_bd || !dmadev->tx_buf ||
+        !dmadev->rx_buf) {
         dev_err(dev, "coherent buffer allocation failed\n");
         ret = -ENOMEM;
         goto err_free_dma_buffers;
@@ -526,16 +535,16 @@ static int axi_dma_probe(struct platform_device* pdev) {
         goto err_cdev_del;
     }
 
-    dmadev->device = device_create(
-        dmadev->class, dev, dmadev->dev_num, NULL, XILINX_DMA_DEV_NAME);
+    dmadev->device = device_create(dmadev->class, dev, dmadev->dev_num, NULL,
+                                   XILINX_DMA_DEV_NAME);
     if (IS_ERR(dmadev->device)) {
         ret = PTR_ERR(dmadev->device);
         goto err_class_destroy;
     }
 
     /* 7. Request Shared IRQs */
-    ret = request_irq(dmadev->rx_virq, axi_dma_isr, IRQF_SHARED,
-                      "axi_dma_rx", dmadev);
+    ret = request_irq(dmadev->rx_virq, axi_dma_isr, IRQF_SHARED, "axi_dma_rx",
+                      dmadev);
     if (ret) {
         dev_err(dev, "failed to request RX IRQ %d\n", dmadev->rx_virq);
         goto err_device_destroy;
@@ -567,7 +576,8 @@ static int axi_dma_probe(struct platform_device* pdev) {
     platform_set_drvdata(pdev, dmadev);
 
     dev_info(dev,
-             "BRAM DMA Accelerator initialized: DMA at 0x%pa, IP at 0x%p (RX IRQ %d, IP IRQ %d)\n",
+             "BRAM DMA Accelerator initialized: DMA at 0x%pa, IP at 0x%p (RX "
+             "IRQ %d, IP IRQ %d)\n",
              &res0->start, dmadev->ip_regs, dmadev->rx_virq, dmadev->ip_virq);
     return 0;
 
@@ -650,18 +660,20 @@ static int axi_dma_remove(struct platform_device* pdev)
 }
 
 static const struct of_device_id axi_dma_of_match[] = {
-    { .compatible = "xlnx,axi-dma-custom", },
-    { /* sentinel */ }
-};
+    {
+        .compatible = "xlnx,axi-dma-custom",
+    },
+    {/* sentinel */}};
 MODULE_DEVICE_TABLE(of, axi_dma_of_match);
 
 static struct platform_driver axi_dma_driver = {
     .probe = axi_dma_probe,
     .remove = axi_dma_remove,
-    .driver = {
-        .name = "axi_dma_custom",
-        .of_match_table = axi_dma_of_match,
-    },
+    .driver =
+        {
+            .name = "axi_dma_custom",
+            .of_match_table = axi_dma_of_match,
+        },
 };
 
 module_platform_driver(axi_dma_driver);
