@@ -1,0 +1,93 @@
+#ifndef _AXI_DMA_H_
+#define _AXI_DMA_H_
+
+#include <linux/types.h>
+#include <linux/ioctl.h>
+
+#define XILINX_DMA_DEV_NAME    "axi_dma_dev"
+#define XILINX_DMA_CLASS_NAME  "axi_dma"
+
+/* AXI DMA Register Space */
+#define XAXIDMA_DEFAULT_BASEADDR  0x40400000
+#define XAXIDMA_DEFAULT_REG_SIZE  0x10000
+
+/* Custom BRAM IP Register Space */
+#define BRAM_IP_DEFAULT_BASEADDR  0x40000000
+#define BRAM_IP_DEFAULT_REG_SIZE  0x1000      /* 4 KB (1024 words) */
+
+/* Interrupt numbers (SPI numbers) */
+#define XAXIDMA_DEFAULT_RX_IRQ    29          /* SPI 29 -> HW IRQ 61 (S2MM) */
+#define XAXIDMA_DEFAULT_TX_IRQ    30          /* SPI 30 -> HW IRQ 62 (MM2S) */
+#define BRAM_IP_DEFAULT_IRQ       31          /* SPI 31 -> HW IRQ 63 (IP Done / Error) */
+
+#define XAXIDMA_DEFAULT_BUF_SIZE  4096
+
+/* BRAM IP Memory Map Constants */
+#define BRAM_IP_STATUS_OFFSET     0x0FF8      /* Read: {crc_err, state, ip_done_irq} */
+#define BRAM_IP_TRIGGER_OFFSET    0x0FFC      /* Write: Doorbell + CRC, Read: 32-bit CRC */
+
+#define BRAM_IP_STATUS_IRQ_MASK   0x00000001
+#define BRAM_IP_STATUS_STATE_MASK 0x0000001E
+#define BRAM_IP_STATUS_CRC_ERR    0x00000020
+
+#define BRAM_IP_MAX_WORDS         1022
+#define BRAM_IP_MAX_BYTES         (BRAM_IP_MAX_WORDS * 4) /* 4088 bytes */
+
+/* Register offsets */
+#define XAXIDMA_MM2S_DMACR_OFFSET      0x00
+#define XAXIDMA_MM2S_DMASR_OFFSET      0x04
+#define XAXIDMA_MM2S_CURDESC_OFFSET    0x08
+#define XAXIDMA_MM2S_TAILDESC_OFFSET   0x10
+
+#define XAXIDMA_S2MM_DMACR_OFFSET      0x30
+#define XAXIDMA_S2MM_DMASR_OFFSET      0x34
+#define XAXIDMA_S2MM_CURDESC_OFFSET    0x38
+#define XAXIDMA_S2MM_TAILDESC_OFFSET   0x40
+
+/* DMACR control bits */
+#define XAXIDMA_CR_RUNSTOP_MASK        0x00000001
+#define XAXIDMA_CR_RESET_MASK          0x00000004
+#define XAXIDMA_CR_IRQ_IOC_MASK        0x00001000
+#define XAXIDMA_CR_IRQ_DLY_MASK        0x00002000
+#define XAXIDMA_CR_IRQ_ERR_MASK        0x00004000
+#define XAXIDMA_CR_IRQ_ALL_MASK        0x00007000
+
+/* DMASR status bits */
+#define XAXIDMA_SR_HALTED_MASK         0x00000001
+#define XAXIDMA_SR_IDLE_MASK           0x00000002
+#define XAXIDMA_SR_SG_INCL_MASK        0x00000008
+#define XAXIDMA_SR_ERR_INTERNAL_MASK   0x00000100
+#define XAXIDMA_SR_ERR_SLAVE_MASK      0x00000200
+#define XAXIDMA_SR_ERR_DECODE_MASK     0x00000400
+#define XAXIDMA_SR_ERR_ALL_MASK        0x00000700
+#define XAXIDMA_SR_IRQ_IOC_MASK        0x00001000
+#define XAXIDMA_SR_IRQ_DLY_MASK        0x00002000
+#define XAXIDMA_SR_IRQ_ERR_MASK        0x00004000
+#define XAXIDMA_SR_IRQ_ALL_MASK        0x00007000
+
+/* Buffer Descriptor (BD) Control & Status bits */
+#define XAXIDMA_BD_CTRL_TXSOF_MASK     0x08000000
+#define XAXIDMA_BD_CTRL_TXEOF_MASK     0x04000000
+#define XAXIDMA_BD_CTRL_LENGTH_MASK    0x007FFFFF
+
+#define XAXIDMA_BD_STS_CMPLT_MASK      0x80000000
+#define XAXIDMA_BD_STS_ERROR_MASK      0x70000000
+#define XAXIDMA_BD_STS_RXSOF_MASK      0x08000000
+#define XAXIDMA_BD_STS_RXEOF_MASK      0x04000000
+#define XAXIDMA_BD_STS_ACTUAL_LEN_MASK 0x007FFFFF
+
+/* AXI DMA SG Buffer Descriptor Structure (64 bytes aligned) */
+struct axi_dma_bd {
+	__u32 next_desc;
+	__u32 next_desc_msb;
+	__u32 buf_addr;
+	__u32 buf_addr_msb;
+	__u32 reserved0;
+	__u32 reserved1;
+	__u32 control;
+	__u32 status;
+	__u32 app[5];
+	__u32 reserved2[3];
+} __aligned(64);
+
+#endif /* _AXI_DMA_H_ */
