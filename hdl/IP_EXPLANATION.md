@@ -93,9 +93,10 @@ The IP exposes a **4 KB (1024 $\times$ 32-bit words)** memory-mapped address spa
   * `0x3`: `S_COMP_WAIT`
   * `0x4`: `S_COMP_WRITE`
   * `0x5`: `S_DONE_IRQ`
-  * `0x6`: `S_TX_FETCH`
-  * `0x7`: `S_TX_WAIT_RAM`
-  * `0x8`: `S_TX_SEND`
+  * `0x6`: `S_WAIT_EGRESS`
+  * `0x7`: `S_TX_FETCH`
+  * `0x8`: `S_TX_WAIT_RAM`
+  * `0x9`: `S_TX_SEND`
 * **Bit [5] (`crc_err`):** `1` = Ingress CRC mismatch detected; compute was aborted.
 * **Bits [31:6]:** Reserved (zeros).
 
@@ -115,13 +116,15 @@ flowchart TD
     
     COMP_WRITE["S_COMP_WRITE (4)<br>• In-place update: bram[comp_ptr] <= f(dout)<br>• portb_we = 1"]
     
-    DONE_IRQ["S_DONE_IRQ (5)<br>• Assert ip_done_irq = 1<br>• Wait for S2MM m_axis_tready<br>• (Or Trigger Ack on CRC error)"]
+    DONE_IRQ["S_DONE_IRQ (5)<br>• Assert ip_done_irq = 1 (Level-High)<br>• Hold until Driver writes ACK to 0x0FF8"]
     
-    TX_FETCH["S_TX_FETCH (6)<br>• portb_addr = rd_ptr<br>• Request BRAM synchronous read"]
+    WAIT_EGRESS["S_WAIT_EGRESS (6)<br>• ip_done_irq = 0<br>• Wait for Driver read() to kick egress (write 0x0FF8)"]
+
+    TX_FETCH["S_TX_FETCH (7)<br>• portb_addr = rd_ptr<br>• Request BRAM synchronous read"]
     
-    TX_WAIT["S_TX_WAIT_RAM (7)<br>• Wait 1 cycle for BRAM latency<br>• portb_dout settles"]
+    TX_WAIT["S_TX_WAIT_RAM (8)<br>• Wait 1 cycle for BRAM latency<br>• portb_dout settles"]
     
-    TX_SEND["S_TX_SEND (8)<br>• Drive m_axis_tdata = portb_dout<br>• Drive m_axis_tvalid = 1<br>• Set m_axis_tlast on final word (1021)"]
+    TX_SEND["S_TX_SEND (9)<br>• Drive m_axis_tdata = portb_dout<br>• Drive m_axis_tvalid = 1<br>• Set m_axis_tlast on final word (1021)"]
 
     IDLE -->|"Write to TRIGGER_ADDR (0xFFC)<br>(trigger_detected == 1)"| CHECK_CRC
     CHECK_CRC -->|"Pass / Bypass"| COMP_READ
@@ -134,9 +137,11 @@ flowchart TD
     COMP_WRITE -->|"comp_ptr < pkt_len - 1<br>(comp_ptr++)"| COMP_READ
     COMP_WRITE -->|"comp_ptr == pkt_len - 1<br>(ip_done_irq <= 1)"| DONE_IRQ
     
-    DONE_IRQ -->|"PS primes S2MM DMA<br>(m_axis_tready == 1)"| TX_FETCH
-    DONE_IRQ -->|"CRC Error Reset<br>(trigger_detected == 1)"| IDLE
+    DONE_IRQ -->|"Driver ISR Acks IRQ<br>(Write to 0x0FF8)"| WAIT_EGRESS
+    DONE_IRQ -->|"CRC Error Reset<br>(Write to 0x0FF8/0xFFC)"| IDLE
     
+    WAIT_EGRESS -->|"Driver read() kicks egress<br>(Write to 0x0FF8)"| TX_FETCH
+
     TX_FETCH --> TX_WAIT
     TX_WAIT --> TX_SEND
     

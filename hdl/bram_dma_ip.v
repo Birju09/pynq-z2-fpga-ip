@@ -111,10 +111,11 @@ module bram_dma_ip #(
         S_COMP_READ   = 4'd2, // Read BRAM word for compute
         S_COMP_WAIT   = 4'd3, // Multi-cycle processing delay
         S_COMP_WRITE  = 4'd4, // Write processed result back to BRAM
-        S_DONE_IRQ    = 4'd5, // Assert interrupt to PS & await RX DMA
-        S_TX_FETCH    = 4'd6, // Fetch word from BRAM for M_AXIS
-        S_TX_WAIT_RAM = 4'd7, // Wait 1 cycle for BRAM synchronous read
-        S_TX_SEND     = 4'd8; // Stream out word to S2MM DMA
+        S_DONE_IRQ    = 4'd5, // Assert interrupt to PS & await Driver IRQ ACK
+        S_WAIT_EGRESS = 4'd6, // Await Driver read kick (write to STATUS_ADDR)
+        S_TX_FETCH    = 4'd7, // Fetch word from BRAM for M_AXIS
+        S_TX_WAIT_RAM = 4'd8, // Wait 1 cycle for BRAM synchronous read
+        S_TX_SEND     = 4'd9; // Stream out word to S2MM DMA
 
     reg [3:0] state;
 
@@ -275,7 +276,12 @@ module bram_dma_ip #(
     // =========================================================================
     // AXI Slave Read Channel: Separated Full 32-bit CRC & Status Registers
     // =========================================================================
-    reg ar_pending;
+    reg [1:0] ar_state;
+
+    // Multiplex read data between internal registers and BRAM
+    wire [31:0] rdata_mux = (porta_read_addr == STATUS_ADDR)  ? {26'b0, crc_err, state, ip_done_irq} :
+                            (porta_read_addr == TRIGGER_ADDR) ? crc_accum :
+                            porta_dout;
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -283,40 +289,41 @@ module bram_dma_ip #(
             s_axi_rvalid    <= 1'b0;
             s_axi_rdata     <= 32'd0;
             porta_read_addr <= 0;
-            ar_pending      <= 1'b0;
+            ar_state        <= 2'd0;
         end else begin
-            if (~s_axi_arready && s_axi_arvalid && ~ar_pending && ~s_axi_rvalid) begin
-                s_axi_arready   <= 1'b1;
-                porta_read_addr <= s_axi_araddr[ADDR_WIDTH+1:2];
-                ar_pending      <= 1'b1;
-            end else begin
-                s_axi_arready <= 1'b0;
-            end
-
-            if (ar_pending) begin
-                s_axi_rvalid <= 1'b1;
-
-                case (porta_read_addr)
-                    // Offset 0xFF8 (Word 1022): Dedicated Status Register
-                    STATUS_ADDR: begin
-                        s_axi_rdata <= {26'b0, crc_err, state, ip_done_irq};
+            case (ar_state)
+                2'd0: begin
+                    // Idle: Accept incoming read address
+                    if (~s_axi_arready && s_axi_arvalid && ~s_axi_rvalid) begin
+                        s_axi_arready   <= 1'b1;
+                        porta_read_addr <= s_axi_araddr[ADDR_WIDTH+1:2];
+                        ar_state        <= 2'd1;
+                    end else begin
+                        s_axi_arready <= 1'b0;
                     end
+                end
 
-                    // Offset 0xFFC (Word 1023): Full 32-bit Accumulated CRC-32!
-                    TRIGGER_ADDR: begin
-                        s_axi_rdata <= crc_accum;
+                2'd1: begin
+                    s_axi_arready <= 1'b0;
+                    // Wait 1 clock cycle: BRAM synchronous read latches into porta_dout
+                    ar_state      <= 2'd2;
+                end
+
+                2'd2: begin
+                    // BRAM memory data is now fully clocked and settled on porta_dout
+                    s_axi_rdata  <= rdata_mux;
+                    s_axi_rvalid <= 1'b1;
+                    ar_state     <= 2'd3;
+                end
+
+                2'd3: begin
+                    // Hold rvalid until master completes the handshake
+                    if (s_axi_rvalid && s_axi_rready) begin
+                        s_axi_rvalid <= 1'b0;
+                        ar_state     <= 2'd0;
                     end
-
-                    // Offsets 0x000 - 0xFF4 (Words 0 .. 1021): Payload Memory
-                    default: begin
-                        s_axi_rdata <= porta_dout;
-                    end
-                endcase
-
-                ar_pending <= 1'b0;
-            end else if (s_axi_rvalid && s_axi_rready) begin
-                s_axi_rvalid <= 1'b0;
-            end
+                end
+            endcase
         end
     end
 
@@ -327,6 +334,9 @@ module bram_dma_ip #(
     reg [ADDR_WIDTH:0] rd_ptr;
     reg [ADDR_WIDTH:0] pkt_len;
     reg [15:0]         work_timer;
+
+    wire status_write  = porta_we && (porta_write_addr == STATUS_ADDR);
+    wire trigger_write = porta_we && (porta_write_addr == TRIGGER_ADDR);
 
     assign m_axis_tkeep = {(DATA_WIDTH/8){1'b1}};
     wire   tx_handshake = m_axis_tvalid && m_axis_tready;
@@ -358,7 +368,7 @@ module bram_dma_ip #(
                     m_axis_tlast  <= 1'b0;
                     ip_done_irq   <= 1'b0;
 
-                    if (trigger_detected) begin
+                    if (trigger_detected || trigger_write) begin
                         pkt_len  <= STATUS_ADDR; // Process all payload words [0 .. 1021]
                         comp_ptr <= 0;
                         state    <= S_CHECK_CRC;
@@ -413,28 +423,36 @@ module bram_dma_ip #(
                 end
 
                 // -------------------------------------------------------------
-                // 4. NOTIFY: Hold interrupt high until PS begins RX DMA
+                // 4. NOTIFY: Hold interrupt high until PS Kernel driver acks
                 // -------------------------------------------------------------
                 S_DONE_IRQ: begin
-                    // If CRC failed, a new trigger write resets to IDLE
-                    if (crc_err) begin
-                        if (trigger_detected) begin
-                            crc_err     <= 1'b0;
-                            ip_done_irq <= 1'b0;
-                            state       <= S_IDLE;
-                        end
-                    end else begin
-                        // Normal Path: When PS starts S2MM DMA, m_axis_tready goes HIGH!
-                        if (m_axis_tready || trigger_detected) begin
-                            ip_done_irq <= 1'b0; // Lower interrupt line
-                            rd_ptr      <= 0;
-                            state       <= S_TX_FETCH;
+                    // Level-High interrupt stays asserted (1'b1) until CPU writes
+                    // to STATUS_ADDR (0x0FF8) or TRIGGER_ADDR (0x0FFC)
+                    if (status_write || trigger_write || trigger_detected) begin
+                        ip_done_irq <= 1'b0; // Lower interrupt line on CPU ACK
+                        if (crc_err) begin
+                            crc_err <= 1'b0;
+                            state   <= S_IDLE;
+                        end else begin
+                            state   <= S_WAIT_EGRESS;
                         end
                     end
                 end
 
                 // -------------------------------------------------------------
-                // 5. EGRESS: Stream processed results from BRAM to S2MM DMA
+                // 5. WAIT EGRESS: Wait for Driver read() to prime DMA and kick
+                // -------------------------------------------------------------
+                S_WAIT_EGRESS: begin
+                    // Driver writes to STATUS_ADDR or TRIGGER_ADDR in axi_dma_read()
+                    // to start the AXI-Stream egress transfer.
+                    if (status_write || trigger_write || trigger_detected) begin
+                        rd_ptr <= 0;
+                        state  <= S_TX_FETCH;
+                    end
+                end
+
+                // -------------------------------------------------------------
+                // 6. EGRESS: Stream processed results from BRAM to S2MM DMA
                 // -------------------------------------------------------------
                 S_TX_FETCH: begin
                     portb_addr <= rd_ptr[ADDR_WIDTH-1:0];
