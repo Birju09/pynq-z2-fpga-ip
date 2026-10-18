@@ -83,7 +83,16 @@ module bram_dma_ip #(
     input  wire                      s_axi_rready,
 
     // -------------------------------------------------------------------------
-    // 2. AXI4-Stream Master (Connected to AXI DMA S2MM: BRAM -> DDR RAM)
+    // 2. AXI4-Stream Slave (Connected to AXI DMA MM2S: DDR RAM -> BRAM)
+    // -------------------------------------------------------------------------
+    input  wire [DATA_WIDTH-1:0]     s_axis_tdata,
+    input  wire [(DATA_WIDTH/8)-1:0] s_axis_tkeep,
+    input  wire                      s_axis_tvalid,
+    output wire                      s_axis_tready,
+    input  wire                      s_axis_tlast,
+
+    // -------------------------------------------------------------------------
+    // 3. AXI4-Stream Master (Connected to AXI DMA S2MM: BRAM -> DDR RAM)
     // -------------------------------------------------------------------------
     output reg  [DATA_WIDTH-1:0]     m_axis_tdata,
     output wire [(DATA_WIDTH/8)-1:0] m_axis_tkeep,
@@ -92,7 +101,7 @@ module bram_dma_ip #(
     output reg                       m_axis_tlast,
 
     // -------------------------------------------------------------------------
-    // 3. Dedicated Level-High Interrupt Wire to PS GIC (IRQ_F2P[2])
+    // 4. Dedicated Level-High Interrupt Wire to PS GIC (IRQ_F2P[2])
     // -------------------------------------------------------------------------
     output reg                       ip_done_irq
 );
@@ -134,15 +143,25 @@ module bram_dma_ip #(
     reg                       porta_we;
     reg  [DATA_WIDTH-1:0]     porta_dout;
 
-    wire [ADDR_WIDTH-1:0]     porta_ram_addr = porta_we ? porta_write_addr : porta_read_addr;
+    // AXI-Stream Ingress signals (from AXI DMA MM2S)
+    reg  [ADDR_WIDTH-1:0]     rx_ptr;
+    assign s_axis_tready = (state == S_IDLE);
+    wire                      rx_handshake = s_axis_tvalid && s_axis_tready;
+    wire                      axis_wr      = rx_handshake && (state == S_IDLE);
+
+    // Port A arbitration between AXI-Stream DMA and AXI-Lite Memory-Mapped
+    wire [ADDR_WIDTH-1:0]     porta_ram_addr   = axis_wr ? rx_ptr : (porta_we ? porta_write_addr : porta_read_addr);
+    wire [DATA_WIDTH-1:0]     actual_porta_din  = axis_wr ? s_axis_tdata : porta_din;
+    wire                      actual_porta_we   = axis_wr || porta_we;
+    wire [(DATA_WIDTH/8)-1:0] actual_porta_strb = axis_wr ? {(DATA_WIDTH/8){1'b1}} : porta_strb;
 
     // Port A Synchronous Process (Synthesis template with byte-write enables)
     always @(posedge clk) begin
-        if (porta_we) begin
-            if (porta_strb[0]) bram[porta_ram_addr][7:0]   <= porta_din[7:0];
-            if (porta_strb[1]) bram[porta_ram_addr][15:8]  <= porta_din[15:8];
-            if (porta_strb[2]) bram[porta_ram_addr][23:16] <= porta_din[23:16];
-            if (porta_strb[3]) bram[porta_ram_addr][31:24] <= porta_din[31:24];
+        if (actual_porta_we) begin
+            if (actual_porta_strb[0]) bram[porta_ram_addr][7:0]   <= actual_porta_din[7:0];
+            if (actual_porta_strb[1]) bram[porta_ram_addr][15:8]  <= actual_porta_din[15:8];
+            if (actual_porta_strb[2]) bram[porta_ram_addr][23:16] <= actual_porta_din[23:16];
+            if (actual_porta_strb[3]) bram[porta_ram_addr][31:24] <= actual_porta_din[31:24];
         end
         porta_dout <= bram[porta_ram_addr];
     end
@@ -214,6 +233,14 @@ module bram_dma_ip #(
         end else begin
             porta_we         <= 1'b0;
             trigger_detected <= 1'b0;
+
+            // --- On-the-Fly CRC Accumulation from AXI-Stream MM2S DMA ---
+            if (axis_wr) begin
+                if (rx_ptr == 0)
+                    crc_accum <= next_crc32(32'hFFFFFFFF, s_axis_tdata);
+                else if (rx_ptr < STATUS_ADDR)
+                    crc_accum <= next_crc32(crc_accum, s_axis_tdata);
+            end
 
             // 1. Capture Write Address
             if (~s_axi_awready && s_axi_awvalid && ~aw_captured) begin
@@ -346,6 +373,7 @@ module bram_dma_ip #(
             state         <= S_IDLE;
             comp_ptr      <= 0;
             rd_ptr        <= 0;
+            rx_ptr        <= 0;
             pkt_len       <= STATUS_ADDR;
             work_timer    <= 0;
             crc_err       <= 1'b0;
@@ -361,16 +389,29 @@ module bram_dma_ip #(
 
             case (state)
                 // -------------------------------------------------------------
-                // 1. IDLE: Wait for DMA/CPU write to land on TRIGGER_ADDR
+                // 1. IDLE: Wait for DMA stream (MM2S) or CPU write to land on TRIGGER_ADDR
                 // -------------------------------------------------------------
                 S_IDLE: begin
                     m_axis_tvalid <= 1'b0;
                     m_axis_tlast  <= 1'b0;
                     ip_done_irq   <= 1'b0;
 
-                    if (trigger_detected || trigger_write) begin
+                    // AXI-Stream Ingress from AXI DMA MM2S:
+                    if (rx_handshake) begin
+                        if (s_axis_tlast || (rx_ptr == STATUS_ADDR - 1)) begin
+                            pkt_len  <= rx_ptr + 1'b1;
+                            comp_ptr <= 0;
+                            rx_ptr   <= 0;
+                            state    <= S_CHECK_CRC;
+                        end else begin
+                            rx_ptr   <= rx_ptr + 1'b1;
+                        end
+                    end
+                    // Or Doorbell Trigger from CPU AXI-Lite write:
+                    else if (trigger_detected || trigger_write) begin
                         pkt_len  <= STATUS_ADDR; // Process all payload words [0 .. 1021]
                         comp_ptr <= 0;
+                        rx_ptr   <= 0;
                         state    <= S_CHECK_CRC;
                     end
                 end
@@ -426,16 +467,23 @@ module bram_dma_ip #(
                 // 4. NOTIFY: Hold interrupt high until PS Kernel driver acks
                 // -------------------------------------------------------------
                 S_DONE_IRQ: begin
-                    // Level-High interrupt stays asserted (1'b1) until CPU writes
-                    // to STATUS_ADDR (0x0FF8) or TRIGGER_ADDR (0x0FFC)
-                    if (status_write || trigger_write || trigger_detected) begin
+                    // Nominal Path: Driver ISR writes to STATUS_ADDR (0x0FF8) to ACK
+                    if (status_write) begin
                         ip_done_irq <= 1'b0; // Lower interrupt line on CPU ACK
                         if (crc_err) begin
                             crc_err <= 1'b0;
+                            rx_ptr  <= 0;
                             state   <= S_IDLE;
                         end else begin
                             state   <= S_WAIT_EGRESS;
                         end
+                    end
+                    // Abort/Reset Path: Driver writes to TRIGGER_ADDR (0x0FFC) to force reset
+                    else if (trigger_detected || trigger_write) begin
+                        ip_done_irq <= 1'b0;
+                        crc_err     <= 1'b0;
+                        rx_ptr      <= 0;
+                        state       <= S_IDLE; // Always back to IDLE, never re-compute!
                     end
                 end
 
@@ -443,11 +491,15 @@ module bram_dma_ip #(
                 // 5. WAIT EGRESS: Wait for Driver read() to prime DMA and kick
                 // -------------------------------------------------------------
                 S_WAIT_EGRESS: begin
-                    // Driver writes to STATUS_ADDR or TRIGGER_ADDR in axi_dma_read()
-                    // to start the AXI-Stream egress transfer.
-                    if (status_write || trigger_write || trigger_detected) begin
+                    // Nominal Path: Driver read() writes to STATUS_ADDR (0x0FF8) to kick egress
+                    if (status_write) begin
                         rd_ptr <= 0;
                         state  <= S_TX_FETCH;
+                    end
+                    // Abort/Reset Path: Driver abandons read and forces reset
+                    else if (trigger_detected || trigger_write) begin
+                        rx_ptr <= 0;
+                        state  <= S_IDLE;
                     end
                 end
 
@@ -474,7 +526,8 @@ module bram_dma_ip #(
                         m_axis_tlast  <= 1'b0;
 
                         if (rd_ptr == pkt_len - 1) begin
-                            state <= S_IDLE; // Frame complete! Return to IDLE
+                            rx_ptr <= 0;
+                            state  <= S_IDLE; // Frame complete! Return to IDLE
                         end else begin
                             rd_ptr <= rd_ptr + 1'b1;
                             state  <= S_TX_FETCH;
