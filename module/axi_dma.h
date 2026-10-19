@@ -88,6 +88,12 @@
 #define AXI_DMA_IOC_SET_TIMER     _IOW(AXI_DMA_IOC_MAGIC, 1, __u32)
 #define AXI_DMA_IOC_GET_TIMER     _IOR(AXI_DMA_IOC_MAGIC, 2, __u32)
 
+#define BRAM_IP_PAYLOAD_LEN_OFFSET  0x14  /* Word 5: Configurable payload words */
+
+/* IOCTL to set payload length */
+#define AXI_DMA_IOC_SET_PAYLOAD_LEN _IOW(AXI_DMA_IOC_MAGIC, 3, __u32)
+#define AXI_DMA_IOC_GET_PAYLOAD_LEN _IOR(AXI_DMA_IOC_MAGIC, 4, __u32)
+
 /* AXI DMA SG Buffer Descriptor Structure (64 bytes aligned) */
 struct axi_dma_bd {
     __u32 next_desc;
