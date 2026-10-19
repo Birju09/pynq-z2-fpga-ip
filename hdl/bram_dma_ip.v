@@ -336,7 +336,9 @@ module bram_dma_ip #(
 
     assign m_axis_tkeep = {(DATA_WIDTH/8){1'b1}};
     wire   tx_handshake = m_axis_tvalid && m_axis_tready;
-    wire   can_issue_bram_rd = (state == S_TX_RUN) && (egress_rd_ptr < pkt_len) && (!skid_valid || m_axis_tready);
+    wire   can_issue_bram_rd = (state == S_TX_RUN) && (egress_rd_ptr < pkt_len) &&
+                               (!skid_valid) &&
+                               (m_axis_tready || !bram_pipe_valid || !m_axis_tvalid);
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -377,7 +379,7 @@ module bram_dma_ip #(
                     // AXI-Stream Ingress from AXI DMA MM2S:
                     if (rx_handshake) begin
                         if (s_axis_tlast || (rx_ptr == cfg_payload_words - 1)) begin
-                            pkt_len  <= rx_ptr + 1'b1;
+                            pkt_len  <= {1'b0, rx_ptr} + 1'b1;
                             rx_ptr   <= 0;
                             state    <= S_CHECK_CRC;
                         end else begin
