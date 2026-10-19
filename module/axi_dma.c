@@ -189,6 +189,29 @@ static irqreturn_t axi_dma_isr(int irq, void* dev_id) {
     return handled;
 }
 
+static long axi_dma_unlocked_ioctl(struct file* file, unsigned int cmd,
+                                   unsigned long arg) {
+    struct axi_dma_dev* dev = file->private_data;
+    u32 val;
+
+    switch (cmd) {
+        case AXI_DMA_IOC_SET_TIMER:
+            if (copy_from_user(&val, (u32 __user*)arg, sizeof(u32)))
+                return -EFAULT;
+            iowrite32(val, dev->ip_regs + BRAM_IP_TIMER_OFFSET);
+            return 0;
+
+        case AXI_DMA_IOC_GET_TIMER:
+            val = ioread32(dev->ip_regs + BRAM_IP_TIMER_OFFSET);
+            if (copy_to_user((u32 __user*)arg, &val, sizeof(u32)))
+                return -EFAULT;
+            return 0;
+
+        default:
+            return -ENOTTY;
+    }
+}
+
 static int axi_dma_open(struct inode* inode, struct file* file) {
     file->private_data = &dma_device;
     return 0;
@@ -397,6 +420,7 @@ static const struct file_operations axi_dma_fops = {
     .release = axi_dma_release,
     .read = axi_dma_read,
     .write = axi_dma_write,
+    .unlocked_ioctl = axi_dma_unlocked_ioctl,
 };
 
 static int axi_dma_probe(struct platform_device* pdev) {

@@ -81,6 +81,13 @@
 #define XAXIDMA_BD_STS_RXEOF_MASK 0x04000000
 #define XAXIDMA_BD_STS_ACTUAL_LEN_MASK 0x007FFFFF
 
+#define BRAM_IP_TIMER_OFFSET      0x10  /* Word 4: Programmable work timer */
+
+/* IOCTL Definitions */
+#define AXI_DMA_IOC_MAGIC         'd'
+#define AXI_DMA_IOC_SET_TIMER     _IOW(AXI_DMA_IOC_MAGIC, 1, __u32)
+#define AXI_DMA_IOC_GET_TIMER     _IOR(AXI_DMA_IOC_MAGIC, 2, __u32)
+
 /* AXI DMA SG Buffer Descriptor Structure (64 bytes aligned) */
 struct axi_dma_bd {
     __u32 next_desc;
@@ -93,6 +100,6 @@ struct axi_dma_bd {
     __u32 status;
     __u32 app[5];
     __u32 reserved2[3];
-} __aligned(64);
+} __attribute__((aligned(64)));
 
 #endif /* _AXI_DMA_H_ */

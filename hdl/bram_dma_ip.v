@@ -119,13 +119,15 @@ module bram_dma_ip #(
     localparam [CFG_ADDR_WIDTH-1:0] STATUS_ADDR       = 8'h1; // Byte offset 0x04
     localparam [CFG_ADDR_WIDTH-1:0] COMPUTE_CTRL_ADDR = 8'h2; // Byte offset 0x08
     localparam [CFG_ADDR_WIDTH-1:0] EXPECTED_CRC_ADDR = 8'h3; // Byte offset 0x0C
-    localparam [CFG_ADDR_WIDTH-1:0] TIMER_ADDR         = 8'h4; // Byte offset 0x10
+    localparam [CFG_ADDR_WIDTH-1:0] TIMER_ADDR        = 8'h4; // Byte offset 0x10
+    localparam [CFG_ADDR_WIDTH-1:0] CFG_PAYLOAD_ADDR  = 8'h5; // Byte offset 0x14
 
     reg [DATA_WIDTH-1:0] ctrl_reg;
     reg                  status_write_pulse;
     reg                  trigger_detected;
     reg [DATA_WIDTH-1:0] status_write_data;
     reg [DATA_WIDTH-1:0] cfg_worker_timer;
+    reg [DATA_WIDTH-1:0] cfg_payload_words;
 
     // =========================================================================
     // FSM State Definitions
@@ -213,6 +215,7 @@ module bram_dma_ip #(
             status_write_data  <= 32'h0;
             trigger_detected   <= 1'b0;
             cfg_worker_timer   <= 16'd100;
+            cfg_payload_words   <= BRAM_DEPTH;
         end else begin
             status_write_pulse <= 1'b0;
             trigger_detected   <= 1'b0;
@@ -238,6 +241,9 @@ module bram_dma_ip #(
                     TIMER_ADDR: begin
                         cfg_worker_timer <= s_axi_wdata[15:0];
                     end
+                    CFG_PAYLOAD_ADDR: begin
+                        cfg_payload_words <= (s_axi_wdata == 0 || s_axi_wdata > BRAM_DEPTH) ? BRAM_DEPTH : s_axi_wdata;
+                    end
                 endcase
 
                 s_axi_bvalid <= 1'b1;
@@ -260,7 +266,7 @@ module bram_dma_ip #(
         end else if (axis_wr) begin
             if (rx_ptr == 0)
                 crc_accum <= next_crc32(32'hFFFFFFFF, s_axis_tdata);
-            else if (rx_ptr < BRAM_DEPTH)
+            else if (rx_ptr < cfg_payload_words)
                 crc_accum <= next_crc32(crc_accum, s_axis_tdata);
         end
     end
@@ -289,6 +295,9 @@ module bram_dma_ip #(
                     end
                     TIMER_ADDR: begin
                         s_axi_rdata <= {16'd0, cfg_worker_timer};
+                    end
+                    CFG_PAYLOAD_ADDR: begin
+                        s_axi_rdata <= cfg_payload_words;
                     end
                     default: begin
                         s_axi_rdata <= 32'd0;
@@ -346,7 +355,7 @@ module bram_dma_ip #(
 
                     // AXI-Stream Ingress from AXI DMA MM2S:
                     if (rx_handshake) begin
-                        if (s_axis_tlast || (rx_ptr == BRAM_DEPTH - 1)) begin
+                        if (s_axis_tlast || (rx_ptr == cfg_payload_words - 1)) begin
                             pkt_len  <= rx_ptr + 1'b1;
                             comp_ptr <= 0;
                             rx_ptr   <= 0;
@@ -357,7 +366,7 @@ module bram_dma_ip #(
                     end
                     // Manual Software Start from CPU (write bit 0 to STATUS_ADDR 0x04):
                     else if (status_write_pulse && status_write_data[0]) begin
-                        pkt_len  <= BRAM_DEPTH; // Process full buffer length
+                        pkt_len  <= cfg_payload_words; // Process full buffer length
                         comp_ptr <= 0;
                         rx_ptr   <= 0;
                         state    <= S_CHECK_CRC;
