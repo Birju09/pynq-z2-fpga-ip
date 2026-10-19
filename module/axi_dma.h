@@ -30,8 +30,8 @@
 #define BRAM_IP_CRC_OFFSET        0x0C        /* Word 3: Write expected_crc / Read calculated CRC */
 
 /* Full 4096 bytes (1024 words) now available for payload */
-#define BRAM_IP_MAX_WORDS         4096
-#define BRAM_IP_MAX_BYTES         (BRAM_IP_MAX_WORDS * 4) // 4096 bytes
+#define BRAM_IP_MAX_WORDS         65536
+#define BRAM_IP_MAX_BYTES         (BRAM_IP_MAX_WORDS * 4) // 262144 bytes
 #define XAXIDMA_DEFAULT_BUF_SIZE  BRAM_IP_MAX_BYTES
 
 #define BRAM_IP_STATUS_IRQ_MASK 0x00000001
@@ -93,6 +93,14 @@
 /* IOCTL to set payload length */
 #define AXI_DMA_IOC_SET_PAYLOAD_LEN _IOW(AXI_DMA_IOC_MAGIC, 3, __u32)
 #define AXI_DMA_IOC_GET_PAYLOAD_LEN _IOR(AXI_DMA_IOC_MAGIC, 4, __u32)
+
+/* MMAP Offsets for TX and RX coherent buffers */
+#define AXI_DMA_MMAP_TX_OFFSET      0x00000000
+#define AXI_DMA_MMAP_RX_OFFSET      0x00100000 /* 1MB page offset to map RX buffer */
+
+/* IOCTL to bypass or enable software CRC (for zero-copy benchmarking) */
+#define AXI_DMA_IOC_SET_CRC_BYPASS  _IOW(AXI_DMA_IOC_MAGIC, 5, __u32)
+#define AXI_DMA_IOC_GET_CRC_BYPASS  _IOR(AXI_DMA_IOC_MAGIC, 6, __u32)
 
 /* AXI DMA SG Buffer Descriptor Structure (64 bytes aligned) */
 struct axi_dma_bd {

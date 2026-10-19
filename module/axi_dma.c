@@ -9,6 +9,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -45,6 +46,11 @@ struct axi_dma_dev {
     dma_addr_t rx_bd_phys;
     void* rx_buf;
     dma_addr_t rx_buf_phys;
+
+    /* Zero-copy mmap user virtual addresses */
+    unsigned long tx_user_addr;
+    unsigned long rx_user_addr;
+    u32 bypass_crc;
 
     /* Synchronization */
     struct mutex tx_lock;
@@ -207,6 +213,32 @@ static long axi_dma_unlocked_ioctl(struct file* file, unsigned int cmd,
                 return -EFAULT;
             return 0;
 
+        case AXI_DMA_IOC_SET_PAYLOAD_LEN:
+            if (copy_from_user(&val, (u32 __user*)arg, sizeof(u32)))
+                return -EFAULT;
+            if (val > BRAM_IP_MAX_WORDS)
+                return -EINVAL;
+            iowrite32(val, dev->ip_regs + BRAM_IP_PAYLOAD_LEN_OFFSET);
+            return 0;
+
+        case AXI_DMA_IOC_GET_PAYLOAD_LEN:
+            val = ioread32(dev->ip_regs + BRAM_IP_PAYLOAD_LEN_OFFSET);
+            if (copy_to_user((u32 __user*)arg, &val, sizeof(u32)))
+                return -EFAULT;
+            return 0;
+
+        case AXI_DMA_IOC_SET_CRC_BYPASS:
+            if (copy_from_user(&val, (u32 __user*)arg, sizeof(u32)))
+                return -EFAULT;
+            dev->bypass_crc = val ? 1 : 0;
+            return 0;
+
+        case AXI_DMA_IOC_GET_CRC_BYPASS:
+            val = dev->bypass_crc;
+            if (copy_to_user((u32 __user*)arg, &val, sizeof(u32)))
+                return -EFAULT;
+            return 0;
+
         default:
             return -ENOTTY;
     }
@@ -218,6 +250,11 @@ static int axi_dma_open(struct inode* inode, struct file* file) {
 }
 
 static int axi_dma_release(struct inode* inode, struct file* file) {
+    struct axi_dma_dev* dev = file->private_data;
+    if (dev) {
+        dev->tx_user_addr = 0;
+        dev->rx_user_addr = 0;
+    }
     return 0;
 }
 
@@ -294,9 +331,18 @@ static ssize_t axi_dma_read(struct file* file, char __user* buf, size_t count,
     if (rx_bytes == 0)
         rx_bytes = transfer_len;
 
-    if (copy_to_user(buf, dev->rx_buf, rx_bytes)) {
-        mutex_unlock(&dev->rx_lock);
-        return -EFAULT;
+    /*
+     * Zero-Copy support:
+     * If buf is NULL or within mmap'd RX buffer, data already sits
+     * in the coherent RX buffer mapped to user space. Skip copy_to_user().
+     */
+    if (buf != NULL && !(dev->rx_user_addr &&
+                         (unsigned long)buf >= dev->rx_user_addr &&
+                         (unsigned long)buf < dev->rx_user_addr + XAXIDMA_DEFAULT_BUF_SIZE)) {
+        if (copy_to_user(buf, dev->rx_buf, rx_bytes)) {
+            mutex_unlock(&dev->rx_lock);
+            return -EFAULT;
+        }
     }
 
     mutex_unlock(&dev->rx_lock);
@@ -322,9 +368,18 @@ static ssize_t axi_dma_write(struct file* file, const char __user* buf,
     if (mutex_lock_interruptible(&dev->tx_lock))
         return -ERESTARTSYS;
 
-    if (copy_from_user(dev->tx_buf, buf, transfer_len)) {
-        mutex_unlock(&dev->tx_lock);
-        return -EFAULT;
+    /*
+     * Zero-Copy support:
+     * If buf is NULL or within mmap'd TX buffer, user space has written
+     * directly into coherent memory. Skip copy_from_user().
+     */
+    if (buf != NULL && !(dev->tx_user_addr &&
+                         (unsigned long)buf >= dev->tx_user_addr &&
+                         (unsigned long)buf < dev->tx_user_addr + XAXIDMA_DEFAULT_BUF_SIZE)) {
+        if (copy_from_user(dev->tx_buf, buf, transfer_len)) {
+            mutex_unlock(&dev->tx_lock);
+            return -EFAULT;
+        }
     }
 
     if (!dev->ip_regs) {
@@ -333,8 +388,12 @@ static ssize_t axi_dma_write(struct file* file, const char __user* buf,
         return -ENODEV;
     }
 
-    /* 1. Calculate 32-bit CRC across payload words */
-    crc = calc_crc32((const u32*)dev->tx_buf, num_words);
+    /* 1. Calculate 32-bit CRC across payload words if not bypassed */
+    if (!dev->bypass_crc) {
+        crc = calc_crc32((const u32*)dev->tx_buf, num_words);
+    } else {
+        crc = 0; /* Hardware IP treats 0 as bypass CRC check */
+    }
 
     dev->ip_done = 0;
     dev->crc_err = 0;
@@ -414,12 +473,43 @@ static ssize_t axi_dma_write(struct file* file, const char __user* buf,
     return transfer_len;
 }
 
+/* MMAP Interface: Map TX or RX coherent DMA buffer directly to user space */
+static int axi_dma_mmap(struct file* file, struct vm_area_struct* vma) {
+    struct axi_dma_dev* dev = file->private_data;
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long rx_pgoff = AXI_DMA_MMAP_RX_OFFSET >> PAGE_SHIFT;
+
+    if (size > XAXIDMA_DEFAULT_BUF_SIZE) {
+        dev_err(&dev->pdev->dev, "mmap: requested size %lu exceeds buffer size %u\n",
+                size, XAXIDMA_DEFAULT_BUF_SIZE);
+        return -EINVAL;
+    }
+
+    if (vma->vm_pgoff == (AXI_DMA_MMAP_TX_OFFSET >> PAGE_SHIFT)) {
+        dev->tx_user_addr = vma->vm_start;
+        return dma_mmap_coherent(&dev->pdev->dev, vma, dev->tx_buf,
+                                 dev->tx_buf_phys, XAXIDMA_DEFAULT_BUF_SIZE);
+    } else if (vma->vm_pgoff == rx_pgoff) {
+        dev->rx_user_addr = vma->vm_start;
+        vma->vm_pgoff = 0; /* Reset pgoff so dma_mmap_coherent maps from start of buffer */
+        return dma_mmap_coherent(&dev->pdev->dev, vma, dev->rx_buf,
+                                 dev->rx_buf_phys, XAXIDMA_DEFAULT_BUF_SIZE);
+    }
+
+    dev_err(&dev->pdev->dev, "mmap: invalid offset 0x%lx (expected TX: 0x%lx, RX: 0x%lx)\n",
+            vma->vm_pgoff << PAGE_SHIFT,
+            (unsigned long)AXI_DMA_MMAP_TX_OFFSET,
+            (unsigned long)AXI_DMA_MMAP_RX_OFFSET);
+    return -EINVAL;
+}
+
 static const struct file_operations axi_dma_fops = {
     .owner = THIS_MODULE,
     .open = axi_dma_open,
     .release = axi_dma_release,
     .read = axi_dma_read,
     .write = axi_dma_write,
+    .mmap = axi_dma_mmap,
     .unlocked_ioctl = axi_dma_unlocked_ioctl,
 };
 

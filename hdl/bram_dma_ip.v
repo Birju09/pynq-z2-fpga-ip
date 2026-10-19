@@ -135,46 +135,60 @@ module bram_dma_ip #(
     localparam [3:0]
         S_IDLE        = 4'd0, // Awaiting S_AXIS stream ingress or manual CPU start
         S_CHECK_CRC   = 4'd1, // Validate CRC accumulator against expected CRC
-        S_COMP_READ   = 4'd2, // Read BRAM word for compute
-        S_COMP_WAIT   = 4'd3, // Multi-cycle processing delay
-        S_COMP_WRITE  = 4'd4, // Write processed result back to BRAM
+        S_COMP_RUN    = 4'd2, // Pipelined Compute: 1 beat per clock cycle
         S_DONE_IRQ    = 4'd5, // Assert interrupt to PS & await Driver IRQ ACK
         S_WAIT_EGRESS = 4'd6, // Await Driver read kick (write to STATUS_ADDR)
-        S_TX_FETCH    = 4'd7, // Fetch word from BRAM for M_AXIS
-        S_TX_WAIT_RAM = 4'd8, // Wait 1 cycle for BRAM synchronous read
-        S_TX_SEND     = 4'd9; // Stream out word to S2MM DMA
+        S_TX_RUN      = 4'd7; // Pipelined Egress: 1 beat per clock cycle over M_AXIS
 
     reg [3:0] state;
 
     // =========================================================================
-    // Dual-Port Inferred Block RAM (1024 x 32-bit = 4 KB)
-    // Port A: Servicing AXI-Stream MM2S Ingress (DMA -> BRAM)
-    // Port B: Servicing Internal Compute and Egress Stream (M_AXIS -> DMA)
+    // Dual-Port Inferred Block RAM
+    // Port A: Servicing S_AXIS MM2S Ingress (in S_IDLE) and Compute Writes (in S_COMP_RUN)
+    // Port B: Servicing Compute Reads (in S_COMP_RUN) and Egress M_AXIS Stream (in S_TX_RUN)
     // =========================================================================
     (* ram_style = "block" *) reg [DATA_WIDTH-1:0] bram [0:BRAM_DEPTH-1];
 
-    // Port A: AXI-Stream Ingress signals (from AXI DMA MM2S)
+    // Port A: AXI-Stream Ingress signals & Compute Write signals
     reg  [ADDR_WIDTH-1:0] rx_ptr;
     assign s_axis_tready = (state == S_IDLE);
     wire                  rx_handshake = s_axis_tvalid && s_axis_tready;
     wire                  axis_wr      = rx_handshake && (state == S_IDLE);
 
+    // Pipelined Compute Signals
+    reg  [ADDR_WIDTH:0]   comp_rd_ptr;
+    reg                   comp_stage1_valid;
+    reg  [ADDR_WIDTH-1:0] comp_stage1_addr;
+    reg                   comp_wr_en;
+    reg  [ADDR_WIDTH-1:0] comp_wr_addr;
+    reg  [DATA_WIDTH-1:0] comp_wr_data;
+
+    // Port A MUX: Writes in S_IDLE from stream, writes in S_COMP_RUN from compute
+    wire [ADDR_WIDTH-1:0] porta_addr = (state == S_IDLE) ? rx_ptr : comp_wr_addr;
+    wire [DATA_WIDTH-1:0] porta_din  = (state == S_IDLE) ? s_axis_tdata : comp_wr_data;
+    wire                  porta_we   = (state == S_IDLE) ? axis_wr : comp_wr_en;
+
     always @(posedge clk) begin
-        if (axis_wr) begin
-            bram[rx_ptr] <= s_axis_tdata;
+        if (porta_we) begin
+            bram[porta_addr] <= porta_din;
         end
     end
 
-    // Port B: Internal Compute Engine and M_AXIS Egress signals
-    reg  [ADDR_WIDTH-1:0] portb_addr;
-    reg  [DATA_WIDTH-1:0] portb_din;
-    reg                   portb_we;
+    // Pipelined Egress Signals
+    reg  [ADDR_WIDTH:0]   egress_rd_ptr;
+    reg                   bram_pipe_valid;
+    reg                   bram_pipe_last;
+    reg  [DATA_WIDTH-1:0] skid_data;
+    reg                   skid_last;
+    reg                   skid_valid;
+
+    // Port B: Address MUX & Read Data
+    wire [ADDR_WIDTH-1:0] portb_addr = (state == S_COMP_RUN) ? comp_rd_ptr[ADDR_WIDTH-1:0] :
+                                       (state == S_TX_RUN)   ? egress_rd_ptr[ADDR_WIDTH-1:0] :
+                                       {ADDR_WIDTH{1'b0}};
     reg  [DATA_WIDTH-1:0] portb_dout;
 
     always @(posedge clk) begin
-        if (portb_we) begin
-            bram[portb_addr] <= portb_din;
-        end
         portb_dout <= bram[portb_addr];
     end
 
@@ -317,47 +331,53 @@ module bram_dma_ip #(
     // =========================================================================
     // Compute & Egress State Machine
     // =========================================================================
-    reg [ADDR_WIDTH:0] comp_ptr;
-    reg [ADDR_WIDTH:0] rd_ptr;
     reg [ADDR_WIDTH:0] pkt_len;
     reg [15:0]         work_timer;
 
     assign m_axis_tkeep = {(DATA_WIDTH/8){1'b1}};
     wire   tx_handshake = m_axis_tvalid && m_axis_tready;
+    wire   can_issue_bram_rd = (state == S_TX_RUN) && (egress_rd_ptr < pkt_len) && (!skid_valid || m_axis_tready);
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            state         <= S_IDLE;
-            comp_ptr      <= 0;
-            rd_ptr        <= 0;
-            rx_ptr        <= 0;
-            pkt_len       <= 0;
-            work_timer    <= 0;
-            crc_err       <= 1'b0;
-            portb_we      <= 1'b0;
-            portb_addr    <= 0;
-            portb_din     <= 0;
-            m_axis_tvalid <= 1'b0;
-            m_axis_tdata  <= 0;
-            m_axis_tlast  <= 1'b0;
-            ip_done_irq   <= 1'b0;
+            state             <= S_IDLE;
+            rx_ptr            <= 0;
+            pkt_len           <= 0;
+            work_timer        <= 0;
+            crc_err           <= 1'b0;
+            ip_done_irq       <= 1'b0;
+            comp_rd_ptr       <= 0;
+            comp_stage1_valid <= 1'b0;
+            comp_stage1_addr  <= 0;
+            comp_wr_en        <= 1'b0;
+            comp_wr_addr      <= 0;
+            comp_wr_data      <= 0;
+            egress_rd_ptr     <= 0;
+            bram_pipe_valid   <= 1'b0;
+            bram_pipe_last    <= 1'b0;
+            skid_data         <= 0;
+            skid_last         <= 1'b0;
+            skid_valid        <= 1'b0;
+            m_axis_tvalid     <= 1'b0;
+            m_axis_tdata      <= 0;
+            m_axis_tlast      <= 1'b0;
         end else begin
-            portb_we <= 1'b0;
-
             case (state)
                 // -------------------------------------------------------------
                 // 1. IDLE: Wait for DMA stream (MM2S) or manual CPU start
                 // -------------------------------------------------------------
                 S_IDLE: begin
-                    m_axis_tvalid <= 1'b0;
-                    m_axis_tlast  <= 1'b0;
-                    ip_done_irq   <= 1'b0;
+                    m_axis_tvalid     <= 1'b0;
+                    m_axis_tlast      <= 1'b0;
+                    skid_valid        <= 1'b0;
+                    ip_done_irq       <= 1'b0;
+                    comp_wr_en        <= 1'b0;
+                    comp_stage1_valid <= 1'b0;
 
                     // AXI-Stream Ingress from AXI DMA MM2S:
                     if (rx_handshake) begin
                         if (s_axis_tlast || (rx_ptr == cfg_payload_words - 1)) begin
                             pkt_len  <= rx_ptr + 1'b1;
-                            comp_ptr <= 0;
                             rx_ptr   <= 0;
                             state    <= S_CHECK_CRC;
                         end else begin
@@ -367,7 +387,6 @@ module bram_dma_ip #(
                     // Manual Software Start from CPU (write bit 0 to STATUS_ADDR 0x04):
                     else if (status_write_pulse && status_write_data[0]) begin
                         pkt_len  <= cfg_payload_words; // Process full buffer length
-                        comp_ptr <= 0;
                         rx_ptr   <= 0;
                         state    <= S_CHECK_CRC;
                     end
@@ -379,9 +398,12 @@ module bram_dma_ip #(
                 S_CHECK_CRC: begin
                     // Bypass CRC check if expected_crc is 0, or if accumulator matches
                     if ((crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
-                        crc_err  <= 1'b0;
-                        comp_ptr <= 0;
-                        state    <= S_COMP_READ; // CRC OK: Proceed to compute!
+                        crc_err           <= 1'b0;
+                        comp_rd_ptr       <= 0;
+                        comp_stage1_valid <= 1'b0;
+                        comp_wr_en        <= 1'b0;
+                        work_timer        <= cfg_worker_timer[15:0];
+                        state             <= S_COMP_RUN; // CRC OK: Proceed to pipelined compute!
                     end else begin
                         crc_err     <= 1'b1;     // CRC Failed: Abort compute to protect data!
                         ip_done_irq <= 1'b1;     // Alert PS of error via interrupt
@@ -390,33 +412,39 @@ module bram_dma_ip #(
                 end
 
                 // -------------------------------------------------------------
-                // 3. COMPUTE: Read word -> Process -> Write back to BRAM
+                // 3. PIPELINED COMPUTE: Read -> Compute -> Write (1 cycle/word)
                 // -------------------------------------------------------------
-                S_COMP_READ: begin
-                    portb_addr <= comp_ptr[ADDR_WIDTH-1:0];
-                    work_timer <= cfg_worker_timer;
-                    state      <= S_COMP_WAIT;
-                end
+                S_COMP_RUN: begin
+                    if (trigger_detected) begin
+                        comp_wr_en  <= 1'b0;
+                        ip_done_irq <= 1'b0;
+                        rx_ptr      <= 0;
+                        state       <= S_IDLE;
+                    end else if (work_timer == 0) begin
+                        work_timer <= cfg_worker_timer[15:0];
 
-                S_COMP_WAIT: begin
-                    if (work_timer == 0)
-                        state <= S_COMP_WRITE;
-                    else
-                        work_timer <= work_timer - 1'b1;
-                end
+                        // Stage 1: Port B Read address generation
+                        if (comp_rd_ptr < pkt_len) begin
+                            comp_rd_ptr       <= comp_rd_ptr + 1'b1;
+                            comp_stage1_valid <= 1'b1;
+                            comp_stage1_addr  <= comp_rd_ptr[ADDR_WIDTH-1:0];
+                        end else begin
+                            comp_stage1_valid <= 1'b0;
+                        end
 
-                S_COMP_WRITE: begin
-                    portb_addr <= comp_ptr[ADDR_WIDTH-1:0];
-                    // Example Compute: Invert bits and add offset 0x1000
-                    portb_din  <= (~portb_dout) + 32'h0000_1000;
-                    portb_we   <= 1'b1;
+                        // Stage 2: Transform data & write to Port A
+                        comp_wr_en   <= comp_stage1_valid;
+                        comp_wr_addr <= comp_stage1_addr;
+                        comp_wr_data <= (~portb_dout) + 32'h0000_1000;
 
-                    if (comp_ptr == pkt_len - 1) begin
-                        state       <= S_DONE_IRQ;
-                        ip_done_irq <= 1'b1; // Assert Level-High interrupt to PS GIC
+                        // Completion: When the last word is written to Port A
+                        if (comp_wr_en && (comp_wr_addr == pkt_len - 1)) begin
+                            comp_wr_en  <= 1'b0;
+                            ip_done_irq <= 1'b1; // Assert Level-High interrupt
+                            state       <= S_DONE_IRQ;
+                        end
                     end else begin
-                        comp_ptr <= comp_ptr + 1'b1;
-                        state    <= S_COMP_READ;
+                        work_timer <= work_timer - 1'b1;
                     end
                 end
 
@@ -424,6 +452,7 @@ module bram_dma_ip #(
                 // 4. NOTIFY: Hold interrupt high until PS Kernel driver acks
                 // -------------------------------------------------------------
                 S_DONE_IRQ: begin
+                    comp_wr_en <= 1'b0;
                     // Nominal Path: Driver ISR writes to STATUS_ADDR (0x04) to ACK
                     if (status_write_pulse) begin
                         ip_done_irq <= 1'b0; // Lower interrupt line on CPU ACK
@@ -450,8 +479,13 @@ module bram_dma_ip #(
                 S_WAIT_EGRESS: begin
                     // Nominal Path: Driver read() writes to STATUS_ADDR (0x04) to kick egress
                     if (status_write_pulse) begin
-                        rd_ptr <= 0;
-                        state  <= S_TX_FETCH;
+                        egress_rd_ptr   <= 0;
+                        bram_pipe_valid <= 1'b0;
+                        bram_pipe_last  <= 1'b0;
+                        skid_valid      <= 1'b0;
+                        m_axis_tvalid   <= 1'b0;
+                        m_axis_tlast    <= 1'b0;
+                        state           <= S_TX_RUN;
                     end
                     // Abort/Reset Path: Driver abandons read and forces reset (0x00)
                     else if (trigger_detected) begin
@@ -461,33 +495,67 @@ module bram_dma_ip #(
                 end
 
                 // -------------------------------------------------------------
-                // 6. EGRESS: Stream processed results from BRAM to S2MM DMA
+                // 6. PIPELINED EGRESS: Stream processed results from BRAM to S2MM
                 // -------------------------------------------------------------
-                S_TX_FETCH: begin
-                    portb_addr <= rd_ptr[ADDR_WIDTH-1:0];
-                    state      <= S_TX_WAIT_RAM;
-                end
-
-                S_TX_WAIT_RAM: begin
-                    // Wait 1 clock cycle for synchronous BRAM read to settle
-                    state <= S_TX_SEND;
-                end
-
-                S_TX_SEND: begin
-                    m_axis_tdata  <= portb_dout;
-                    m_axis_tvalid <= 1'b1;
-                    m_axis_tlast  <= (rd_ptr == pkt_len - 1);
-
-                    if (tx_handshake) begin
+                S_TX_RUN: begin
+                    if (trigger_detected) begin
                         m_axis_tvalid <= 1'b0;
                         m_axis_tlast  <= 1'b0;
-
-                        if (rd_ptr == pkt_len - 1) begin
-                            rx_ptr <= 0;
-                            state  <= S_IDLE; // Frame complete! Return to IDLE
+                        skid_valid    <= 1'b0;
+                        rx_ptr        <= 0;
+                        state         <= S_IDLE;
+                    end else begin
+                        // 1. Issue BRAM read if pipeline can accept a beat
+                        if (can_issue_bram_rd) begin
+                            egress_rd_ptr   <= egress_rd_ptr + 1'b1;
+                            bram_pipe_valid <= 1'b1;
+                            bram_pipe_last  <= (egress_rd_ptr == pkt_len - 1);
                         end else begin
-                            rd_ptr <= rd_ptr + 1'b1;
-                            state  <= S_TX_FETCH;
+                            bram_pipe_valid <= 1'b0;
+                            bram_pipe_last  <= 1'b0;
+                        end
+
+                        // 2. Stream & Skid Buffer State Machine
+                        if (skid_valid) begin
+                            if (m_axis_tready) begin
+                                m_axis_tdata  <= skid_data;
+                                m_axis_tlast  <= skid_last;
+                                m_axis_tvalid <= 1'b1;
+                                if (bram_pipe_valid) begin
+                                    skid_data  <= portb_dout;
+                                    skid_last  <= bram_pipe_last;
+                                    skid_valid <= 1'b1;
+                                end else begin
+                                    skid_valid <= 1'b0;
+                                end
+                            end
+                        end else begin
+                            if (m_axis_tready || !m_axis_tvalid) begin
+                                if (bram_pipe_valid) begin
+                                    m_axis_tdata  <= portb_dout;
+                                    m_axis_tlast  <= bram_pipe_last;
+                                    m_axis_tvalid <= 1'b1;
+                                end else if (m_axis_tready && m_axis_tvalid) begin
+                                    m_axis_tvalid <= 1'b0;
+                                    m_axis_tlast  <= 1'b0;
+                                end
+                            end else begin
+                                // Downstream stalled while BRAM read was in flight
+                                if (bram_pipe_valid) begin
+                                    skid_data  <= portb_dout;
+                                    skid_last  <= bram_pipe_last;
+                                    skid_valid <= 1'b1;
+                                end
+                            end
+                        end
+
+                        // 3. Egress completion check: final beat handshaked
+                        if (tx_handshake && m_axis_tlast) begin
+                            m_axis_tvalid <= 1'b0;
+                            m_axis_tlast  <= 1'b0;
+                            skid_valid    <= 1'b0;
+                            rx_ptr        <= 0;
+                            state         <= S_IDLE; // Frame complete! Return to S_IDLE
                         end
                     end
                 end
