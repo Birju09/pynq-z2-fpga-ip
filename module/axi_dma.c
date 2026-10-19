@@ -168,7 +168,7 @@ static irqreturn_t axi_dma_isr(int irq, void* dev_id) {
             iowrite32(1, dev->ip_regs + BRAM_IP_STATUS_OFFSET);
 
             if (ip_status & BRAM_IP_STATUS_CRC_ERR) {
-                u32 calc_crc = ioread32(dev->ip_regs + BRAM_IP_TRIGGER_OFFSET);
+                u32 calc_crc = ioread32(dev->ip_regs + BRAM_IP_CRC_OFFSET);
                 dev->crc_err = 1;
                 pr_err(
                     "axi_dma: IP CRC mismatch! Calc CRC: 0x%08x, Status: "
@@ -319,7 +319,7 @@ static ssize_t axi_dma_write(struct file* file, const char __user* buf,
     dev->tx_err = 0;
 
     /* 2. Program expected CRC into BRAM IP Trigger register (0x0FFC) */
-    iowrite32(crc, dev->ip_regs + BRAM_IP_TRIGGER_OFFSET);
+    iowrite32(crc, dev->ip_regs + BRAM_IP_CRC_OFFSET);
 
     /* 3. Setup MM2S Buffer Descriptor */
     memset(dev->tx_bd, 0, sizeof(*dev->tx_bd));

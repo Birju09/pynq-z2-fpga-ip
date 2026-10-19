@@ -119,11 +119,13 @@ module bram_dma_ip #(
     localparam [CFG_ADDR_WIDTH-1:0] STATUS_ADDR       = 8'h1; // Byte offset 0x04
     localparam [CFG_ADDR_WIDTH-1:0] COMPUTE_CTRL_ADDR = 8'h2; // Byte offset 0x08
     localparam [CFG_ADDR_WIDTH-1:0] EXPECTED_CRC_ADDR = 8'h3; // Byte offset 0x0C
+    localparam [CFG_ADDR_WIDTH-1:0] TIMER_ADDR         = 8'h4; // Byte offset 0x10
 
     reg [DATA_WIDTH-1:0] ctrl_reg;
     reg                  status_write_pulse;
     reg                  trigger_detected;
     reg [DATA_WIDTH-1:0] status_write_data;
+    reg [DATA_WIDTH-1:0] cfg_worker_timer;
 
     // =========================================================================
     // FSM State Definitions
@@ -210,6 +212,7 @@ module bram_dma_ip #(
             status_write_pulse <= 1'b0;
             status_write_data  <= 32'h0;
             trigger_detected   <= 1'b0;
+            cfg_worker_timer   <= 16'd100;
         end else begin
             status_write_pulse <= 1'b0;
             trigger_detected   <= 1'b0;
@@ -231,6 +234,9 @@ module bram_dma_ip #(
                     end
                     COMPUTE_CTRL_ADDR: begin
                         ctrl_reg <= s_axi_wdata;
+                    end
+                    TIMER_ADDR: begin
+                        cfg_worker_timer <= s_axi_wdata[15:0];
                     end
                 endcase
 
@@ -280,6 +286,9 @@ module bram_dma_ip #(
                     end
                     COMPUTE_CTRL_ADDR: begin
                         s_axi_rdata <= ctrl_reg;
+                    end
+                    TIMER_ADDR: begin
+                        s_axi_rdata <= {16'd0, cfg_worker_timer};
                     end
                     default: begin
                         s_axi_rdata <= 32'd0;
@@ -376,7 +385,7 @@ module bram_dma_ip #(
                 // -------------------------------------------------------------
                 S_COMP_READ: begin
                     portb_addr <= comp_ptr[ADDR_WIDTH-1:0];
-                    work_timer <= 16'd100; // Simulated compute latency per word
+                    work_timer <= cfg_worker_timer;
                     state      <= S_COMP_WAIT;
                 end
 

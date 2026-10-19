@@ -20,19 +20,23 @@
 #define XAXIDMA_DEFAULT_TX_IRQ 30 /* SPI 30 -> HW IRQ 62 (MM2S) */
 #define BRAM_IP_DEFAULT_IRQ 31    /* SPI 31 -> HW IRQ 63 (IP Done / Error) */
 
-#define XAXIDMA_DEFAULT_BUF_SIZE 4096
 
 /* BRAM IP Memory Map Constants */
-#define BRAM_IP_STATUS_OFFSET 0x0FF8 /* Read: {crc_err, state, ip_done_irq} */
-#define BRAM_IP_TRIGGER_OFFSET \
-    0x0FFC /* Write: Doorbell + CRC, Read: 32-bit CRC */
+
+/* New Offsets matching bram_dma_ip.v */
+#define BRAM_IP_TRIGGER_OFFSET    0x00        /* Word 0: Abort / Force Reset */
+#define BRAM_IP_STATUS_OFFSET     0x04        /* Word 1: Read status / Write IRQ ACK & kick */
+#define BRAM_IP_CTRL_OFFSET       0x08        /* Word 2: Compute control register */
+#define BRAM_IP_CRC_OFFSET        0x0C        /* Word 3: Write expected_crc / Read calculated CRC */
+
+/* Full 4096 bytes (1024 words) now available for payload */
+#define BRAM_IP_MAX_WORDS         4096
+#define BRAM_IP_MAX_BYTES         (BRAM_IP_MAX_WORDS * 4) // 4096 bytes
+#define XAXIDMA_DEFAULT_BUF_SIZE  BRAM_IP_MAX_BYTES
 
 #define BRAM_IP_STATUS_IRQ_MASK 0x00000001
 #define BRAM_IP_STATUS_STATE_MASK 0x0000001E
 #define BRAM_IP_STATUS_CRC_ERR 0x00000020
-
-#define BRAM_IP_MAX_WORDS 1022
-#define BRAM_IP_MAX_BYTES (BRAM_IP_MAX_WORDS * 4) /* 4088 bytes */
 
 /* Register offsets */
 #define XAXIDMA_MM2S_DMACR_OFFSET 0x00
