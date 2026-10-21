@@ -193,16 +193,20 @@ module bram_dma_ip #(
     end
 
     // =========================================================================
-    // Full 32-bit CRC-32 Calculation Logic
+    // Standard IEEE 802.3 Ethernet FCS CRC-32 Function (32-bit parallel)
+    // Polynomial: 0xEDB88320 (reflected / LSB-first)
     // =========================================================================
-    // Standard 32-bit parallel reduction function (CRC-32 / Checksum step)
     function [31:0] next_crc32;
         input [31:0] current_crc;
         input [31:0] data_in;
-        reg   [31:0] x;
+        reg   [31:0] c;
+        integer      i;
         begin
-            x = current_crc ^ data_in;
-            next_crc32 = {x[30:0], 1'b0} ^ (x[31] ? 32'h04C11DB7 : 32'h0);
+            c = current_crc ^ data_in;
+            for (i = 0; i < 32; i = i + 1) begin
+                c = (c >> 1) ^ (c[0] ? 32'hEDB88320 : 32'h0000_0000);
+            end
+            next_crc32 = c;
         end
     endfunction
 
@@ -302,7 +306,7 @@ module bram_dma_ip #(
                         s_axi_rdata <= {26'd0, crc_err, state, ip_done_irq};
                     end
                     EXPECTED_CRC_ADDR: begin
-                        s_axi_rdata <= crc_accum;
+                        s_axi_rdata <= ~crc_accum;
                     end
                     COMPUTE_CTRL_ADDR: begin
                         s_axi_rdata <= ctrl_reg;
@@ -399,7 +403,7 @@ module bram_dma_ip #(
                 // -------------------------------------------------------------
                 S_CHECK_CRC: begin
                     // Bypass CRC check if expected_crc is 0, or if accumulator matches
-                    if ((crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
+                    if ((~crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
                         crc_err           <= 1'b0;
                         comp_rd_ptr       <= 0;
                         comp_stage1_valid <= 1'b0;

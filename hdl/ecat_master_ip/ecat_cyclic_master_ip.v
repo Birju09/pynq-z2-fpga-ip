@@ -177,15 +177,20 @@ module ecat_cyclic_master_ip #(
     end
 
     // =========================================================================
-    // 32-bit CRC-32 Function (Used for DMA Ingress Check & Ethernet FCS)
+    // Standard IEEE 802.3 Ethernet FCS CRC-32 Function (32-bit parallel)
+    // Polynomial: 0xEDB88320 (reflected / LSB-first)
     // =========================================================================
     function [31:0] next_crc32;
         input [31:0] current_crc;
         input [31:0] data_in;
-        reg   [31:0] x;
+        reg   [31:0] c;
+        integer      i;
         begin
-            x = current_crc ^ data_in;
-            next_crc32 = {x[30:0], 1'b0} ^ (x[31] ? 32'h04C11DB7 : 32'h0);
+            c = current_crc ^ data_in;
+            for (i = 0; i < 32; i = i + 1) begin
+                c = (c >> 1) ^ (c[0] ? 32'hEDB88320 : 32'h0000_0000);
+            end
+            next_crc32 = c;
         end
     endfunction
 
@@ -395,7 +400,7 @@ module ecat_cyclic_master_ip #(
                                 ip_done_irq       // [0]     Level-High IRQ status
                             };
                         end
-                        EXPECTED_CRC_ADDR:  s_axi_rdata <= crc_accum;
+                        EXPECTED_CRC_ADDR:  s_axi_rdata <= ~crc_accum;
                         COMPUTE_CTRL_ADDR:  s_axi_rdata <= ctrl_reg;
                         PACING_TIMER_ADDR:  s_axi_rdata <= cfg_pacing_timer;
                         CFG_PAYLOAD_ADDR:   s_axi_rdata <= cfg_payload_words;
@@ -484,7 +489,7 @@ module ecat_cyclic_master_ip #(
                 else if (tx_beat_idx == (12'd6 + cur_payload_words))
                     next_eth_tx_word = 32'h0000_0000; // Outgoing WKC initialized to 0
                 else
-                    next_eth_tx_word = tx_fcs_accum; // Trailing Ethernet FCS (CRC-32)
+                    next_eth_tx_word = ~tx_fcs_accum; // Trailing Ethernet FCS (CRC-32)
             end
         endcase
     end
@@ -574,7 +579,7 @@ module ecat_cyclic_master_ip #(
                 // 2. CHECK CRC: Validate DMA MM2S CRC-32 & initialize cycle
                 // -------------------------------------------------------------
                 S_CHECK_CRC: begin
-                    if ((crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
+                    if ((~crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
                         crc_err          <= 1'b0;
                         wkc_err          <= 1'b0;
                         cur_desc_idx     <= 4'd0;
@@ -676,13 +681,13 @@ module ecat_cyclic_master_ip #(
                                 // Final Beat: Verify Ethernet FCS (CRC-32) & finalize descriptor
                                 desc_status[cur_desc_idx[2:0]] <= {
                                     13'd0,
-                                    1'b1,                            // [18] frame_done
-                                    (eth_rx_tdata != rx_fcs_accum),  // [17] frame_fcs_err
-                                    rx_frame_wkc_err,                // [16] frame_wkc_err
-                                    rx_latched_wkc                   // [15:0] actual_wkc
+                                    1'b1,                             // [18] frame_done
+                                    (eth_rx_tdata != ~rx_fcs_accum),  // [17] frame_fcs_err
+                                    rx_frame_wkc_err,                 // [16] frame_wkc_err
+                                    rx_latched_wkc                    // [15:0] actual_wkc
                                 };
 
-                                if (eth_rx_tdata != rx_fcs_accum) begin
+                                if (eth_rx_tdata != ~rx_fcs_accum) begin
                                     crc_err <= 1'b1;
                                 end
                                 if (rx_frame_wkc_err) begin

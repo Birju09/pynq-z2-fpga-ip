@@ -106,14 +106,18 @@ module tb_ecat_master;
     initial clk = 1'b0;
     always #5 clk = ~clk;
 
-    // Helper CRC-32 function matching hardware
+    // Helper CRC-32 function matching hardware (IEEE 802.3 Ethernet FCS)
     function [31:0] next_crc32;
         input [31:0] current_crc;
         input [31:0] data_in;
-        reg   [31:0] x;
+        reg   [31:0] c;
+        integer      i;
         begin
-            x = current_crc ^ data_in;
-            next_crc32 = {x[30:0], 1'b0} ^ (x[31] ? 32'h04C11DB7 : 32'h0);
+            c = current_crc ^ data_in;
+            for (i = 0; i < 32; i = i + 1) begin
+                c = (c >> 1) ^ (c[0] ? 32'hEDB88320 : 32'h0000_0000);
+            end
+            next_crc32 = c;
         end
     endfunction
 
@@ -219,6 +223,7 @@ module tb_ecat_master;
             tx_buf[i] = 32'hA500_0000 ^ (i * 32'h0001_0103);
             calc_crc  = next_crc32(calc_crc, tx_buf[i]);
         end
+        calc_crc = ~calc_crc;
 
         // Write expected_crc and verify FSM remains in S_IDLE (Rule 1a)
         axi_write(10'h00C, calc_crc);
@@ -337,6 +342,48 @@ module tb_ecat_master;
 
         // Abort/Reset back to S_IDLE via TRIGGER_ADDR (0x00)
         axi_write(10'h000, 32'h0000_0001);
+        repeat (5) @(posedge clk);
+
+        // =====================================================================
+        // TEST 3: Corrupted Ingress CRC Fault Injection (Rule 1b)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 3: Ingress CRC Fault Injection (Deliberate CRC mismatch)");
+        $display("==================================================================");
+        // Reset slaves back online
+        axi_write(10'h018, 32'hFFFF_FFFF);
+        axi_write(10'h01C, 32'h0000_00FF);
+
+        // Write intentionally wrong expected_crc (0xDEADBEEF)
+        axi_write(10'h00C, 32'hDEAD_BEEF);
+
+        // Stream 1,280 words over S_AXIS MM2S
+        for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
+            @(posedge clk);
+            s_axis_tdata  <= tx_buf[i];
+            s_axis_tvalid <= 1'b1;
+            s_axis_tlast  <= (i == PAYLOAD_WORDS - 1);
+            while (!s_axis_tready) @(posedge clk);
+        end
+        @(posedge clk);
+        s_axis_tvalid <= 1'b0;
+        s_axis_tlast  <= 1'b0;
+
+        // Wait for IRQ from CRC failure
+        wait (ip_done_irq == 1'b1);
+        axi_read(10'h004, status_val);
+        $display("[+] CRC Error STATUS=0x%08X (CRC_ERR=%b, Level-High IRQ=%b)",
+                 status_val, status_val[5], status_val[0]);
+
+        if (status_val[5] !== 1'b1) begin
+            $display("[-] FAIL: Master did not assert CRC_ERR (bit 5) upon corrupted ingress!");
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Master detected corrupted Ingress CRC and raised CRC_ERR=1!");
+        end
+
+        // Acknowledge IRQ and clear back to S_IDLE
+        axi_write(10'h004, 32'h0000_0001);
         repeat (5) @(posedge clk);
 
         $display("\n==================================================================");

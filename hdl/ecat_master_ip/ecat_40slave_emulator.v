@@ -61,15 +61,20 @@ module ecat_40slave_emulator #(
     (* ram_style = "block" *) reg [DATA_WIDTH-1:0] slave_pdo_ram [0:TOTAL_WORDS-1];
 
     // =========================================================================
-    // 32-bit Frame Check Sequence (CRC-32) Function
+    // Standard IEEE 802.3 Ethernet FCS CRC-32 Function (32-bit parallel)
+    // Polynomial: 0xEDB88320 (reflected / LSB-first)
     // =========================================================================
     function [31:0] next_crc32;
         input [31:0] current_crc;
         input [31:0] data_in;
-        reg   [31:0] x;
+        reg   [31:0] c;
+        integer      i;
         begin
-            x = current_crc ^ data_in;
-            next_crc32 = {x[30:0], 1'b0} ^ (x[31] ? 32'h04C11DB7 : 32'h0);
+            c = current_crc ^ data_in;
+            for (i = 0; i < 32; i = i + 1) begin
+                c = (c >> 1) ^ (c[0] ? 32'hEDB88320 : 32'h0000_0000);
+            end
+            next_crc32 = c;
         end
     endfunction
 
@@ -123,7 +128,7 @@ module ecat_40slave_emulator #(
             wire_out_word = {16'h0000, s_axis_tdata[15:0] + wkc_accum};
         end else begin
             // Beat 7+N (tlast): Ethernet FCS (CRC-32) over all preceding beats
-            wire_out_word = fcs_accum;
+            wire_out_word = ~fcs_accum;
         end
     end
 
