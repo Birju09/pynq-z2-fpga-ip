@@ -458,6 +458,17 @@ module ecat_cyclic_master_ip #(
     wire [15:0] cur_payload_bytes = {2'b00, cur_payload_words, 2'b00};
     wire [15:0] ecat_hdr_word     = {4'h1, (cur_payload_bytes[11:0] + 12'd12)}; // Type=1, Len=Payload+12
 
+    // Freeze BRAM Port B output on first cycle of beat when pacing_timer > 0
+    reg  [DATA_WIDTH-1:0] tx_word_buf;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            tx_word_buf <= 32'd0;
+        end else if (pacing_timer == cfg_pacing_timer[15:0]) begin
+            tx_word_buf <= portb_dout;
+        end
+    end
+    wire [31:0] pdo_tx_word = (cfg_pacing_timer == 32'd0) ? portb_dout : tx_word_buf;
+
     reg  [31:0] next_eth_tx_word;
     always @(*) begin
         case (tx_beat_idx)
@@ -469,7 +480,7 @@ module ecat_cyclic_master_ip #(
             12'd5:   next_eth_tx_word = cur_logical_addr;
             default: begin
                 if (tx_beat_idx < (12'd6 + cur_payload_words))
-                    next_eth_tx_word = portb_dout; // Prefetched TxPDO word from BRAM Port B
+                    next_eth_tx_word = pdo_tx_word; // Prefetched TxPDO word from BRAM Port B
                 else if (tx_beat_idx == (12'd6 + cur_payload_words))
                     next_eth_tx_word = 32'h0000_0000; // Outgoing WKC initialized to 0
                 else

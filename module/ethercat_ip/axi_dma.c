@@ -801,7 +801,7 @@ static int axi_dma_remove(struct platform_device* pdev) {
 }
 
 static const struct of_device_id axi_dma_of_match[] = {
-    {.compatible = "xlnx,axi-dma-1.00.a"},
+    {.compatible = "xlnx,axi-dma-custom"},
     {},
 };
 MODULE_DEVICE_TABLE(of, axi_dma_of_match);
@@ -809,7 +809,7 @@ MODULE_DEVICE_TABLE(of, axi_dma_of_match);
 static struct platform_driver axi_dma_driver = {
     .driver =
         {
-            .name = "axi_dma_driver",
+            .name = "axi_dma_custom",
             .of_match_table = axi_dma_of_match,
         },
     .probe = axi_dma_probe,

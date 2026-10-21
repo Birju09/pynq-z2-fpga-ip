@@ -190,7 +190,7 @@ module tb_ecat_master;
 
         // 1. Dynamically program the 4-frame Descriptor Table from PS
         axi_write(10'h008, 32'h0000_0014); // 4 descriptors, internal emulator enabled
-        axi_write(10'h010, 32'h0000_0000); // 0 wire delay ticks for fast sim
+        axi_write(10'h010, 32'd31);        // 31 wire delay ticks (matching 100BASE-TX)
         axi_write(10'h014, PAYLOAD_WORDS); // 1280 words = 5120 bytes
 
         // Desc 0: Logical Addr 0, 352 words (1408B, Slaves 0..10), Offset 0, Expected WKC 33
