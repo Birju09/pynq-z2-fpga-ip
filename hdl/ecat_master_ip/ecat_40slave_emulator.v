@@ -61,20 +61,48 @@ module ecat_40slave_emulator #(
     (* ram_style = "block" *) reg [DATA_WIDTH-1:0] slave_pdo_ram [0:TOTAL_WORDS-1];
 
     // =========================================================================
-    // Standard IEEE 802.3 Ethernet FCS CRC-32 Function (32-bit parallel)
+    // Standard IEEE 802.3 Ethernet FCS CRC-32 (2-LUT Parallel Matrix)
     // Polynomial: 0xEDB88320 (reflected / LSB-first)
+    // Maximum logic depth: 2 LUT6 levels (sub-nanosecond propagation delay)
     // =========================================================================
     function [31:0] next_crc32;
         input [31:0] current_crc;
         input [31:0] data_in;
-        reg   [31:0] c;
-        integer      i;
+        reg   [31:0] d;
         begin
-            c = current_crc ^ data_in;
-            for (i = 0; i < 32; i = i + 1) begin
-                c = (c >> 1) ^ (c[0] ? 32'hEDB88320 : 32'h0000_0000);
-            end
-            next_crc32 = c;
+            d = current_crc ^ data_in;
+            next_crc32[ 0] = d[0] ^ d[1] ^ d[2] ^ d[3] ^ d[4] ^ d[6] ^ d[7] ^ d[8] ^ d[16] ^ d[20] ^ d[22] ^ d[23] ^ d[26];
+            next_crc32[ 1] = d[1] ^ d[2] ^ d[3] ^ d[4] ^ d[5] ^ d[7] ^ d[8] ^ d[9] ^ d[17] ^ d[21] ^ d[23] ^ d[24] ^ d[27];
+            next_crc32[ 2] = d[0] ^ d[2] ^ d[3] ^ d[4] ^ d[5] ^ d[6] ^ d[8] ^ d[9] ^ d[10] ^ d[18] ^ d[22] ^ d[24] ^ d[25] ^ d[28];
+            next_crc32[ 3] = d[1] ^ d[3] ^ d[4] ^ d[5] ^ d[6] ^ d[7] ^ d[9] ^ d[10] ^ d[11] ^ d[19] ^ d[23] ^ d[25] ^ d[26] ^ d[29];
+            next_crc32[ 4] = d[2] ^ d[4] ^ d[5] ^ d[6] ^ d[7] ^ d[8] ^ d[10] ^ d[11] ^ d[12] ^ d[20] ^ d[24] ^ d[26] ^ d[27] ^ d[30];
+            next_crc32[ 5] = d[0] ^ d[3] ^ d[5] ^ d[6] ^ d[7] ^ d[8] ^ d[9] ^ d[11] ^ d[12] ^ d[13] ^ d[21] ^ d[25] ^ d[27] ^ d[28] ^ d[31];
+            next_crc32[ 6] = d[0] ^ d[2] ^ d[3] ^ d[9] ^ d[10] ^ d[12] ^ d[13] ^ d[14] ^ d[16] ^ d[20] ^ d[23] ^ d[28] ^ d[29];
+            next_crc32[ 7] = d[1] ^ d[3] ^ d[4] ^ d[10] ^ d[11] ^ d[13] ^ d[14] ^ d[15] ^ d[17] ^ d[21] ^ d[24] ^ d[29] ^ d[30];
+            next_crc32[ 8] = d[0] ^ d[2] ^ d[4] ^ d[5] ^ d[11] ^ d[12] ^ d[14] ^ d[15] ^ d[16] ^ d[18] ^ d[22] ^ d[25] ^ d[30] ^ d[31];
+            next_crc32[ 9] = d[0] ^ d[2] ^ d[4] ^ d[5] ^ d[7] ^ d[8] ^ d[12] ^ d[13] ^ d[15] ^ d[17] ^ d[19] ^ d[20] ^ d[22] ^ d[31];
+            next_crc32[10] = d[0] ^ d[2] ^ d[4] ^ d[5] ^ d[7] ^ d[9] ^ d[13] ^ d[14] ^ d[18] ^ d[21] ^ d[22] ^ d[26];
+            next_crc32[11] = d[1] ^ d[3] ^ d[5] ^ d[6] ^ d[8] ^ d[10] ^ d[14] ^ d[15] ^ d[19] ^ d[22] ^ d[23] ^ d[27];
+            next_crc32[12] = d[2] ^ d[4] ^ d[6] ^ d[7] ^ d[9] ^ d[11] ^ d[15] ^ d[16] ^ d[20] ^ d[23] ^ d[24] ^ d[28];
+            next_crc32[13] = d[0] ^ d[3] ^ d[5] ^ d[7] ^ d[8] ^ d[10] ^ d[12] ^ d[16] ^ d[17] ^ d[21] ^ d[24] ^ d[25] ^ d[29];
+            next_crc32[14] = d[0] ^ d[1] ^ d[4] ^ d[6] ^ d[8] ^ d[9] ^ d[11] ^ d[13] ^ d[17] ^ d[18] ^ d[22] ^ d[25] ^ d[26] ^ d[30];
+            next_crc32[15] = d[1] ^ d[2] ^ d[5] ^ d[7] ^ d[9] ^ d[10] ^ d[12] ^ d[14] ^ d[18] ^ d[19] ^ d[23] ^ d[26] ^ d[27] ^ d[31];
+            next_crc32[16] = d[1] ^ d[4] ^ d[7] ^ d[10] ^ d[11] ^ d[13] ^ d[15] ^ d[16] ^ d[19] ^ d[22] ^ d[23] ^ d[24] ^ d[26] ^ d[27] ^ d[28];
+            next_crc32[17] = d[2] ^ d[5] ^ d[8] ^ d[11] ^ d[12] ^ d[14] ^ d[16] ^ d[17] ^ d[20] ^ d[23] ^ d[24] ^ d[25] ^ d[27] ^ d[28] ^ d[29];
+            next_crc32[18] = d[0] ^ d[3] ^ d[6] ^ d[9] ^ d[12] ^ d[13] ^ d[15] ^ d[17] ^ d[18] ^ d[21] ^ d[24] ^ d[25] ^ d[26] ^ d[28] ^ d[29] ^ d[30];
+            next_crc32[19] = d[0] ^ d[1] ^ d[4] ^ d[7] ^ d[10] ^ d[13] ^ d[14] ^ d[16] ^ d[18] ^ d[19] ^ d[22] ^ d[25] ^ d[26] ^ d[27] ^ d[29] ^ d[30] ^ d[31];
+            next_crc32[20] = d[0] ^ d[3] ^ d[4] ^ d[5] ^ d[6] ^ d[7] ^ d[11] ^ d[14] ^ d[15] ^ d[16] ^ d[17] ^ d[19] ^ d[22] ^ d[27] ^ d[28] ^ d[30] ^ d[31];
+            next_crc32[21] = d[0] ^ d[2] ^ d[3] ^ d[5] ^ d[12] ^ d[15] ^ d[17] ^ d[18] ^ d[22] ^ d[26] ^ d[28] ^ d[29] ^ d[31];
+            next_crc32[22] = d[2] ^ d[7] ^ d[8] ^ d[13] ^ d[18] ^ d[19] ^ d[20] ^ d[22] ^ d[26] ^ d[27] ^ d[29] ^ d[30];
+            next_crc32[23] = d[0] ^ d[3] ^ d[8] ^ d[9] ^ d[14] ^ d[19] ^ d[20] ^ d[21] ^ d[23] ^ d[27] ^ d[28] ^ d[30] ^ d[31];
+            next_crc32[24] = d[2] ^ d[3] ^ d[6] ^ d[7] ^ d[8] ^ d[9] ^ d[10] ^ d[15] ^ d[16] ^ d[21] ^ d[23] ^ d[24] ^ d[26] ^ d[28] ^ d[29] ^ d[31];
+            next_crc32[25] = d[1] ^ d[2] ^ d[6] ^ d[9] ^ d[10] ^ d[11] ^ d[17] ^ d[20] ^ d[23] ^ d[24] ^ d[25] ^ d[26] ^ d[27] ^ d[29] ^ d[30];
+            next_crc32[26] = d[2] ^ d[3] ^ d[7] ^ d[10] ^ d[11] ^ d[12] ^ d[18] ^ d[21] ^ d[24] ^ d[25] ^ d[26] ^ d[27] ^ d[28] ^ d[30] ^ d[31];
+            next_crc32[27] = d[0] ^ d[1] ^ d[2] ^ d[6] ^ d[7] ^ d[11] ^ d[12] ^ d[13] ^ d[16] ^ d[19] ^ d[20] ^ d[23] ^ d[25] ^ d[27] ^ d[28] ^ d[29] ^ d[31];
+            next_crc32[28] = d[0] ^ d[4] ^ d[6] ^ d[12] ^ d[13] ^ d[14] ^ d[16] ^ d[17] ^ d[21] ^ d[22] ^ d[23] ^ d[24] ^ d[28] ^ d[29] ^ d[30];
+            next_crc32[29] = d[0] ^ d[1] ^ d[5] ^ d[7] ^ d[13] ^ d[14] ^ d[15] ^ d[17] ^ d[18] ^ d[22] ^ d[23] ^ d[24] ^ d[25] ^ d[29] ^ d[30] ^ d[31];
+            next_crc32[30] = d[3] ^ d[4] ^ d[7] ^ d[14] ^ d[15] ^ d[18] ^ d[19] ^ d[20] ^ d[22] ^ d[24] ^ d[25] ^ d[30] ^ d[31];
+            next_crc32[31] = d[0] ^ d[1] ^ d[2] ^ d[3] ^ d[5] ^ d[6] ^ d[7] ^ d[15] ^ d[19] ^ d[21] ^ d[22] ^ d[25] ^ d[31];
         end
     endfunction
 
@@ -89,14 +117,13 @@ module ecat_40slave_emulator #(
     reg [15:0]           wkc_accum;
     reg [NUM_SLAVES-1:0] slave_visited;
     reg [31:0]           fcs_accum;
+    reg [31:0]           cur_byte_addr;
 
     // Ready whenever downstream can accept (or output register is empty)
     assign s_axis_tready = m_axis_tready || !m_axis_tvalid;
     wire   beat_fire     = s_axis_tvalid && s_axis_tready;
 
-    // Combinational calculation for current PDO beat
-    wire [11:0] pdo_word_idx  = beat_idx - 12'd6;
-    wire [31:0] cur_byte_addr = latched_logical_addr + {18'd0, pdo_word_idx, 2'b00};
+    // Registered byte address & slave mapping for current PDO beat
     wire [5:0]  cur_slave_id  = cur_byte_addr[12:7]; // 128 bytes per slave (2^7)
     wire [10:0] ram_word_addr = cur_byte_addr[12:2]; // 32-bit word index in 8KB space
 
@@ -139,6 +166,7 @@ module ecat_40slave_emulator #(
             latched_payload_bytes <= 16'd0;
             latched_payload_words <= 12'd0;
             latched_logical_addr  <= 32'd0;
+            cur_byte_addr         <= 32'd0;
             wkc_accum             <= 16'd0;
             slave_visited         <= {NUM_SLAVES{1'b0}};
             fcs_accum             <= 32'hFFFF_FFFF;
@@ -162,6 +190,7 @@ module ecat_40slave_emulator #(
                 // Frame state progression
                 if (s_axis_tlast) begin
                     beat_idx      <= 12'd0;
+                    cur_byte_addr <= 32'd0;
                     wkc_accum     <= 16'd0;
                     slave_visited <= {NUM_SLAVES{1'b0}};
                     fcs_accum     <= 32'hFFFF_FFFF;
@@ -183,8 +212,10 @@ module ecat_40slave_emulator #(
                         slave_visited         <= {NUM_SLAVES{1'b0}};
                     end else if (beat_idx == 12'd5) begin
                         latched_logical_addr  <= s_axis_tdata;
+                        cur_byte_addr         <= s_axis_tdata;
                     end else if ((beat_idx >= 12'd6) &&
                                  (beat_idx < (12'd6 + latched_payload_words))) begin
+                        cur_byte_addr <= cur_byte_addr + 32'd4;
                         if (first_hit) begin
                             wkc_accum                    <= wkc_accum + wkc_step;
                             slave_visited[cur_slave_id] <= 1'b1;
