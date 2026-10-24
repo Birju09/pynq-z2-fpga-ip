@@ -244,13 +244,12 @@ module tb_ecat_master;
         axi_write(10'h074, {8'd3, 8'h0C, 4'd0, 12'd224});
         axi_write(10'h078, {16'd21, 4'd0, 12'd1056});
 
-        // Prepare 5 KB TxPDO payload and compute expected CRC-32
-        calc_crc = 32'hFFFF_FFFF;
+        // Prepare 5 KB TxPDO payload and compute expected 32-bit additive checksum
+        calc_crc = 32'd0;
         for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
             tx_buf[i] = 32'hA500_0000 ^ (i * 32'h0001_0103);
-            calc_crc  = next_crc32(calc_crc, tx_buf[i]);
+            calc_crc  = calc_crc + tx_buf[i];
         end
-        calc_crc = ~calc_crc;
 
         // Write expected_crc and verify FSM remains in S_IDLE (Rule 1a)
         axi_write(10'h00C, calc_crc);

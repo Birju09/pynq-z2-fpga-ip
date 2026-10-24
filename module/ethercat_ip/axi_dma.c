@@ -83,23 +83,14 @@ static inline u32 dma_read(struct axi_dma_dev* dev, u32 offset) {
     return ioread32(dev->regs + offset);
 }
 
-/* Calculate 32-bit CRC matching IEEE 802.3 Ethernet standard (reflected poly 0xEDB88320) */
-static inline u32 next_crc32(u32 current_crc, u32 data_in) {
-    u32 c = current_crc ^ data_in;
-    int i;
-    for (i = 0; i < 32; i++) {
-        c = (c >> 1) ^ ((c & 1) ? 0xEDB88320 : 0);
-    }
-    return c;
-}
-
+/* Fast 32-bit Additive Checksum for strictly DMA ingress validation (Option 1) */
 static u32 calc_crc32(const u32* data, size_t num_words) {
-    u32 crc = 0xFFFFFFFF;
+    u32 sum = 0;
     size_t i;
     for (i = 0; i < num_words; i++) {
-        crc = next_crc32(crc, data[i]);
+        sum += data[i];
     }
-    return ~crc;
+    return sum;
 }
 
 /* Dynamic ARM GIC SPI IRQ mapper (fallback when not in device tree) */

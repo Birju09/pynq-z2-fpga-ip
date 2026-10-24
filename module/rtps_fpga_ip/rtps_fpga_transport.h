@@ -1,0 +1,466 @@
+#ifndef _RTPS_FPGA_TRANSPORT_H_
+#define _RTPS_FPGA_TRANSPORT_H_
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include "axi_rtps.h"
+
+/* =========================================================================
+ * 1. Flat-Copy C-Struct Sample Layout (`@final @flat_data`, 4,096 Bytes)
+ *    Matches Q12 of the Design Decisions:
+ *      Word 0    : cycle_id (uint32_t)
+ *      Word 1    : flags (uint32_t)
+ *      Words 2..3: tx_timestamp_ns (uint64_t)
+ *      Words 4..1023: payload[1020] (4,080 bytes)
+ * ========================================================================= */
+struct FastSample {
+    uint32_t cycle_id;
+    uint32_t flags;
+    uint64_t tx_timestamp_ns;
+    uint32_t payload[1020];
+} __attribute__((packed, aligned(4)));
+
+/* =========================================================================
+ * 2. RTI Connext Transport Plugin C API Types (`NDDS_Transport_Plugin`)
+ *    Compatible with RTI Connext `ndds/ndds_transport_c.h`
+ * ========================================================================= */
+#define NDDS_TRANSPORT_CLASSID_FPGA_RTPS 0x0F504741 /* 'FPGA' custom class ID */
+#define NDDS_TRANSPORT_ADDRESS_LENGTH    16
+
+typedef int32_t NDDS_Transport_ClassId_t;
+typedef uint32_t NDDS_Transport_Port_t;
+typedef int32_t RTIBool;
+#define RTI_TRUE  1
+#define RTI_FALSE 0
+
+typedef struct NDDS_Transport_Address_t {
+    uint8_t network_ordered_value[NDDS_TRANSPORT_ADDRESS_LENGTH];
+} NDDS_Transport_Address_t;
+
+typedef struct NDDS_Transport_Buffer_t {
+    int32_t length;
+    char*   pointer;
+} NDDS_Transport_Buffer_t;
+
+typedef void* NDDS_Transport_SendResource_t;
+typedef void* NDDS_Transport_RecvResource_t;
+
+typedef struct NDDS_Transport_Message_t {
+    NDDS_Transport_Buffer_t buffer;
+    void*                   loaned_sample_param;
+} NDDS_Transport_Message_t;
+
+struct NDDS_Transport_PluginImpl;
+
+typedef int32_t (*NDDS_Transport_Send_Fcn)(
+    struct NDDS_Transport_PluginImpl* self,
+    const NDDS_Transport_SendResource_t* sr_in,
+    const NDDS_Transport_Address_t* dest_address_in,
+    const NDDS_Transport_Port_t dest_port_in,
+    int32_t transport_priority_in,
+    const NDDS_Transport_Buffer_t iov_in[],
+    int32_t iov_count_in,
+    void* reserved);
+
+typedef int32_t (*NDDS_Transport_Receive_rEA_Fcn)(
+    struct NDDS_Transport_PluginImpl* self,
+    NDDS_Transport_Message_t* message_out,
+    const NDDS_Transport_Buffer_t* buffer_in,
+    const NDDS_Transport_RecvResource_t* rr_in,
+    void* reserved);
+
+typedef int32_t (*NDDS_Transport_CreateSendResource_srEA_Fcn)(
+    struct NDDS_Transport_PluginImpl* self,
+    NDDS_Transport_SendResource_t* sr_out,
+    const NDDS_Transport_Address_t* dest_address_in,
+    const NDDS_Transport_Port_t dest_port_in,
+    int32_t transport_priority_in);
+
+typedef int32_t (*NDDS_Transport_CreateRecvResource_rrEA_Fcn)(
+    struct NDDS_Transport_PluginImpl* self,
+    NDDS_Transport_RecvResource_t* rr_out,
+    NDDS_Transport_Port_t* dest_port_inout,
+    const NDDS_Transport_Address_t* multicast_address_in,
+    int32_t reserved);
+
+/* =========================================================================
+ * 3. Option B FPGA Transport Plugin Instance State
+ * ========================================================================= */
+typedef struct NDDS_Transport_PluginImpl {
+    NDDS_Transport_ClassId_t                   class_id;
+    NDDS_Transport_Send_Fcn                    send;
+    NDDS_Transport_Receive_rEA_Fcn             receive_rEA;
+    NDDS_Transport_CreateSendResource_srEA_Fcn create_send_resource_srEA;
+    NDDS_Transport_CreateRecvResource_rrEA_Fcn create_recv_resource_rrEA;
+
+    /* Hardware device & Zero-Copy Coherent Buffers (`mmap`) */
+    int                        fd;
+    int                        use_mmap;
+    int                        option_b_rtps_rx_mode; /* 1 = 4,156 B RTPS message on RX */
+    uint32_t*                  tx_mmap_buf;
+    uint32_t*                  rx_mmap_buf;
+    size_t                     mmap_size;
+
+    /* Shadow -> Active Endpoint Descriptor Table state */
+    struct rtps_endpoint_cfg   edt_cfg;
+} NDDS_Transport_Plugin;
+
+/* =========================================================================
+ * 4. Option B Transport Plugin Callback Implementations
+ * ========================================================================= */
+
+static inline int32_t FpgaTransport_create_send_resource_srEA(
+    NDDS_Transport_Plugin* self,
+    NDDS_Transport_SendResource_t* sr_out,
+    const NDDS_Transport_Address_t* dest_address_in,
+    const NDDS_Transport_Port_t dest_port_in,
+    int32_t transport_priority_in) {
+    (void)dest_address_in;
+    (void)dest_port_in;
+    (void)transport_priority_in;
+    if (!self || !sr_out)
+        return 0;
+    *sr_out = (NDDS_Transport_SendResource_t)self;
+    return 1;
+}
+
+static inline int32_t FpgaTransport_create_recv_resource_rrEA(
+    NDDS_Transport_Plugin* self,
+    NDDS_Transport_RecvResource_t* rr_out,
+    NDDS_Transport_Port_t* dest_port_inout,
+    const NDDS_Transport_Address_t* multicast_address_in,
+    int32_t reserved) {
+    (void)dest_port_inout;
+    (void)multicast_address_in;
+    (void)reserved;
+    if (!self || !rr_out)
+        return 0;
+    *rr_out = (NDDS_Transport_RecvResource_t)self;
+    return 1;
+}
+
+/*
+ * Option B `FpgaTransport_send()`:
+ *   RTI Connext's `DataWriter::write()` passes a scatter-gather `iov[]` array:
+ *     - iov[0 .. iov_count-2]: CPU-formatted RTPS Header, INFO_TS, DATA, CDR_LE
+ *     - iov[iov_count-1]:      4,096-byte serialized `FastSample` payload
+ *   In Option B, the plugin strips the CPU-built headers and DMAs ONLY the
+ *   4,096-byte serialized `FastSample` payload (`iov[iov_count - 1]`) over MM2S
+ *   (zero-copy if loaned via `get_loan()` from `tx_mmap_buf`).
+ *   The FPGA prepends the wire RTPS v2.4 header + hardware-timestamped INFO_TS +
+ *   DATA + CDR_LE, computes the 1's-complement UDP checksum, and emits the 3 IPv4
+ *   fragments autonomously!
+ */
+static inline int32_t FpgaTransport_send(
+    NDDS_Transport_Plugin* self,
+    const NDDS_Transport_SendResource_t* sr_in,
+    const NDDS_Transport_Address_t* dest_address_in,
+    const NDDS_Transport_Port_t dest_port_in,
+    int32_t transport_priority_in,
+    const NDDS_Transport_Buffer_t iov_in[],
+    int32_t iov_count_in,
+    void* reserved) {
+    (void)sr_in;
+    (void)dest_address_in;
+    (void)dest_port_in;
+    (void)transport_priority_in;
+    (void)reserved;
+
+    if (!self || self->fd < 0 || !iov_in || iov_count_in <= 0)
+        return 0;
+
+    /* Extract the final scatter-gather element holding the 4,096B FastSample payload */
+    const NDDS_Transport_Buffer_t* payload_iov = &iov_in[iov_count_in - 1];
+    if (!payload_iov->pointer || payload_iov->length <= 0)
+        return 0;
+
+    ssize_t written = write(self->fd, payload_iov->pointer, (size_t)payload_iov->length);
+    return (written == (ssize_t)payload_iov->length) ? 1 : 0;
+}
+
+/*
+ * Option B `FpgaTransport_receive_rEA()`:
+ *   In Option B (`CTRL_ADDR[7] == 1`), the FPGA still performs 100% of RX hardware
+ *   offload:
+ *     1. 3-slot IPv4 fragment reassembly (including out-of-order fragments)
+ *     2. Hardware IPv4 header + reassembled UDP 1's-complement checksum validation
+ *     3. 4-entry `guidPrefix` CAM lookup + `writerEntityId` verification
+ *     4. Generic submessage walking (skipping Heartbeat/AckNack/Vendor/Inline QoS)
+ *     5. Latest-Value (`writerSN > last_rx_seq_num`) deduplication
+ *   When a newer valid DATA sample is locked into `egress_slot`, the FPGA streams
+ *   from `Word 2` ("RTPS") for `1,039 words` (`4,156 bytes` = 60B RTPS header +
+ *   4,096B FastSample) into `receive_rEA()`'s buffer so standard RTI Connext
+ *   `DataReader::take()` parses the RTPS message natively!
+ */
+static inline int32_t FpgaTransport_receive_rEA(
+    NDDS_Transport_Plugin* self,
+    NDDS_Transport_Message_t* message_out,
+    const NDDS_Transport_Buffer_t* buffer_in,
+    const NDDS_Transport_RecvResource_t* rr_in,
+    void* reserved) {
+    (void)rr_in;
+    (void)reserved;
+
+    if (!self || self->fd < 0 || !message_out || !buffer_in || !buffer_in->pointer)
+        return 0;
+
+    size_t req_bytes = self->option_b_rtps_rx_mode ? RTPS_FULL_MSG_BYTES : RTPS_FAST_SAMPLE_BYTES;
+    if ((size_t)buffer_in->length < req_bytes)
+        return 0;
+
+    ssize_t nread = read(self->fd, buffer_in->pointer, req_bytes);
+    if (nread != (ssize_t)req_bytes) {
+        message_out->buffer.length  = 0;
+        message_out->buffer.pointer = NULL;
+        return 0;
+    }
+
+    message_out->buffer.pointer      = buffer_in->pointer;
+    message_out->buffer.length       = (int32_t)nread;
+    message_out->loaned_sample_param = self;
+    return 1;
+}
+
+/* =========================================================================
+ * 5. Option B Control-Plane Hook (`on_publication_matched` / `on_subscription_matched`)
+ * ========================================================================= */
+
+static inline int FpgaTransport_on_publication_matched(
+    NDDS_Transport_Plugin* self,
+    uint32_t slot_idx,
+    uint32_t peer_ipv4_host_order,
+    uint16_t local_src_port,
+    uint16_t peer_dst_port,
+    uint32_t dst_mac_lo,
+    uint16_t dst_mac_hi,
+    uint32_t local_writer_entity_id,
+    uint32_t remote_reader_entity_id,
+    uint32_t starting_seq_seed,
+    uint8_t  use_multicast) {
+    if (!self || slot_idx >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    struct rtps_writer_edt_entry* wr = &self->edt_cfg.writers[slot_idx];
+    wr->valid            = 1;
+    wr->use_multicast    = use_multicast ? 1 : 0;
+    wr->payload_words    = RTPS_FAST_SAMPLE_WORDS;
+    wr->dst_ip           = peer_ipv4_host_order;
+    wr->src_port         = local_src_port;
+    wr->dst_port         = peer_dst_port;
+    wr->dst_mac_lo       = dst_mac_lo;
+    wr->dst_mac_hi       = dst_mac_hi;
+    wr->writer_entity_id = local_writer_entity_id;
+    wr->reader_entity_id = remote_reader_entity_id;
+    wr->seq_seed         = starting_seq_seed;
+
+    if (slot_idx + 1 > self->edt_cfg.num_writers)
+        self->edt_cfg.num_writers = (uint8_t)(slot_idx + 1);
+
+    return ioctl(self->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &self->edt_cfg);
+}
+
+static inline int FpgaTransport_on_subscription_matched(
+    NDDS_Transport_Plugin* self,
+    uint32_t cam_slot_idx,
+    const uint32_t remote_guid_prefix[3],
+    uint32_t remote_writer_entity_id,
+    uint32_t local_reader_entity_id) {
+    if (!self || cam_slot_idx >= RTPS_MAX_ENDPOINTS || !remote_guid_prefix)
+        return -EINVAL;
+
+    struct rtps_reader_cam_entry* rd = &self->edt_cfg.readers[cam_slot_idx];
+    rd->valid            = 1;
+    rd->guid_prefix[0]   = remote_guid_prefix[0];
+    rd->guid_prefix[1]   = remote_guid_prefix[1];
+    rd->guid_prefix[2]   = remote_guid_prefix[2];
+    rd->writer_entity_id = remote_writer_entity_id;
+    rd->reader_entity_id = local_reader_entity_id;
+
+    return ioctl(self->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &self->edt_cfg);
+}
+
+/* =========================================================================
+ * 6. Plugin Lifecycle (`create_plugin` / `destroy_plugin`) & Standard DDS
+ *    `DataWriter::write()` / `DataReader::take()` Wrapper Layer
+ * ========================================================================= */
+
+static inline int FpgaTransport_init_plugin(
+    NDDS_Transport_Plugin* plugin,
+    int fd,
+    int enable_option_b_rtps_rx,
+    uint32_t wire_pacing_ticks) {
+    if (!plugin || fd < 0)
+        return -EINVAL;
+
+    memset(plugin, 0, sizeof(*plugin));
+    plugin->class_id                  = NDDS_TRANSPORT_CLASSID_FPGA_RTPS;
+    plugin->send                      = FpgaTransport_send;
+    plugin->receive_rEA               = FpgaTransport_receive_rEA;
+    plugin->create_send_resource_srEA = FpgaTransport_create_send_resource_srEA;
+    plugin->create_recv_resource_rrEA = FpgaTransport_create_recv_resource_rrEA;
+    plugin->fd                        = fd;
+    plugin->option_b_rtps_rx_mode     = enable_option_b_rtps_rx ? 1 : 0;
+    plugin->mmap_size                 = RTPS_IP_MAX_BYTES;
+
+    /* Default Local Participant Identity (Cyclone DDS / RTI Connext Hybrid Node) */
+    plugin->edt_cfg.local_guid_prefix[0] = 0x01100001U;
+    plugin->edt_cfg.local_guid_prefix[1] = 0xAA000001U;
+    plugin->edt_cfg.local_guid_prefix[2] = 0x00000001U;
+    plugin->edt_cfg.local_ip             = 0xC0A8010AU; /* 192.168.1.10 */
+    plugin->edt_cfg.local_mac_lo         = 0x5E100001U;
+    plugin->edt_cfg.local_mac_hi         = 0x0000U;
+    plugin->edt_cfg.num_writers          = 1;
+    plugin->edt_cfg.plugin_rx_rtps_mode  = (uint8_t)plugin->option_b_rtps_rx_mode;
+    plugin->edt_cfg.payload_words        = RTPS_FAST_SAMPLE_WORDS;
+    plugin->edt_cfg.pacing_timer_ticks   = wire_pacing_ticks;
+    plugin->edt_cfg.rx_timeout_ticks     = 500000U; /* 5 ms @ 100 MHz */
+
+    /* Map coherent TX & RX buffers for Zero-Copy `get_loan()` and `receive_rEA()` */
+    plugin->tx_mmap_buf = (uint32_t*)mmap(NULL, plugin->mmap_size,
+                                          PROT_READ | PROT_WRITE, MAP_SHARED,
+                                          fd, AXI_DMA_MMAP_TX_OFFSET);
+    plugin->rx_mmap_buf = (uint32_t*)mmap(NULL, plugin->mmap_size,
+                                          PROT_READ | PROT_WRITE, MAP_SHARED,
+                                          fd, AXI_DMA_MMAP_RX_OFFSET);
+
+    if (plugin->tx_mmap_buf != MAP_FAILED && plugin->rx_mmap_buf != MAP_FAILED) {
+        plugin->use_mmap = 1;
+    } else {
+        if (plugin->tx_mmap_buf != MAP_FAILED)
+            munmap(plugin->tx_mmap_buf, plugin->mmap_size);
+        if (plugin->rx_mmap_buf != MAP_FAILED)
+            munmap(plugin->rx_mmap_buf, plugin->mmap_size);
+        plugin->tx_mmap_buf = (uint32_t*)malloc(RTPS_FULL_MSG_BYTES);
+        plugin->rx_mmap_buf = (uint32_t*)malloc(RTPS_FULL_MSG_BYTES);
+        plugin->use_mmap    = 0;
+        if (!plugin->tx_mmap_buf || !plugin->rx_mmap_buf)
+            return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static inline void FpgaTransport_cleanup_plugin(NDDS_Transport_Plugin* plugin) {
+    if (!plugin)
+        return;
+    if (plugin->use_mmap) {
+        if (plugin->tx_mmap_buf && plugin->tx_mmap_buf != MAP_FAILED)
+            munmap(plugin->tx_mmap_buf, plugin->mmap_size);
+        if (plugin->rx_mmap_buf && plugin->rx_mmap_buf != MAP_FAILED)
+            munmap(plugin->rx_mmap_buf, plugin->mmap_size);
+    } else {
+        free(plugin->tx_mmap_buf);
+        free(plugin->rx_mmap_buf);
+    }
+    plugin->tx_mmap_buf = NULL;
+    plugin->rx_mmap_buf = NULL;
+}
+
+/*
+ * Zero-Copy `FooDataWriter::get_loan()`:
+ *   Returns a pointer directly into the coherent `mmap` TX buffer so the application
+ *   writes its 4 KB `FastSample` in-place with zero CPU memory copies.
+ */
+static inline struct FastSample* DDS_DataWriter_get_loan(NDDS_Transport_Plugin* plugin) {
+    if (!plugin || !plugin->tx_mmap_buf)
+        return NULL;
+    return (struct FastSample*)plugin->tx_mmap_buf;
+}
+
+/*
+ * Standard `FooDataWriter::write()` backed by Option B `NDDS_Transport_Plugin::send()`:
+ *   Constructs the scatter-gather `iov[2]` array identical to RTI Connext's preserialized
+ *   writer path (`iov[0]` = 60B dummy RTPS header, `iov[1]` = 4,096B `FastSample`) and
+ *   invokes `plugin->send()`.
+ */
+static inline int DDS_DataWriter_write(
+    NDDS_Transport_Plugin* plugin,
+    const struct FastSample* sample) {
+    if (!plugin || !sample)
+        return -EINVAL;
+
+    uint32_t dummy_rtps_hdr[RTPS_WIRE_HEADER_WORDS];
+    NDDS_Transport_Buffer_t iov[2];
+    NDDS_Transport_SendResource_t sr = (NDDS_Transport_SendResource_t)plugin;
+    NDDS_Transport_Address_t dst_addr;
+    memset(&dst_addr, 0, sizeof(dst_addr));
+
+    iov[0].pointer = (char*)dummy_rtps_hdr;
+    iov[0].length  = RTPS_WIRE_HEADER_BYTES; /* 60B stripped by Option B plugin->send() */
+    iov[1].pointer = (char*)sample;
+    iov[1].length  = sizeof(struct FastSample); /* 4,096B DMA'd directly to FPGA */
+
+    int32_t ok = plugin->send(plugin, &sr, &dst_addr, 7410, 0, iov, 2, NULL);
+    return ok ? 0 : -EIO;
+}
+
+/*
+ * Standard `FooDataReader::take()` backed by Option B `NDDS_Transport_Plugin::receive_rEA()`:
+ *   Invokes `plugin->receive_rEA()` into the coherent `mmap` RX buffer.
+ *   In Option B (`option_b_rtps_rx_mode == 1`), verifies the 60-byte hardware-validated
+ *   RTPS v2.x wire header (`"RTPS"` magic, `INFO_TS`, `DATA`, `CDR_LE`) and returns a
+ *   zero-copy pointer to the 4,096-byte `FastSample` payload at `Words 15..1038`!
+ */
+static inline int DDS_DataReader_take(
+    NDDS_Transport_Plugin* plugin,
+    const struct FastSample** sample_out,
+    uint64_t* rx_seq_num_out,
+    uint64_t* rx_source_ts_out) {
+    if (!plugin || !sample_out || !plugin->rx_mmap_buf)
+        return -EINVAL;
+
+    NDDS_Transport_RecvResource_t rr = (NDDS_Transport_RecvResource_t)plugin;
+    NDDS_Transport_Buffer_t rx_buf_desc;
+    NDDS_Transport_Message_t msg;
+
+    rx_buf_desc.pointer = (char*)plugin->rx_mmap_buf;
+    rx_buf_desc.length  = plugin->option_b_rtps_rx_mode ? RTPS_FULL_MSG_BYTES : RTPS_FAST_SAMPLE_BYTES;
+
+    int32_t ok = plugin->receive_rEA(plugin, &msg, &rx_buf_desc, &rr, NULL);
+    if (!ok || !msg.buffer.pointer)
+        return -EIO;
+
+    const uint32_t* words = (const uint32_t*)msg.buffer.pointer;
+    if (plugin->option_b_rtps_rx_mode) {
+        /*
+         * Verify the 15-word (60-byte) RTPS v2.x message header returned by S2MM:
+         *   Word 0:  "RTPS" (0x52545053)
+         *   Word 1:  Version 2.x + VendorId
+         *   Word 5:  INFO_TS (0x09010800)
+         *   Word 6:  INFO_TS seconds (LE)
+         *   Word 7:  INFO_TS fraction (LE)
+         *   Word 8:  DATA submessage header (0x1505....)
+         *   Word 12: writerSN Hi (LE)
+         *   Word 13: writerSN Lo (LE)
+         *   Word 14: CDR_LE encapsulation (0x00010000)
+         *   Words 15..1038: 4,096-byte FastSample payload
+         */
+        if (words[0] != 0x52545053U || (words[8] >> 24) != 0x15U || words[14] != 0x00010000U) {
+            return -EBADMSG;
+        }
+        if (rx_source_ts_out) {
+            uint32_t ts_sec  = __builtin_bswap32(words[6]);
+            uint32_t ts_frac = __builtin_bswap32(words[7]);
+            *rx_source_ts_out = ((uint64_t)ts_sec << 32) | ts_frac;
+        }
+        if (rx_seq_num_out) {
+            uint32_t seq_hi = __builtin_bswap32(words[12]);
+            uint32_t seq_lo = __builtin_bswap32(words[13]);
+            *rx_seq_num_out = ((uint64_t)seq_hi << 32) | seq_lo;
+        }
+        *sample_out = (const struct FastSample*)(&words[RTPS_WIRE_HEADER_WORDS]);
+    } else {
+        *sample_out = (const struct FastSample*)words;
+    }
+
+    return 0;
+}
+
+#endif /* _RTPS_FPGA_TRANSPORT_H_ */

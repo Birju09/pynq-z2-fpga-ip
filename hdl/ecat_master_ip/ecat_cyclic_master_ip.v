@@ -226,15 +226,15 @@ module ecat_cyclic_master_ip #(
     reg        crc_err;
     reg        wkc_err;
 
-    // On-the-Fly CRC-32 Accumulation on S_AXIS MM2S Ingress
+    // On-the-Fly 32-bit Additive Checksum Accumulation on S_AXIS MM2S Ingress (Option 1)
     always @(posedge clk) begin
         if (!rst_n) begin
-            crc_accum <= 32'hFFFF_FFFF;
+            crc_accum <= 32'd0;
         end else if (axis_wr) begin
             if (rx_ptr == 0)
-                crc_accum <= next_crc32(32'hFFFF_FFFF, s_axis_tdata);
+                crc_accum <= s_axis_tdata;
             else if (rx_ptr < cfg_payload_words)
-                crc_accum <= next_crc32(crc_accum, s_axis_tdata);
+                crc_accum <= crc_accum + s_axis_tdata;
         end
     end
 
@@ -428,7 +428,7 @@ module ecat_cyclic_master_ip #(
                                 ip_done_irq       // [0]     Level-High IRQ status
                             };
                         end
-                        EXPECTED_CRC_ADDR:  s_axi_rdata <= ~crc_accum;
+                        EXPECTED_CRC_ADDR:  s_axi_rdata <= crc_accum;
                         COMPUTE_CTRL_ADDR:  s_axi_rdata <= ctrl_reg;
                         PACING_TIMER_ADDR:  s_axi_rdata <= cfg_pacing_timer;
                         CFG_PAYLOAD_ADDR:   s_axi_rdata <= cfg_payload_words;
@@ -607,7 +607,7 @@ module ecat_cyclic_master_ip #(
                 // 2. CHECK CRC: Validate DMA MM2S CRC-32 & initialize cycle
                 // -------------------------------------------------------------
                 S_CHECK_CRC: begin
-                    if ((~crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
+                    if ((crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
                         crc_err          <= 1'b0;
                         wkc_err          <= 1'b0;
                         cur_desc_idx     <= 4'd0;
