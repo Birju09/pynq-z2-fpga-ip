@@ -707,7 +707,8 @@ module rtps_fastpath_ip #(
         R_DATA_SEQ_HI     = 5'd14, // Latch writerSeqNum[63:32]
         R_DATA_SEQ_LO     = 5'd15, // Latch writerSeqNum[31:0] & branch on Q-flag (inline QoS)
         R_SKIP_QOS_WAIT   = 5'd16, // 1-cycle BRAM read wait for Inline QoS parameter header
-        R_SKIP_QOS        = 5'd17; // Walk inline QoS parameter list until PID_SENTINEL (0x0001)
+        R_SKIP_QOS        = 5'd17, // Walk inline QoS parameter list until PID_SENTINEL (0x0001)
+        R_COMMIT_SAMPLE   = 5'd18; // Registered commit state (breaks BRAM-to-CE critical path)
 
     reg [4:0]  rx_state;
     reg [11:0] rx_wire_beat;
@@ -726,6 +727,29 @@ module rtps_fastpath_ip #(
     reg        rx_saw_last;
     reg [15:0] rx_udp_csum_accum;
     reg [15:0] rx_udp_len_bytes;
+
+    // Pipelined RX UDP Pseudo-Header Checksum Engine:
+    // Pre-sums the 6 pseudo-header half-words continuously while payload streams in,
+    // so R_CHECK_UDP only needs a single 16-bit add instead of a 32-CARRY4 cascade.
+    reg [19:0] rx_pseudo_sum_pipe;
+    reg [15:0] rx_pseudo_csum;
+    wire [16:0] rx_pseudo_fold1 = {1'b0, rx_pseudo_sum_pipe[15:0]} + {13'd0, rx_pseudo_sum_pipe[19:16]};
+    wire [15:0] rx_pseudo_fold2 = rx_pseudo_fold1[15:0] + {15'd0, rx_pseudo_fold1[16]};
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            rx_pseudo_sum_pipe <= 20'd0;
+            rx_pseudo_csum     <= 16'd0;
+        end else begin
+            rx_pseudo_sum_pipe <= {4'd0, rx_src_ip[31:16]} + {4'd0, rx_src_ip[15:0]} +
+                                  {4'd0, rx_dst_ip[31:16]} + {4'd0, rx_dst_ip[15:0]} +
+                                  {4'd0, 16'h0011}         + {4'd0, rx_udp_len_bytes};
+            rx_pseudo_csum     <= rx_pseudo_fold2;
+        end
+    end
+
+    wire [16:0] rx_chk_fold1 = {1'b0, rx_udp_csum_accum} + {1'b0, rx_pseudo_csum};
+    wire [15:0] rx_chk_final = rx_chk_fold1[15:0] + {15'd0, rx_chk_fold1[16]};
 
     wire [12:0] rx_frag_off_8b  = rx_flags_frag[12:0];
     wire        rx_frag_mf      = rx_flags_frag[13];
@@ -831,36 +855,88 @@ module rtps_fastpath_ip #(
         endcase
     end
 
-    // Combinational UDP Checksum Finalizer in S_CHECK_CRC (sums Pseudo-Header + 17 RTPS Header Words + payload_csum_accum)
-    wire [15:0] ucs_0  = csum_add32(payload_csum_accum, local_src_ip);
-    wire [15:0] ucs_1  = csum_add32(ucs_0,  wr0_dst_ip);
-    wire [15:0] ucs_2  = csum_add32(ucs_1,  {16'h0011, tx_udp_total_bytes});
-    wire [15:0] ucs_3  = csum_add32(ucs_2,  {wr0_src_port, wr0_dst_port});
-    wire [15:0] ucs_4  = csum_add32(ucs_3,  {tx_udp_total_bytes, 16'h0000});
-    wire [15:0] ucs_5  = csum_add32(ucs_4,  32'h5254_5053);
-    wire [15:0] ucs_6  = csum_add32(ucs_5,  {16'h0201, local_vendor_id});
-    wire [15:0] ucs_7  = csum_add32(ucs_6,  local_guid_prefix[95:64]);
-    wire [15:0] ucs_8  = csum_add32(ucs_7,  local_guid_prefix[63:32]);
-    wire [15:0] ucs_9  = csum_add32(ucs_8,  local_guid_prefix[31:0]);
-    wire [15:0] ucs_10 = csum_add32(ucs_9,  32'h0901_0800);
-    wire [15:0] ucs_11 = csum_add32(ucs_10, {latched_tx_ts[39:32], latched_tx_ts[47:40], latched_tx_ts[55:48], latched_tx_ts[63:56]});
-    wire [15:0] ucs_12 = csum_add32(ucs_11, {latched_tx_ts[7:0],   latched_tx_ts[15:8],  latched_tx_ts[23:16], latched_tx_ts[31:24]});
-    wire [15:0] ucs_13 = csum_add32(ucs_12, {8'h15, 8'h05, tx_data_octets_wire});
-    wire [15:0] ucs_14 = csum_add32(ucs_13, 32'h0000_1000);
-    wire [15:0] ucs_15 = csum_add32(ucs_14, wr0_reader_id);
-    wire [15:0] ucs_16 = csum_add32(ucs_15, wr0_writer_id);
-    wire [15:0] ucs_17 = csum_add32(ucs_16, {cur_tx_seq[39:32], cur_tx_seq[47:40], cur_tx_seq[55:48], cur_tx_seq[63:56]});
-    wire [15:0] ucs_18 = csum_add32(ucs_17, {cur_tx_seq[7:0],   cur_tx_seq[15:8],  cur_tx_seq[23:16], cur_tx_seq[31:24]});
-    wire [15:0] ucs_19 = csum_add32(ucs_18, 32'h0001_0000);
-    wire [15:0] calc_tx_udp_csum = (~ucs_19 == 16'h0000) ? 16'hFFFF : ~ucs_19;
+    // =========================================================================
+    // High-Performance Pipelined UDP & IP Checksum Engines (Timing Closure)
+    //
+    // Instead of chaining 60 carry-chains with per-word end-around carries,
+    // we sum the 16-bit half-words into a wide 24-bit binary accumulator tree
+    // (max 1 carry-chain per stage, delay < 1.5 ns), and fold the carries once.
+    //
+    // The result is ready in 4 clock cycles, well before Word 1 is sent on Beat 9.
+    // =========================================================================
+    reg [23:0] ucs_tree_0, ucs_tree_1, ucs_tree_2;
+    reg [15:0] ucs_final_fold;
 
-    // Combinational IPv4 Header Checksum for current TX fragment
-    wire [15:0] ipcs_0 = csum_add32(16'h0000, {16'h4500, tx_frag_ip_len});
-    wire [15:0] ipcs_1 = csum_add32(ipcs_0,   {tx_ip_id_counter, tx_frag_flags});
-    wire [15:0] ipcs_2 = csum_add32(ipcs_1,   {16'h4011, 16'h0000});
-    wire [15:0] ipcs_3 = csum_add32(ipcs_2,   local_src_ip);
-    wire [15:0] ipcs_4 = csum_add32(ipcs_3,   wr0_dst_ip);
-    wire [15:0] calc_tx_ip_hdr_csum = ~ipcs_4;
+    // Stage 1: Sum 8 half-words (4 words: payload_csum, local_src_ip, wr0_dst_ip, udp_len/proto)
+    wire [23:0] ucs_stg0_sum = {8'd0, payload_csum_accum} +
+                               {8'd0, local_src_ip[31:16]} + {8'd0, local_src_ip[15:0]} +
+                               {8'd0, wr0_dst_ip[31:16]}   + {8'd0, wr0_dst_ip[15:0]} +
+                               {8'd0, 16'h0011}            + {8'd0, tx_udp_total_bytes} +
+                               {8'd0, wr0_src_port}        + {8'd0, wr0_dst_port};
+
+    // Stage 2: Sum next 8 half-words (RTPS magic, version/vendor, guidPrefix)
+    wire [23:0] ucs_stg1_sum = ucs_tree_0 +
+                               {8'd0, tx_udp_total_bytes} + 24'd0 +
+                               {8'd0, 16'h5254} + {8'd0, 16'h5053} +
+                               {8'd0, 16'h0201} + {8'd0, local_vendor_id} +
+                               {8'd0, local_guid_prefix[95:80]} + {8'd0, local_guid_prefix[79:64]} +
+                               {8'd0, local_guid_prefix[63:48]} + {8'd0, local_guid_prefix[47:32]} +
+                               {8'd0, local_guid_prefix[31:16]} + {8'd0, local_guid_prefix[15:0]};
+
+    // Stage 3: Sum remaining fields (INFO_TS, timestamp, DATA header, writer/reader IDs, seqNum, CDR_LE)
+    wire [23:0] ucs_stg2_sum = ucs_tree_1 +
+                               {8'd0, 16'h0901} + {8'd0, 16'h0800} +
+                               {8'd0, latched_tx_ts[39:32], latched_tx_ts[47:40]} +
+                               {8'd0, latched_tx_ts[55:48], latched_tx_ts[63:56]} +
+                               {8'd0, latched_tx_ts[7:0],   latched_tx_ts[15:8]}  +
+                               {8'd0, latched_tx_ts[23:16], latched_tx_ts[31:24]} +
+                               {8'd0, 8'h15, 8'h05} + {8'd0, tx_data_octets_wire} +
+                               {8'd0, 16'h0000} + {8'd0, 16'h1000} +
+                               {8'd0, wr0_reader_id[31:16]} + {8'd0, wr0_reader_id[15:0]} +
+                               {8'd0, wr0_writer_id[31:16]} + {8'd0, wr0_writer_id[15:0]} +
+                               {8'd0, cur_tx_seq[39:32], cur_tx_seq[47:40]} +
+                               {8'd0, cur_tx_seq[55:48], cur_tx_seq[63:56]} +
+                               {8'd0, cur_tx_seq[7:0],   cur_tx_seq[15:8]}  +
+                               {8'd0, cur_tx_seq[23:16], cur_tx_seq[31:24]} +
+                               {8'd0, 16'h0001};
+
+    // Final Stage 4: 1's complement carry-fold of the 24-bit binary sum into 16 bits
+    wire [19:0] ucs_fold_tmp1 = {4'd0, ucs_tree_2[15:0]} + {12'd0, ucs_tree_2[23:16]};
+    wire [16:0] ucs_fold_tmp2 = {1'b0, ucs_fold_tmp1[15:0]} + {13'd0, ucs_fold_tmp1[19:16]};
+    wire [15:0] ucs_folded    = ucs_fold_tmp2[15:0] + {15'd0, ucs_fold_tmp2[16]};
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            ucs_tree_0     <= 24'd0;
+            ucs_tree_1     <= 24'd0;
+            ucs_tree_2     <= 24'd0;
+            ucs_final_fold <= 16'd0;
+        end else begin
+            ucs_tree_0     <= ucs_stg0_sum;
+            ucs_tree_1     <= ucs_stg1_sum;
+            ucs_tree_2     <= ucs_stg2_sum;
+            ucs_final_fold <= ucs_folded;
+        end
+    end
+    wire [15:0] calc_tx_udp_csum = (~ucs_final_fold == 16'h0000) ? 16'hFFFF : ~ucs_final_fold;
+
+    // Pipelined IPv4 Header Checksum: computed in 2 stages during Beat 0 and Beat 1
+    reg [19:0] ipcs_stg0;
+    reg [15:0] ipcs_stg1;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            ipcs_stg0 <= 20'd0;
+            ipcs_stg1 <= 16'd0;
+        end else begin
+            ipcs_stg0 <= {4'd0, 16'h4500} + {4'd0, tx_frag_ip_len} +
+                         {4'd0, tx_ip_id_counter} + {4'd0, tx_frag_flags} +
+                         {4'd0, 16'h4011} +
+                         {4'd0, local_src_ip[31:16]} + {4'd0, local_src_ip[15:0]} +
+                         {4'd0, wr0_dst_ip[31:16]}   + {4'd0, wr0_dst_ip[15:0]};
+            ipcs_stg1 <= ~(ipcs_stg0[15:0] + {12'd0, ipcs_stg0[19:16]});
+        end
+    end
+    wire [15:0] calc_tx_ip_hdr_csum = ipcs_stg1;
 
     // Combinational Ethernet + IPv4 + Fragment Word Builder
     reg [31:0] next_wire_tx_word;
@@ -1147,8 +1223,7 @@ module rtps_fastpath_ip #(
                 // Fold UDP pseudo-header into rx_udp_csum_accum & check == 0xFFFF
                 R_CHECK_UDP: begin
                     walk_dgram_words <= rx_udp_len_bytes[13:2];
-                    if (csum_add32(csum_add32(csum_add32(rx_udp_csum_accum, rx_src_ip), rx_dst_ip),
-                                   {16'h0011, rx_udp_len_bytes}) != 16'hFFFF) begin
+                    if (rx_chk_final != 16'hFFFF) begin
                         err_csum       <= 1'b1;
                         stat_csum_errs <= stat_csum_errs + 32'd1;
                         rx_state       <= R_IDLE;
@@ -1320,38 +1395,33 @@ module rtps_fastpath_ip #(
                         walk_cur_word  <= walk_cur_word + 12'd6;
                         rx_state       <= R_SKIP_QOS; // walker_dout already holds Word +6 on next cycle!
                     end else begin
-                        // Q-flag == 0: Word +6 is Encapsulation, Word +7 is Payload start!
-                        // Check Latest-Value invariant: new seqNum > last_rx_seq_num
-                        if ({walk_seq_num[63:32], (walk_submsg_flags[0] ?
-                            {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
-                            walker_dout)} > last_rx_seq_num) begin
-
-                            if (last_rx_seq_num != 64'd0 &&
-                                ({walk_seq_num[63:32], (walk_submsg_flags[0] ?
-                                 {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
-                                 walker_dout)} > (last_rx_seq_num + 64'd1))) begin
-                                stat_seq_gaps <= stat_seq_gaps +
-                                    ((walk_submsg_flags[0] ?
-                                     {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
-                                     walker_dout) - last_rx_seq_num[31:0] - 32'd1);
-                            end
-
-                            last_rx_seq_num         <= {walk_seq_num[63:32], (walk_submsg_flags[0] ?
-                                                       {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
-                                                       walker_dout)};
-                            last_rx_ts              <= walk_ts;
-                            stat_rx_samples         <= stat_rx_samples + 32'd1;
-                            rd_match_count[walk_cam_idx] <= rd_match_count[walk_cam_idx] + 32'd1;
-                            latest_payload_word_off <= walk_cur_word + 12'd7; // Skip 4B encapsulation word (+6)
-                            latest_rtps_words       <= walk_dgram_words - 12'd2;
-                            latest_slot             <= fill_slot;
-                            latest_valid            <= 1'b1;
-                            fill_slot               <= pick_free_slot(fill_slot, egress_slot);
-                        end else begin
-                            stat_stale_drops <= stat_stale_drops + 32'd1;
-                        end
-                        rx_state <= R_IDLE;
+                        // Q-flag == 0: Pipeline into R_COMMIT_SAMPLE to break BRAM-to-CE critical path
+                        rx_state <= R_COMMIT_SAMPLE;
                     end
+                end
+
+                // Registered commit state: all inputs come from registers
+                R_COMMIT_SAMPLE: begin
+                    // Word +6 is Encapsulation, Word +7 is Payload start
+                    // Check Latest-Value invariant: new seqNum > last_rx_seq_num
+                    if (walk_seq_num > last_rx_seq_num) begin
+                        if (last_rx_seq_num != 64'd0 && (walk_seq_num > (last_rx_seq_num + 64'd1))) begin
+                            stat_seq_gaps <= stat_seq_gaps + (walk_seq_num[31:0] - last_rx_seq_num[31:0] - 32'd1);
+                        end
+
+                        last_rx_seq_num              <= walk_seq_num;
+                        last_rx_ts                   <= walk_ts;
+                        stat_rx_samples              <= stat_rx_samples + 32'd1;
+                        rd_match_count[walk_cam_idx] <= rd_match_count[walk_cam_idx] + 32'd1;
+                        latest_payload_word_off      <= walk_cur_word + 12'd7; // Skip 4B encapsulation word (+6)
+                        latest_rtps_words            <= walk_dgram_words - 12'd2;
+                        latest_slot                  <= fill_slot;
+                        latest_valid                 <= 1'b1;
+                        fill_slot                    <= pick_free_slot(fill_slot, egress_slot);
+                    end else begin
+                        stat_stale_drops <= stat_stale_drops + 32'd1;
+                    end
+                    rx_state <= R_IDLE;
                 end
 
                 R_SKIP_QOS_WAIT: begin
@@ -1467,11 +1537,7 @@ module rtps_fastpath_ip #(
                 // -------------------------------------------------------------
                 S_TX_FRAG_INIT: begin
                     cycle_tick_cnt <= cycle_tick_cnt + 32'd1;
-                    // Compute full UDP checksum on fragment 0 init (after latched_tx_ts & cur_tx_seq are valid)
-                    if (tx_frag_idx == 2'd0) begin
-                        tx_udp_csum <= calc_tx_udp_csum;
-                    end
-
+                    // UDP checksum is latched from the 4-stage pipeline on Fragment 0 beat 4 (see S_TX_FRAG_SEND)
                     case (tx_frag_idx)
                         2'd0: begin
                             tx_dgram_word_idx <= 12'd0;
@@ -1515,8 +1581,11 @@ module rtps_fastpath_ip #(
                         state         <= S_IDLE;
                     end else begin
                         cycle_tick_cnt <= cycle_tick_cnt + 32'd1;
-                        if (tx_beat_idx == 12'd0) begin
+                        if (tx_beat_idx == 12'd3) begin
                             tx_frag_hdr_csum <= calc_tx_ip_hdr_csum;
+                        end
+                        if (tx_frag_idx == 2'd0 && tx_beat_idx == 12'd4) begin
+                            tx_udp_csum <= calc_tx_udp_csum;
                         end
 
                         if (!eng_tx_tvalid || eng_tx_tready) begin
@@ -1609,7 +1678,7 @@ module rtps_fastpath_ip #(
                 S_DONE_IRQ: begin
                     eng_tx_tvalid <= 1'b0;
                     eng_tx_tlast  <= 1'b0;
-                    if (status_write_pulse) begin
+                    if (status_write_pulse && status_write_data[0]) begin
                         ip_done_irq <= 1'b0;
                         if (err_crc || err_no_match || err_rx_timeout || (!irq_is_rx && mode_pub_only)) begin
                             irq_is_rx <= 1'b0;
@@ -1633,7 +1702,7 @@ module rtps_fastpath_ip #(
                 // 7. S_WAIT_EGRESS: Wait for Driver read() to prime S2MM & kick
                 // -------------------------------------------------------------
                 S_WAIT_EGRESS: begin
-                    if (status_write_pulse) begin
+                    if (status_write_pulse && status_write_data[1]) begin
                         egress_rd_ptr   <= 0;
                         bram_pipe_valid <= 1'b0;
                         bram_pipe_last  <= 1'b0;

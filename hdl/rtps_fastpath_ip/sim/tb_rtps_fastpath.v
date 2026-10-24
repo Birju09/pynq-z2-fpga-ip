@@ -317,7 +317,7 @@ module tb_rtps_fastpath;
         end
 
         // Kick S2MM Egress & stress Skid Buffer under backpressure
-        axi_write(10'h004, 32'h0000_0001);
+        axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
         while (rx_cnt < PAYLOAD_WORDS) begin
             @(posedge clk);
@@ -376,7 +376,7 @@ module tb_rtps_fastpath;
 
         // ACK & drain S2MM and verify all 1,024 words from out-of-order reassembly (seq_num=2)
         axi_write(10'h004, 32'h0000_0001);
-        axi_write(10'h004, 32'h0000_0001);
+        axi_write(10'h004, 32'h0000_0002);
         m_axis_tready <= 1'b1;
         rx_cnt = 0;
         while (rx_cnt < PAYLOAD_WORDS) begin
@@ -548,7 +548,7 @@ module tb_rtps_fastpath;
 
         // ACK IRQ & Kick S2MM Egress for FpgaTransport_receive_rEA() (1,039 words = 4,156 B)
         axi_write(10'h004, 32'h0000_0001);
-        axi_write(10'h004, 32'h0000_0001);
+        axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
         while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
             @(posedge clk);
@@ -718,8 +718,8 @@ module tb_rtps_fastpath;
             errors = errors + 1;
         end
 
-        // Kick S2MM DMA egress (driver read() writes 1 to STATUS_ADDR)
-        axi_write(10'h004, 32'h0000_0001);
+        // Kick S2MM DMA egress (driver read() writes bit 1 to STATUS_ADDR)
+        axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
         while (rx_cnt < PAYLOAD_WORDS) begin
             @(posedge clk);
@@ -821,7 +821,7 @@ module tb_rtps_fastpath;
         end
 
         // S2MM Readout: Kick S2MM and read 1,024 words
-        axi_write(10'h004, 32'h0000_0001);
+        axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
         while (rx_cnt < PAYLOAD_WORDS) begin
             @(posedge clk);

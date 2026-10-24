@@ -172,8 +172,8 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
         if (ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK)) {
             dev->last_ip_status = ip_status;
 
-            /* Rule 2c: Acknowledge and drop PL Level-High interrupt line immediately */
-            iowrite32(1, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            /* Rule 2c: Acknowledge and drop PL Level-High interrupt line immediately (Bit 0) */
+            iowrite32(RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
 
             /* Separate IP compute/validation error flags cleanly */
             if (ip_status & RTPS_STATUS_ERR_CRC) {
@@ -394,9 +394,9 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     wmb();
     dma_write(dev, XAXIDMA_S2MM_TAILDESC_OFFSET, (u32)dev->rx_bd_phys);
 
-    /* Kick S2MM egress streaming from RTPS Fast-Path IP (S_WAIT_EGRESS -> S_TX_RUN) */
+    /* Kick S2MM egress streaming from RTPS Fast-Path IP (S_WAIT_EGRESS -> S_TX_RUN, Bit 1) */
     if (dev->ip_regs)
-        iowrite32(1, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+        iowrite32(RTPS_STATUS_KICK_EGRESS, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
 
     /* Wait for S2MM completion interrupt */
     ret = wait_event_interruptible_timeout(dev->rx_waitq, dev->rx_done != 0,
@@ -610,6 +610,33 @@ static const struct file_operations axi_rtps_fops = {
     .unlocked_ioctl = axi_rtps_unlocked_ioctl,
 };
 
+/* Sysfs attribute: /sys/class/axi_dma/axi_dma_dev/option_b_mode */
+static ssize_t option_b_mode_show(struct device* dev, struct device_attribute* attr, char* buf) {
+    struct axi_rtps_dev* dmadev = dev_get_drvdata(dev->parent);
+    if (!dmadev)
+        return -ENODEV;
+    return scnprintf(buf, PAGE_SIZE, "%u\n", dmadev->plugin_rx_rtps_mode);
+}
+
+static ssize_t option_b_mode_store(struct device* dev, struct device_attribute* attr, const char* buf, size_t count) {
+    struct axi_rtps_dev* dmadev = dev_get_drvdata(dev->parent);
+    unsigned int val;
+    u32 ctrl_word;
+    if (!dmadev || !dmadev->ip_regs)
+        return -ENODEV;
+    if (kstrtouint(buf, 0, &val))
+        return -EINVAL;
+    dmadev->plugin_rx_rtps_mode = val ? 1 : 0;
+    ctrl_word = ioread32(dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
+    if (dmadev->plugin_rx_rtps_mode)
+        ctrl_word |= RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
+    else
+        ctrl_word &= ~RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
+    iowrite32(ctrl_word, dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
+    return count;
+}
+static DEVICE_ATTR_RW(option_b_mode);
+
 static int axi_rtps_probe(struct platform_device* pdev) {
     struct device* dev = &pdev->dev;
     struct axi_rtps_dev* dmadev = &rtps_device;
@@ -735,6 +762,9 @@ static int axi_rtps_probe(struct platform_device* pdev) {
         goto err_class_destroy;
     }
 
+    if (device_create_file(dmadev->device, &dev_attr_option_b_mode))
+        dev_warn(dev, "failed to create option_b_mode sysfs attribute\n");
+
     ret = request_irq(dmadev->rx_virq, axi_rtps_isr, IRQF_SHARED, "axi_rtps_rx",
                       dmadev);
     if (ret)
@@ -773,6 +803,7 @@ err_free_rx_irq:
         free_irq(dmadev->tx_virq, dmadev);
     free_irq(dmadev->rx_virq, dmadev);
 err_device_destroy:
+    device_remove_file(dmadev->device, &dev_attr_option_b_mode);
     device_destroy(dmadev->class, dmadev->dev_num);
 err_class_destroy:
     class_destroy(dmadev->class);
@@ -812,6 +843,7 @@ static int axi_rtps_remove(struct platform_device* pdev) {
     if (dmadev->rx_virq > 0)
         free_irq(dmadev->rx_virq, dmadev);
 
+    device_remove_file(dmadev->device, &dev_attr_option_b_mode);
     device_destroy(dmadev->class, dmadev->dev_num);
     class_destroy(dmadev->class);
     cdev_del(&dmadev->cdev);

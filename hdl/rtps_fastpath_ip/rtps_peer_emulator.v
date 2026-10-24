@@ -151,13 +151,26 @@ module rtps_peer_emulator #(
     reg [11:0] tx_beat_idx;
     reg [15:0] tx_prev_half;
     reg [31:0] rx_ram_dout;
-    reg [31:0] tx_ram_dout;
     reg [11:0] rx_ram_rd_addr;
     reg [11:0] tx_ram_rd_addr;
 
+    // Pipelined checksum accumulator registers (breaks BRAM read + transform + csum timing path)
+    reg [31:0] build_word_pipe;
+    reg [11:0] csum_pipe_idx;
+    reg        build_pipe_valid;
+
+    // Single-write-port tx_dgram_ram (BRAM inference): the final UDP checksum is
+    // held in udp_csum_final and muxed onto Word 1 at the BRAM output instead of
+    // patching the RAM with a second write port (which forced ~49k FF inference).
+    reg [31:0] tx_ram_q;
+    reg        tx_rd_is_w1;
+    reg [15:0] udp_csum_final;
+    wire [31:0] tx_ram_dout = tx_rd_is_w1 ? {tx_ram_q[31:16], udp_csum_final} : tx_ram_q;
+
     always @(posedge clk) begin
         rx_ram_dout <= rx_dgram_ram[rx_ram_rd_addr];
-        tx_ram_dout <= tx_dgram_ram[tx_ram_rd_addr];
+        tx_ram_q    <= tx_dgram_ram[tx_ram_rd_addr];
+        tx_rd_is_w1 <= (tx_ram_rd_addr == 12'd1);
     end
 
     // Extracted fields from rx_dgram_ram during E_BUILD_DGRAM:
@@ -214,18 +227,43 @@ module rtps_peer_emulator #(
         endcase
     end
 
-    // Combinational IPv4 header checksum calculator for current outgoing fragment
-    wire [15:0] csum_step0 = csum_add32(16'h0000,   {16'h4500, cur_frag_ip_len});
-    wire [15:0] csum_step1 = csum_add32(csum_step0, {peer_ip_id, cur_frag_flags});
-    wire [15:0] csum_step2 = csum_add32(csum_step1, {16'h4011, 16'h0000});
-    wire [15:0] csum_step3 = csum_add32(csum_step2, latched_dst_ip); // Reply SrcIP = Master's DstIP
-    wire [15:0] csum_step4 = csum_add32(csum_step3, latched_src_ip); // Reply DstIP = Master's SrcIP
-    wire [15:0] calc_ip_hdr_csum = ~csum_step4;
+    // Pipelined IPv4 header checksum engine for emulator fragment transmission
+    // Computed in 2 stages (adder tree + fold) during Beat 0 and 1, latched on Beat 3
+    reg [19:0] emu_ipcs_stg0;
+    reg [15:0] emu_ipcs_stg1;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            emu_ipcs_stg0 <= 20'd0;
+            emu_ipcs_stg1 <= 16'd0;
+        end else begin
+            emu_ipcs_stg0 <= {4'd0, 16'h4500} + {4'd0, cur_frag_ip_len} +
+                             {4'd0, peer_ip_id} + {4'd0, cur_frag_flags} +
+                             {4'd0, 16'h4011} +
+                             {4'd0, latched_dst_ip[31:16]} + {4'd0, latched_dst_ip[15:0]} +
+                             {4'd0, latched_src_ip[31:16]} + {4'd0, latched_src_ip[15:0]};
+            emu_ipcs_stg1 <= ~(emu_ipcs_stg0[15:0] + {12'd0, emu_ipcs_stg0[19:16]});
+        end
+    end
 
-    // Pseudo-header + words 0..1 (excluding Word 1 low 16b checksum field) seed
-    wire [15:0] pseudo_step0 = csum_add32(16'h0000,       latched_dst_ip);
-    wire [15:0] pseudo_step1 = csum_add32(pseudo_step0,   latched_src_ip);
-    wire [15:0] pseudo_step2 = csum_add32(pseudo_step1,   {16'h0011, udp_total_bytes});
+    // Pipelined Pseudo-Header Checksum Seed:
+    // Pre-computed continuously in 2 stages so build_idx == 0 only performs
+    // a single 16-bit csum_add32 instead of an unpipelined adder tree.
+    reg [19:0] pseudo_sum20_reg;
+    reg [15:0] emu_pseudo_seed;
+    wire [16:0] pseudo_fold       = {1'b0, pseudo_sum20_reg[15:0]} + {13'd0, pseudo_sum20_reg[19:16]};
+    wire [15:0] pseudo_fold_final = pseudo_fold[15:0] + {15'd0, pseudo_fold[16]};
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            pseudo_sum20_reg <= 20'd0;
+            emu_pseudo_seed  <= 16'd0;
+        end else begin
+            pseudo_sum20_reg <= {4'd0, latched_dst_ip[31:16]} + {4'd0, latched_dst_ip[15:0]} +
+                                {4'd0, latched_src_ip[31:16]} + {4'd0, latched_src_ip[15:0]} +
+                                {4'd0, 16'h0011}             + {4'd0, udp_total_bytes};
+            emu_pseudo_seed  <= pseudo_fold_final;
+        end
+    end
 
     // Outgoing Ethernet + IPv4 + Fragment word mux
     reg [31:0] tx_wire_word;
@@ -270,6 +308,9 @@ module rtps_peer_emulator #(
             peer_seq_num      <= 64'd0;
             peer_ip_id        <= 16'hA000;
             build_idx         <= 12'd0;
+            csum_pipe_idx     <= 12'd0;
+            build_pipe_valid  <= 1'b0;
+            build_word_pipe   <= 32'd0;
             udp_csum_accum    <= 16'd0;
             total_dgram_words <= 12'd1041; // 4164 bytes default
             payload_words_cfg <= 12'd1024; // 4096 bytes default
@@ -363,6 +404,8 @@ module rtps_peer_emulator #(
                                                                               : (peer_seq_num + 64'd1);
                                             peer_ip_id       <= peer_ip_id + 16'd1;
                                             build_idx        <= 12'd0;
+                                            csum_pipe_idx    <= 12'd0;
+                                            build_pipe_valid <= 1'b0;
                                             rx_ram_rd_addr   <= 12'd1; // Prefetch Word 1 for build_idx == 1
                                             state            <= E_BUILD_DGRAM;
                                         end else begin
@@ -378,6 +421,8 @@ module rtps_peer_emulator #(
                                                                               : (peer_seq_num + 64'd1);
                                             peer_ip_id       <= peer_ip_id + 16'd1;
                                             build_idx        <= 12'd0;
+                                            csum_pipe_idx    <= 12'd0;
+                                            build_pipe_valid <= 1'b0;
                                             rx_ram_rd_addr   <= 12'd1; // Prefetch Word 1 for build_idx == 1
                                             state            <= E_BUILD_DGRAM;
                                         end else begin
@@ -396,23 +441,34 @@ module rtps_peer_emulator #(
                 // 2. E_BUILD_DGRAM: Build Outgoing Feedback UDP+RTPS Datagram
                 // -------------------------------------------------------------
                 E_BUILD_DGRAM: begin
+                    // Stage 1: Generate build_word and write into tx_dgram_ram
                     if (build_idx < total_dgram_words) begin
                         tx_dgram_ram[build_idx] <= build_word;
-                        if (build_idx == 12'd0)
-                            udp_csum_accum <= csum_add32(pseudo_step2, build_word);
-                        else
-                            udp_csum_accum <= csum_add32(udp_csum_accum, build_word);
-
-                        build_idx      <= build_idx + 12'd1;
-                        rx_ram_rd_addr <= build_idx + 12'd2;
+                        build_word_pipe         <= build_word;
+                        build_pipe_valid        <= 1'b1;
+                        build_idx               <= build_idx + 12'd1;
+                        rx_ram_rd_addr          <= build_idx + 12'd2;
                     end else begin
+                        build_pipe_valid        <= 1'b0;
+                    end
+
+                    // Stage 2: Pipelined checksum accumulator from registered build_word_pipe
+                    if (build_pipe_valid) begin
+                        if (csum_pipe_idx == 12'd0)
+                            udp_csum_accum <= csum_add32(emu_pseudo_seed, build_word_pipe);
+                        else
+                            udp_csum_accum <= csum_add32(udp_csum_accum, build_word_pipe);
+                        csum_pipe_idx <= csum_pipe_idx + 12'd1;
+                    end
+
+                    // When all words have passed through Stage 2, latch checksum and proceed to TX
+                    if ((build_idx == total_dgram_words) && !build_pipe_valid && (csum_pipe_idx == total_dgram_words)) begin
                         // Patch final UDP checksum into Word 1 of tx_dgram_ram
                         // If fault_ctrl[2] == 1, corrupt UDP checksum deliberately
-                        tx_dgram_ram[12'd1] <= {udp_total_bytes,
-                            fault_ctrl[2] ? (~udp_csum_accum ^ 16'hDEAD) :
-                            ((~udp_csum_accum == 16'h0000) ? 16'hFFFF : ~udp_csum_accum)};
-                        frag_step           <= 2'd0;
-                        state               <= E_TX_INIT;
+                        udp_csum_final <= fault_ctrl[2] ? (~udp_csum_accum ^ 16'hDEAD) :
+                            ((~udp_csum_accum == 16'h0000) ? 16'hFFFF : ~udp_csum_accum);
+                        frag_step      <= 2'd0;
+                        state          <= E_TX_INIT;
                     end
                 end
 
@@ -467,9 +523,9 @@ module rtps_peer_emulator #(
                 // 4. E_TX_STREAM: Stream Ethernet + IPv4 Fragment over m_axis
                 // -------------------------------------------------------------
                 E_TX_STREAM: begin
-                    // Latch computed IPv4 header checksum on beat 0
-                    if (tx_beat_idx == 12'd0) begin
-                        cur_frag_hdr_csum <= calc_ip_hdr_csum;
+                    // Latch computed pipelined IPv4 header checksum on beat 3 (stable after beat 1, sent on beat 6)
+                    if (tx_beat_idx == 12'd3) begin
+                        cur_frag_hdr_csum <= emu_ipcs_stg1;
                     end
 
                     if (!m_axis_tvalid || m_axis_tready) begin

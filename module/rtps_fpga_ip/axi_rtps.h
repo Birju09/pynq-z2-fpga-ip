@@ -66,6 +66,8 @@
 #define RTPS_CTRL_SUB_ONLY               (1U << 9) /* Subscribe-only mode: unsolicited wire RX from S_IDLE */
 
 /* STATUS_ADDR (0x04) Bit Masks */
+#define RTPS_STATUS_ACK_IRQ              (1U << 0) /* Write Bit 0: Acknowledge Level-High IRQ */
+#define RTPS_STATUS_KICK_EGRESS          (1U << 1) /* Write Bit 1: Kick S2MM Egress Streaming */
 #define RTPS_STATUS_IRQ_MASK             (1U << 0)
 #define RTPS_STATUS_STATE_MASK           0x0000001EU
 #define RTPS_STATUS_ERR_CRC              (1U << 5)
