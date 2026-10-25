@@ -443,6 +443,7 @@ static inline int DDS_DataReader_take(
          *   Words 15..1038: 4,096-byte FastSample payload
          */
         if (words[0] != 0x52545053U || (words[8] >> 24) != 0x15U || words[14] != 0x00010000U) {
+            errno = EBADMSG;
             return -EBADMSG;
         }
         if (rx_source_ts_out) {

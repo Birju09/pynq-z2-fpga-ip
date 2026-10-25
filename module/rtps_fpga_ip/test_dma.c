@@ -28,6 +28,90 @@ static const char* rtps_state_name(uint8_t state) {
     }
 }
 
+static void print_detailed_diag(FILE* out, const struct rtps_cycle_diag* diag) {
+    uint8_t cur_state       = (uint8_t)((diag->status_reg & 0x1E) >> 1);
+    uint8_t pre_wr_state    = (uint8_t)((diag->pre_write_ip_status & 0x1E) >> 1);
+    uint8_t isr_pre_state   = (uint8_t)((diag->isr_pre_ack_ip_status & 0x1E) >> 1);
+    uint8_t isr_post_state  = (uint8_t)((diag->isr_post_ack_ip_status & 0x1E) >> 1);
+    uint8_t post_wr_state   = (uint8_t)((diag->post_write_ip_status & 0x1E) >> 1);
+    uint8_t pre_rd_state    = (uint8_t)((diag->pre_read_ip_status & 0x1E) >> 1);
+    uint8_t post_kick_state = (uint8_t)((diag->post_kick_ip_status & 0x1E) >> 1);
+    uint8_t post_50us_state = (uint8_t)((diag->post_50us_ip_status & 0x1E) >> 1);
+
+    fprintf(out, "    Hardware Diagnostic State:\n");
+    fprintf(out, "      - FSM State            : %u [%s]\n", cur_state, rtps_state_name(cur_state));
+    fprintf(out, "      - Status Reg           : 0x%08X (IRQ=%u, IRQ_IS_RX=%u, LIFECYCLE_OK=%u, ERR_CRC=%u, NO_MATCH=%u, TIMEOUT=%u, CSUM=%u)\n",
+            diag->status_reg,
+            diag->status_reg & 1U,
+            (diag->status_reg >> 10) & 1U,
+            (diag->status_reg >> 15) & 1U,
+            diag->err_crc, diag->err_no_match, diag->err_rx_timeout, diag->err_csum);
+    fprintf(out, "      - CTRL Reg             : 0x%08X (EN=%u, Writers=%u, Emu=%u, Wdog=%u, OptionB_RTPS=%u, PubOnly=%u, SubOnly=%u)\n",
+            diag->ctrl_reg,
+            diag->ctrl_reg & 1U,
+            (diag->ctrl_reg >> 1) & 7U,
+            (diag->ctrl_reg >> 4) & 1U,
+            (diag->ctrl_reg >> 6) & 1U,
+            (diag->ctrl_reg >> 7) & 1U,
+            (diag->ctrl_reg >> 8) & 1U,
+            (diag->ctrl_reg >> 9) & 1U);
+    fprintf(out, "      - TX / RX Samples      : %u TX / %u RX (Frags=%u, OptionB_Words=%u [%u B])\n",
+            diag->stat_tx_samples, diag->stat_rx_samples, diag->completed_frags,
+            diag->last_rx_rtps_words, diag->last_rx_rtps_words * 4);
+    fprintf(out, "      - Latest RX SeqNum     : %llu (Gaps=%u, StaleDrops=%u, CsumErrs=%u, SkippedSubmsg=%u)\n",
+            (unsigned long long)diag->last_rx_seq_num,
+            diag->stat_seq_gaps, diag->stat_stale_drops, diag->stat_csum_errs, diag->stat_skipped_submsg);
+    fprintf(out, "    Driver & FSM State Transition Timeline:\n");
+    fprintf(out, "      1. Pre-Write IP Status : 0x%08X -> State %u [%s]\n",
+            diag->pre_write_ip_status, pre_wr_state, rtps_state_name(pre_wr_state));
+    fprintf(out, "      2. ISR Pre-ACK Status  : 0x%08X -> State %u [%s] (IRQ=%u)\n",
+            diag->isr_pre_ack_ip_status, isr_pre_state, rtps_state_name(isr_pre_state),
+            diag->isr_pre_ack_ip_status & 1U);
+    fprintf(out, "      3. ISR Post-ACK Status : 0x%08X -> State %u [%s] (IRQ=%u, ACK Polls=%u)\n",
+            diag->isr_post_ack_ip_status, isr_post_state, rtps_state_name(isr_post_state),
+            diag->isr_post_ack_ip_status & 1U, diag->isr_ack_polls);
+    fprintf(out, "      4. Post-Write Status   : 0x%08X -> State %u [%s]\n",
+            diag->post_write_ip_status, post_wr_state, rtps_state_name(post_wr_state));
+    fprintf(out, "      5. Pre-Read IP Status  : 0x%08X -> State %u [%s]\n",
+            diag->pre_read_ip_status, pre_rd_state, rtps_state_name(pre_rd_state));
+    fprintf(out, "      6. Post-Kick IP Status : 0x%08X -> State %u [%s]\n",
+            diag->post_kick_ip_status, post_kick_state, rtps_state_name(post_kick_state));
+    fprintf(out, "      7. Post-50us IP Status : 0x%08X -> State %u [%s]\n",
+            diag->post_50us_ip_status, post_50us_state, rtps_state_name(post_50us_state));
+    fprintf(out, "    AXI DMA S2MM & Interrupt Diagnostics (Pre-Reset Snapshot):\n");
+    fprintf(out, "      - Linux VIRQs & Counts : MM2S_TX=%u (virq=%d), S2MM_RX=%u (virq=%d), IP_DONE=%u (virq=%d)\n",
+            diag->irq_cnt_tx, diag->tx_virq,
+            diag->irq_cnt_rx, diag->rx_virq,
+            diag->irq_cnt_ip, diag->ip_virq);
+    fprintf(out, "      - S2MM DMACR / DMASR   : 0x%08X / 0x%08X (Halted=%u, Idle=%u, SG=%u, Err=0x%X, IOC_Irq=%u)\n",
+            diag->s2mm_dmacr, diag->s2mm_dmasr,
+            diag->s2mm_dmasr & 1U,
+            (diag->s2mm_dmasr >> 1) & 1U,
+            (diag->s2mm_dmasr >> 3) & 1U,
+            (diag->s2mm_dmasr >> 8) & 7U,
+            (diag->s2mm_dmasr >> 12) & 1U);
+    fprintf(out, "      - S2MM 50us Snapshot   : DMASR=0x%08X, BD_STS=0x%08X\n",
+            diag->post_50us_s2mm_dmasr, diag->post_50us_bd_status);
+    fprintf(out, "      - S2MM CUR / TAILDESC  : 0x%08X / 0x%08X (rx_bd_phys=0x%08X, rx_buf_phys=0x%08X)\n",
+            diag->s2mm_curdesc, diag->s2mm_taildesc, diag->rx_bd_phys, diag->rx_buf_phys);
+    fprintf(out, "      - S2MM BD CTRL / STS   : CTRL=0x%08X (%u B), STS=0x%08X (Cmplt=%u, Err=0x%X, SOF=%u, EOF=%u, Len=%u B)\n",
+            diag->rx_bd_control, diag->rx_bd_control & 0x007FFFFFU,
+            diag->rx_bd_status,
+            (diag->rx_bd_status >> 31) & 1U,
+            (diag->rx_bd_status >> 28) & 7U,
+            (diag->rx_bd_status >> 27) & 1U,
+            (diag->rx_bd_status >> 26) & 1U,
+            diag->rx_bd_status & 0x007FFFFFU);
+    fprintf(out, "      - S2MM DDR Buffer Scan : %u / %u words written by DMA (first_mod=%u, last_mod=%u)\n",
+            diag->rx_buf_words_written, diag->rx_buf_total_words,
+            diag->rx_buf_first_mod_idx, diag->rx_buf_last_mod_idx);
+    fprintf(out, "      - RX Buffer Sample Wds : w[0]=0x%08X w[1]=0x%08X w[2]=0x%08X w[8]=0x%08X w[14]=0x%08X w[15]=0x%08X w[last]=0x%08X\n",
+            diag->rx_buf_sample_words[0], diag->rx_buf_sample_words[1],
+            diag->rx_buf_sample_words[2], diag->rx_buf_sample_words[3],
+            diag->rx_buf_sample_words[4], diag->rx_buf_sample_words[5],
+            diag->rx_buf_sample_words[6]);
+}
+
 static inline double timespec_to_us(const struct timespec* start,
                                     const struct timespec* end) {
     return (double)(end->tv_sec - start->tv_sec) * 1e6 +
@@ -244,13 +328,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "\n[-] Iteration %d: DDS_DataWriter_write() failed: %s (after %.2f us)\n",
                     iter, strerror(errno), fail_tx_us);
             if (ioctl(fd, AXI_RTPS_IOC_GET_DIAG, &diag) == 0) {
-                uint8_t cur_state = (uint8_t)((diag.status_reg & 0x1E) >> 1);
-                fprintf(stderr, "    Hardware Diagnostic State:\n");
-                fprintf(stderr, "      - FSM State         : %u [%s]\n", cur_state, rtps_state_name(cur_state));
-                fprintf(stderr, "      - Status Reg        : 0x%08X (IRQ=%u, ERR_CRC=%u, ERR_TIMEOUT=%u)\n",
-                        diag.status_reg, diag.status_reg & 1, diag.err_crc, diag.err_rx_timeout);
-                fprintf(stderr, "      - Wire Cycle Clocks : %u ticks (%.2f us @ 100 MHz)\n",
-                        diag.last_cycle_ticks, diag.last_cycle_ticks * 0.01);
+                print_detailed_diag(stderr, &diag);
             }
             errors++;
             break;
@@ -283,14 +361,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "      - Total Elapsed        : %8.2f us\n", fail_total_us);
 
             if (ioctl(fd, AXI_RTPS_IOC_GET_DIAG, &diag) == 0) {
-                uint8_t cur_state = (uint8_t)((diag.status_reg & 0x1E) >> 1);
-                fprintf(stderr, "    Hardware Diagnostic State:\n");
-                fprintf(stderr, "      - FSM State            : %u [%s]\n", cur_state, rtps_state_name(cur_state));
-                fprintf(stderr, "      - Status Reg           : 0x%08X (IRQ=%u, ERR_CRC=%u, NO_MATCH=%u, TIMEOUT=%u, CSUM=%u)\n",
-                        diag.status_reg, diag.status_reg & 1, diag.err_crc, diag.err_no_match, diag.err_rx_timeout, diag.err_csum);
-                fprintf(stderr, "      - TX / RX Samples      : %u TX / %u RX\n", diag.stat_tx_samples, diag.stat_rx_samples);
-                fprintf(stderr, "      - Latest RX SeqNum     : %llu\n", (unsigned long long)diag.last_rx_seq_num);
-                fprintf(stderr, "      - Stale Drops / Csum   : %u drops, %u csum errors\n", diag.stat_stale_drops, diag.stat_csum_errs);
+                print_detailed_diag(stderr, &diag);
             }
             errors++;
             break;

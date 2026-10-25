@@ -70,6 +70,32 @@ struct axi_rtps_dev {
     int csum_err;
     u32 last_ip_status;
 
+    /* Extended Phase & DMA Hardware Diagnostics */
+    u32 pre_write_ip_status;
+    u32 isr_pre_ack_ip_status;
+    u32 isr_post_ack_ip_status;
+    u32 isr_ack_polls;
+    u32 post_write_ip_status;
+    u32 pre_read_ip_status;
+    u32 post_kick_ip_status;
+    u32 post_50us_ip_status;
+    u32 post_50us_s2mm_dmasr;
+    u32 post_50us_bd_status;
+    u32 last_s2mm_dmacr;
+    u32 last_s2mm_dmasr;
+    u32 last_s2mm_curdesc;
+    u32 last_s2mm_taildesc;
+    u32 last_rx_bd_control;
+    u32 last_rx_bd_status;
+    u32 rx_buf_words_written;
+    u32 rx_buf_total_words;
+    u32 rx_buf_first_mod_idx;
+    u32 rx_buf_last_mod_idx;
+    u32 rx_buf_sample_words[7];
+    u32 irq_cnt_tx;
+    u32 irq_cnt_rx;
+    u32 irq_cnt_ip;
+
     /* Mapped Linux Virtual IRQs */
     int tx_virq;
     int rx_virq;
@@ -143,6 +169,7 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
     if (tx_status & XAXIDMA_SR_IRQ_ALL_MASK) {
         dma_write(dev, XAXIDMA_MM2S_DMASR_OFFSET,
                   tx_status & XAXIDMA_SR_IRQ_ALL_MASK);
+        dev->irq_cnt_tx++;
         if (tx_status & XAXIDMA_SR_ERR_ALL_MASK) {
             dev->tx_err = 1;
             pr_err("axi_rtps: MM2S error status: 0x%08x\n", tx_status);
@@ -156,6 +183,7 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
     if (rx_status & XAXIDMA_SR_IRQ_ALL_MASK) {
         dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
                   rx_status & XAXIDMA_SR_IRQ_ALL_MASK);
+        dev->irq_cnt_rx++;
         if (rx_status & XAXIDMA_SR_ERR_ALL_MASK) {
             dev->rx_err = 1;
             pr_err("axi_rtps: S2MM error status: 0x%08x\n", rx_status);
@@ -170,10 +198,28 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
         u32 ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
 
         if (ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK)) {
+            int ack_polls = 0;
+            u32 post_ack = ip_status;
+
             dev->last_ip_status = ip_status;
+            dev->isr_pre_ack_ip_status = ip_status;
+            dev->irq_cnt_ip++;
 
             /* Rule 2c: Acknowledge and drop PL Level-High interrupt line immediately (Bit 0) */
             iowrite32(RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+
+            /*
+             * Flush posted AXI-Lite write across M_AXI_GP0 and wait for PL Level-High
+             * ip_done_irq (Bit 0) to clear before returning IRQ_HANDLED to GIC.
+             * This prevents spurious GIC re-entry while the posted write is in flight.
+             */
+            for (ack_polls = 1; ack_polls <= 32; ack_polls++) {
+                post_ack = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+                if (!(post_ack & RTPS_STATUS_IRQ_MASK))
+                    break;
+            }
+            dev->isr_post_ack_ip_status = post_ack;
+            dev->isr_ack_polls = (u32)ack_polls;
 
             /* Separate IP compute/validation error flags cleanly */
             if (ip_status & RTPS_STATUS_ERR_CRC) {
@@ -273,6 +319,7 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
         case AXI_RTPS_IOC_GET_DIAG:
             memset(&diag, 0, sizeof(diag));
             diag.status_reg          = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            diag.ctrl_reg            = ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET);
             diag.last_cycle_ticks    = ioread32(dev->ip_regs + RTPS_IP_CYCLE_TICKS_OFFSET);
             diag.stat_tx_samples     = ioread32(dev->ip_regs + RTPS_IP_STAT_TX_SAMPLES_OFFSET);
             diag.stat_rx_samples     = ioread32(dev->ip_regs + RTPS_IP_STAT_RX_SAMPLES_OFFSET);
@@ -291,6 +338,38 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             diag.err_no_match        = (diag.status_reg & RTPS_STATUS_ERR_NO_MATCH) ? 1 : 0;
             diag.err_rx_timeout      = (diag.status_reg & RTPS_STATUS_ERR_RX_TIMEOUT) ? 1 : 0;
             diag.err_csum            = (diag.status_reg & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
+
+            /* Populate Extended Phase & DMA Hardware Diagnostics */
+            diag.pre_write_ip_status    = dev->pre_write_ip_status;
+            diag.isr_pre_ack_ip_status  = dev->isr_pre_ack_ip_status;
+            diag.isr_post_ack_ip_status = dev->isr_post_ack_ip_status;
+            diag.isr_ack_polls          = dev->isr_ack_polls;
+            diag.post_write_ip_status   = dev->post_write_ip_status;
+            diag.pre_read_ip_status     = dev->pre_read_ip_status;
+            diag.post_kick_ip_status    = dev->post_kick_ip_status;
+            diag.post_50us_ip_status    = dev->post_50us_ip_status;
+            diag.post_50us_s2mm_dmasr   = dev->post_50us_s2mm_dmasr;
+            diag.post_50us_bd_status    = dev->post_50us_bd_status;
+            diag.s2mm_dmacr             = dev->last_s2mm_dmacr;
+            diag.s2mm_dmasr             = dev->last_s2mm_dmasr;
+            diag.s2mm_curdesc           = dev->last_s2mm_curdesc;
+            diag.s2mm_taildesc          = dev->last_s2mm_taildesc;
+            diag.rx_bd_phys             = (u32)dev->rx_bd_phys;
+            diag.rx_buf_phys            = (u32)dev->rx_buf_phys;
+            diag.rx_bd_control          = dev->last_rx_bd_control;
+            diag.rx_bd_status           = dev->last_rx_bd_status;
+            diag.rx_buf_words_written   = dev->rx_buf_words_written;
+            diag.rx_buf_total_words     = dev->rx_buf_total_words;
+            diag.rx_buf_first_mod_idx   = dev->rx_buf_first_mod_idx;
+            diag.rx_buf_last_mod_idx    = dev->rx_buf_last_mod_idx;
+            for (i = 0; i < 7; i++)
+                diag.rx_buf_sample_words[i] = dev->rx_buf_sample_words[i];
+            diag.irq_cnt_tx             = dev->irq_cnt_tx;
+            diag.irq_cnt_rx             = dev->irq_cnt_rx;
+            diag.irq_cnt_ip             = dev->irq_cnt_ip;
+            diag.tx_virq                = dev->tx_virq;
+            diag.rx_virq                = dev->rx_virq;
+            diag.ip_virq                = dev->ip_virq;
 
             if (copy_to_user((void __user*)arg, &diag, sizeof(diag)))
                 return -EFAULT;
@@ -343,6 +422,46 @@ static int axi_rtps_release(struct inode* inode, struct file* file) {
     return 0;
 }
 
+static void axi_rtps_snapshot_s2mm_and_rxbuf(struct axi_rtps_dev* dev,
+                                             size_t transfer_len) {
+    const u32* rx_words = (const u32*)dev->rx_buf;
+    u32 num_words = (u32)(transfer_len / sizeof(u32));
+    u32 written = 0;
+    u32 first_idx = 0xFFFFFFFFU;
+    u32 last_idx = 0xFFFFFFFFU;
+    u32 i;
+
+    rmb();
+    dev->last_s2mm_dmacr    = dev->regs ? dma_read(dev, XAXIDMA_S2MM_DMACR_OFFSET) : 0;
+    dev->last_s2mm_dmasr    = dev->regs ? dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET) : 0;
+    dev->last_s2mm_curdesc  = dev->regs ? dma_read(dev, XAXIDMA_S2MM_CURDESC_OFFSET) : 0;
+    dev->last_s2mm_taildesc = dev->regs ? dma_read(dev, XAXIDMA_S2MM_TAILDESC_OFFSET) : 0;
+    dev->last_rx_bd_control = dev->rx_bd ? dev->rx_bd->control : 0;
+    dev->last_rx_bd_status  = dev->rx_bd ? dev->rx_bd->status : 0;
+    dev->rx_buf_total_words = num_words;
+
+    if (rx_words && num_words > 0) {
+        for (i = 0; i < num_words; i++) {
+            if (rx_words[i] != 0xDEADBEEFU) {
+                written++;
+                if (first_idx == 0xFFFFFFFFU)
+                    first_idx = i;
+                last_idx = i;
+            }
+        }
+        dev->rx_buf_sample_words[0] = (num_words > 0)  ? rx_words[0]  : 0;
+        dev->rx_buf_sample_words[1] = (num_words > 1)  ? rx_words[1]  : 0;
+        dev->rx_buf_sample_words[2] = (num_words > 2)  ? rx_words[2]  : 0;
+        dev->rx_buf_sample_words[3] = (num_words > 8)  ? rx_words[8]  : 0;
+        dev->rx_buf_sample_words[4] = (num_words > 14) ? rx_words[14] : 0;
+        dev->rx_buf_sample_words[5] = (num_words > 15) ? rx_words[15] : 0;
+        dev->rx_buf_sample_words[6] = rx_words[num_words - 1];
+    }
+    dev->rx_buf_words_written = written;
+    dev->rx_buf_first_mod_idx = first_idx;
+    dev->rx_buf_last_mod_idx  = last_idx;
+}
+
 /*
  * S2MM Egress Transfer:
  *   - In Option A (raw FastSample mode): streams 4,096 B (1,024 words) from latest_slot.
@@ -354,6 +473,8 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                              loff_t* ppos) {
     struct axi_rtps_dev* dev = file->private_data;
     size_t transfer_len;
+    size_t num_words, i;
+    u32* rx_words;
     u32 rx_bytes;
     long ret;
 
@@ -361,9 +482,18 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
         return 0;
 
     transfer_len = min_t(size_t, count, RTPS_IP_MAX_BYTES);
+    num_words = transfer_len / sizeof(u32);
 
     if (mutex_lock_interruptible(&dev->rx_lock))
         return -ERESTARTSYS;
+
+    /* Pre-fill coherent RX buffer with sentinel pattern to detect partial/un-signalled DMA writes */
+    rx_words = (u32*)dev->rx_buf;
+    for (i = 0; i < num_words; i++) {
+        rx_words[i] = 0xDEADBEEFU;
+    }
+
+    dev->pre_read_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
 
     /* Setup S2MM Buffer Descriptor */
     memset(dev->rx_bd, 0, sizeof(*dev->rx_bd));
@@ -372,7 +502,7 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     dev->rx_bd->control   = transfer_len & XAXIDMA_BD_CTRL_LENGTH_MASK;
     dev->rx_bd->status    = 0;
 
-    /* Ensure memory writes to descriptor are visible to DMA */
+    /* Ensure memory writes to descriptor and sentinel buffer are visible to DMA */
     wmb();
 
     dev->rx_done = 0;
@@ -401,22 +531,83 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
         u32 live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         u8 cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
         if (cur_state == 5) {
+            int ack_wait;
             /* If IP is still holding S_DONE_IRQ, ACK IRQ first to transition to S_WAIT_EGRESS */
             iowrite32(RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-            wmb();
+            for (ack_wait = 0; ack_wait < 32; ack_wait++) {
+                live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+                cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
+                if (cur_state != 5)
+                    break;
+            }
         }
-        /* Kick egress streaming (asserting both Bit 1 and Bit 0 for backward/forward compatibility) */
-        iowrite32(RTPS_STATUS_KICK_EGRESS | RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+        /*
+         * Kick egress streaming using strictly Bit 1 (RTPS_STATUS_KICK_EGRESS = 0x2).
+         * Never assert Bit 0 here so that if the IP is in S_IDLE it cannot accidentally
+         * trigger a new manual TX/RX cycle!
+         */
+        iowrite32(RTPS_STATUS_KICK_EGRESS, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+        dev->post_kick_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+
+        udelay(50);
+        rmb();
+        dev->post_50us_ip_status  = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+        dev->post_50us_s2mm_dmasr = dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET);
+        dev->post_50us_bd_status  = dev->rx_bd->status;
+
+        /* Check if S2MM BD already completed in hardware within 50us even if GIC IRQ did not fire */
+        if (!dev->rx_done &&
+            ((dev->post_50us_bd_status & XAXIDMA_BD_STS_CMPLT_MASK) ||
+             (dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_IOC_MASK))) {
+            pr_warn("axi_rtps: S2MM completed in hardware within 50us without GIC IRQ (DMASR=0x%08x, BD_STS=0x%08x)\n",
+                    dev->post_50us_s2mm_dmasr, dev->post_50us_bd_status);
+            dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
+                      dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_ALL_MASK);
+            dev->rx_done = 1;
+        }
     }
 
     /* Wait for S2MM completion interrupt */
     ret = wait_event_interruptible_timeout(dev->rx_waitq, dev->rx_done != 0,
                                            msecs_to_jiffies(3000));
+    axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
+
     if (ret == 0) {
         u32 live_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
-        pr_err("axi_rtps: S2MM wait timed out (DMASR: 0x%08x, BD STS: 0x%08x, IP STS: 0x%08x [State %u])\n",
-               dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET), dev->rx_bd->status,
+        u32 live_ip_ctrl   = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET) : 0;
+        u32 tx_samples     = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STAT_TX_SAMPLES_OFFSET) : 0;
+        u32 rx_samples     = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STAT_RX_SAMPLES_OFFSET) : 0;
+        u32 rtps_words     = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_LAST_RX_RTPS_WORDS) : 0;
+
+        pr_err("axi_rtps: ==================== S2MM WAIT TIMED OUT ====================\n");
+        pr_err("axi_rtps: [Timeline] PreWrite=0x%08x(S%u) -> ISR_Pre=0x%08x(S%u) -> ISR_Post=0x%08x(S%u,polls=%u) -> PostWrite=0x%08x(S%u)\n",
+               dev->pre_write_ip_status, (dev->pre_write_ip_status & RTPS_STATUS_STATE_MASK) >> 1,
+               dev->isr_pre_ack_ip_status, (dev->isr_pre_ack_ip_status & RTPS_STATUS_STATE_MASK) >> 1,
+               dev->isr_post_ack_ip_status, (dev->isr_post_ack_ip_status & RTPS_STATUS_STATE_MASK) >> 1,
+               dev->isr_ack_polls,
+               dev->post_write_ip_status, (dev->post_write_ip_status & RTPS_STATUS_STATE_MASK) >> 1);
+        pr_err("axi_rtps: [Timeline] PreRead=0x%08x(S%u) -> PostKick=0x%08x(S%u) -> Post50us=0x%08x(S%u) -> Timeout=0x%08x(S%u)\n",
+               dev->pre_read_ip_status, (dev->pre_read_ip_status & RTPS_STATUS_STATE_MASK) >> 1,
+               dev->post_kick_ip_status, (dev->post_kick_ip_status & RTPS_STATUS_STATE_MASK) >> 1,
+               dev->post_50us_ip_status, (dev->post_50us_ip_status & RTPS_STATUS_STATE_MASK) >> 1,
                live_ip_status, (live_ip_status & RTPS_STATUS_STATE_MASK) >> 1);
+        pr_err("axi_rtps: [IP CSRs ] CTRL=0x%08x, TX_Samples=%u, RX_Samples=%u, Latest_RTPS_Words=%u\n",
+               live_ip_ctrl, tx_samples, rx_samples, rtps_words);
+        pr_err("axi_rtps: [S2MM DMA] DMACR=0x%08x, DMASR=0x%08x (50us: 0x%08x), CURDESC=0x%08x, TAILDESC=0x%08x (bd_phys=0x%08x)\n",
+               dev->last_s2mm_dmacr, dev->last_s2mm_dmasr, dev->post_50us_s2mm_dmasr,
+               dev->last_s2mm_curdesc, dev->last_s2mm_taildesc, (u32)dev->rx_bd_phys);
+        pr_err("axi_rtps: [S2MM BD ] CTRL=0x%08x (%zu B), STS=0x%08x (50us: 0x%08x), IRQs(tx=%u[v%d], rx=%u[v%d], ip=%u[v%d])\n",
+               dev->last_rx_bd_control, transfer_len, dev->last_rx_bd_status, dev->post_50us_bd_status,
+               dev->irq_cnt_tx, dev->tx_virq, dev->irq_cnt_rx, dev->rx_virq, dev->irq_cnt_ip, dev->ip_virq);
+        pr_err("axi_rtps: [DDR Scan] Written=%u/%u words (first_idx=%u, last_idx=%u) w[0]=0x%08x w[1]=0x%08x w[2]=0x%08x w[8]=0x%08x w[14]=0x%08x w[15]=0x%08x w[last]=0x%08x\n",
+               dev->rx_buf_words_written, dev->rx_buf_total_words,
+               dev->rx_buf_first_mod_idx, dev->rx_buf_last_mod_idx,
+               dev->rx_buf_sample_words[0], dev->rx_buf_sample_words[1],
+               dev->rx_buf_sample_words[2], dev->rx_buf_sample_words[3],
+               dev->rx_buf_sample_words[4], dev->rx_buf_sample_words[5],
+               dev->rx_buf_sample_words[6]);
+        pr_err("axi_rtps: =============================================================\n");
+
         axi_dma_reset(dev);
         mutex_unlock(&dev->rx_lock);
         return -ETIMEDOUT;
@@ -495,14 +686,19 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         crc = 0;
     }
 
-    dev->last_ip_status = 0;
-    dev->ip_done        = 0;
-    dev->crc_err        = 0;
-    dev->no_match_err   = 0;
-    dev->rx_timeout_err = 0;
-    dev->csum_err       = 0;
-    dev->tx_done        = 0;
-    dev->tx_err         = 0;
+    dev->last_ip_status        = 0;
+    dev->pre_write_ip_status   = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+    dev->isr_pre_ack_ip_status = 0;
+    dev->isr_post_ack_ip_status= 0;
+    dev->isr_ack_polls         = 0;
+    dev->post_write_ip_status  = 0;
+    dev->ip_done               = 0;
+    dev->crc_err               = 0;
+    dev->no_match_err          = 0;
+    dev->rx_timeout_err        = 0;
+    dev->csum_err              = 0;
+    dev->tx_done               = 0;
+    dev->tx_err                = 0;
 
     /* Rule 1a: Program expected CRC into IP (does NOT leave S_IDLE) */
     iowrite32(crc, dev->ip_regs + RTPS_IP_CRC_OFFSET);
@@ -555,9 +751,11 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     /* Wait for RTPS Fast-Path 3-Fragment Publication + Peer Reassembly & Validation */
     ret = wait_event_interruptible_timeout(dev->ip_waitq, dev->ip_done != 0,
                                            msecs_to_jiffies(3000));
+    dev->post_write_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
     if (ret == 0) {
-        u32 status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-        pr_err("axi_rtps: RTPS cycle wait timed out (status: 0x%08x)\n", status);
+        u32 status = dev->post_write_ip_status;
+        pr_err("axi_rtps: RTPS cycle wait timed out (status: 0x%08x [State %u], pre_write: 0x%08x)\n",
+               status, (status & RTPS_STATUS_STATE_MASK) >> 1, dev->pre_write_ip_status);
         iowrite32(0, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
         mutex_unlock(&dev->tx_lock);
         return -ETIMEDOUT;

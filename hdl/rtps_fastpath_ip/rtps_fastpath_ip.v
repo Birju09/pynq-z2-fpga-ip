@@ -1702,7 +1702,7 @@ module rtps_fastpath_ip #(
                 // 7. S_WAIT_EGRESS: Wait for Driver read() to prime S2MM & kick
                 // -------------------------------------------------------------
                 S_WAIT_EGRESS: begin
-                    if (status_write_pulse && (status_write_data[1] || status_write_data[0])) begin
+                    if (status_write_pulse && status_write_data[1]) begin
                         egress_rd_ptr   <= 0;
                         bram_pipe_valid <= 1'b0;
                         bram_pipe_last  <= 1'b0;

@@ -210,6 +210,7 @@ struct rtps_endpoint_cfg {
 
 struct rtps_cycle_diag {
     __u32 status_reg;
+    __u32 ctrl_reg;
     __u32 last_cycle_ticks;
     __u32 stat_tx_samples;
     __u32 stat_rx_samples;
@@ -226,6 +227,37 @@ struct rtps_cycle_diag {
     __u8  err_rx_timeout;
     __u8  err_csum;
     __u8  reserved[3];
+
+    /* Extended Driver & AXI DMA Hardware Phase Diagnostics */
+    __u32 pre_write_ip_status;
+    __u32 isr_pre_ack_ip_status;
+    __u32 isr_post_ack_ip_status;
+    __u32 isr_ack_polls;
+    __u32 post_write_ip_status;
+    __u32 pre_read_ip_status;
+    __u32 post_kick_ip_status;
+    __u32 post_50us_ip_status;
+    __u32 post_50us_s2mm_dmasr;
+    __u32 post_50us_bd_status;
+    __u32 s2mm_dmacr;
+    __u32 s2mm_dmasr;
+    __u32 s2mm_curdesc;
+    __u32 s2mm_taildesc;
+    __u32 rx_bd_phys;
+    __u32 rx_buf_phys;
+    __u32 rx_bd_control;
+    __u32 rx_bd_status;
+    __u32 rx_buf_words_written;
+    __u32 rx_buf_total_words;
+    __u32 rx_buf_first_mod_idx;
+    __u32 rx_buf_last_mod_idx;
+    __u32 rx_buf_sample_words[7]; /* words[0, 1, 2, 8, 14, 15, last] */
+    __u32 irq_cnt_tx;
+    __u32 irq_cnt_rx;
+    __u32 irq_cnt_ip;
+    __s32 tx_virq;
+    __s32 rx_virq;
+    __s32 ip_virq;
 };
 
 /* IOCTL Definitions */
