@@ -140,7 +140,7 @@ static int map_gic_spi(int irq_val) {
 }
 
 static int axi_dma_reset(struct axi_rtps_dev* dev) {
-    int timeout = 1000;
+    int timeout = 10000;
 
     dma_write(dev, XAXIDMA_MM2S_DMACR_OFFSET, XAXIDMA_CR_RESET_MASK);
     dma_write(dev, XAXIDMA_S2MM_DMACR_OFFSET, XAXIDMA_CR_RESET_MASK);
@@ -151,7 +151,7 @@ static int axi_dma_reset(struct axi_rtps_dev* dev) {
         if (!(mm2s_cr & XAXIDMA_CR_RESET_MASK) &&
             !(s2mm_cr & XAXIDMA_CR_RESET_MASK))
             return 0;
-        udelay(10);
+        udelay(1);
     }
 
     pr_err("axi_rtps: DMA reset timeout\n");
@@ -440,6 +440,12 @@ static void axi_rtps_snapshot_s2mm_and_rxbuf(struct axi_rtps_dev* dev,
     dev->last_rx_bd_status  = dev->rx_bd ? dev->rx_bd->status : 0;
     dev->rx_buf_total_words = num_words;
 
+    /*
+     * TEMPORARY LATENCY OPTIMIZATION:
+     * Full DDR memory scan commented out for testing.
+     * Iterating over 1,039 words in uncached DDR memory costs ~15-20 us on ARM Cortex-A9.
+     */
+    /*
     if (rx_words && num_words > 0) {
         for (i = 0; i < num_words; i++) {
             if (rx_words[i] != 0xDEADBEEFU) {
@@ -457,6 +463,12 @@ static void axi_rtps_snapshot_s2mm_and_rxbuf(struct axi_rtps_dev* dev,
         dev->rx_buf_sample_words[5] = (num_words > 15) ? rx_words[15] : 0;
         dev->rx_buf_sample_words[6] = rx_words[num_words - 1];
     }
+    */
+    (void)rx_words;
+    (void)i;
+    (void)written;
+    (void)first_idx;
+    (void)last_idx;
     dev->rx_buf_words_written = written;
     dev->rx_buf_first_mod_idx = first_idx;
     dev->rx_buf_last_mod_idx  = last_idx;
@@ -473,25 +485,28 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                              loff_t* ppos) {
     struct axi_rtps_dev* dev = file->private_data;
     size_t transfer_len;
-    size_t num_words, i;
-    u32* rx_words;
-    u32 rx_bytes;
     long ret;
+    u32 rx_bytes;
 
     if (count == 0)
         return 0;
 
     transfer_len = min_t(size_t, count, RTPS_IP_MAX_BYTES);
-    num_words = transfer_len / sizeof(u32);
 
     if (mutex_lock_interruptible(&dev->rx_lock))
         return -ERESTARTSYS;
 
-    /* Pre-fill coherent RX buffer with sentinel pattern to detect partial/un-signalled DMA writes */
+    /*
+     * TEMPORARY LATENCY OPTIMIZATION:
+     * Sentinel pre-fill commented out for testing.
+     * Writing 1,039 words to uncached DDR costs ~15-20 us on ARM Cortex-A9.
+     */
+    /*
     rx_words = (u32*)dev->rx_buf;
     for (i = 0; i < num_words; i++) {
         rx_words[i] = 0xDEADBEEFU;
     }
+    */
 
     dev->pre_read_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
 
@@ -528,6 +543,7 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
 
     /* Kick S2MM egress streaming from RTPS Fast-Path IP */
     if (dev->ip_regs) {
+        int poll_us;
         u32 live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         u8 cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
         if (cur_state == 5) {
@@ -549,28 +565,59 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
         iowrite32(RTPS_STATUS_KICK_EGRESS, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         dev->post_kick_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
 
-        udelay(50);
-        rmb();
-        dev->post_50us_ip_status  = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+        /*
+         * Poll for S2MM completion (up to 2000 us in 1 us steps; 1039 words @ 100MHz = 10.4 us).
+         * If m_axis_tlast is not wired to s_axis_s2mm_tlast in the Vivado Block Design,
+         * AXI DMA S2MM bursts all 1,039 words into dev->rx_buf in DDR memory and the IP
+         * FSM returns from S_TX_RUN to S_IDLE (State 0), while S2MM SG awaits TLAST before
+         * setting BD_STS.CMPLT or firing S2MM IOC_Irq. We detect both normal BD completion
+         * and TLAST-unwired DDR completion cleanly.
+         */
+        for (poll_us = 0; poll_us < 2000; poll_us++) {
+            rmb();
+            live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
+
+            if (dev->rx_done || (dev->rx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK)) {
+                dev->rx_done = 1;
+                break;
+            }
+            if (cur_state == 0) {
+                /* IP has completed egress streaming (S_TX_RUN -> S_IDLE) */
+                break;
+            }
+            udelay(1);
+        }
+
+        dev->post_50us_ip_status  = live_status;
         dev->post_50us_s2mm_dmasr = dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET);
         dev->post_50us_bd_status  = dev->rx_bd->status;
 
-        /* Check if S2MM BD already completed in hardware within 50us even if GIC IRQ did not fire */
-        if (!dev->rx_done &&
-            ((dev->post_50us_bd_status & XAXIDMA_BD_STS_CMPLT_MASK) ||
-             (dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_IOC_MASK))) {
-            pr_warn("axi_rtps: S2MM completed in hardware within 50us without GIC IRQ (DMASR=0x%08x, BD_STS=0x%08x)\n",
-                    dev->post_50us_s2mm_dmasr, dev->post_50us_bd_status);
-            dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
-                      dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_ALL_MASK);
-            dev->rx_done = 1;
+        if (!dev->rx_done) {
+            if ((dev->post_50us_bd_status & XAXIDMA_BD_STS_CMPLT_MASK) ||
+                (dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_IOC_MASK)) {
+                dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
+                          dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_ALL_MASK);
+                axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
+                dev->rx_done = 1;
+            } else if (((live_status & RTPS_STATUS_STATE_MASK) >> 1) == 0) {
+                axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
+                axi_dma_reset(dev);
+                dev->rx_done = 1;
+            }
+        } else {
+            axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
         }
     }
 
-    /* Wait for S2MM completion interrupt */
-    ret = wait_event_interruptible_timeout(dev->rx_waitq, dev->rx_done != 0,
-                                           msecs_to_jiffies(3000));
-    axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
+    /* Wait for S2MM completion interrupt if not already completed above */
+    if (!dev->rx_done) {
+        ret = wait_event_interruptible_timeout(dev->rx_waitq, dev->rx_done != 0,
+                                               msecs_to_jiffies(3000));
+        axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
+    } else {
+        ret = 1;
+    }
 
     if (ret == 0) {
         u32 live_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;

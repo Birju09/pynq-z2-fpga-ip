@@ -748,7 +748,15 @@ module rtps_fastpath_ip #(
         end
     end
 
-    wire [16:0] rx_chk_fold1 = {1'b0, rx_udp_csum_accum} + {1'b0, rx_pseudo_csum};
+    // Combinational immediate pseudo-header sum used during R_CHECK_UDP
+    // to prevent 1-cycle pipeline lag when fragments reassemble back-to-back:
+    wire [19:0] rx_pseudo_comb_sum = {4'd0, rx_src_ip[31:16]} + {4'd0, rx_src_ip[15:0]} +
+                                     {4'd0, rx_dst_ip[31:16]} + {4'd0, rx_dst_ip[15:0]} +
+                                     {4'd0, 16'h0011}         + {4'd0, rx_udp_len_bytes};
+    wire [16:0] rx_pseudo_comb_f1  = {1'b0, rx_pseudo_comb_sum[15:0]} + {13'd0, rx_pseudo_comb_sum[19:16]};
+    wire [15:0] rx_pseudo_comb_csum = rx_pseudo_comb_f1[15:0] + {15'd0, rx_pseudo_comb_f1[16]};
+
+    wire [16:0] rx_chk_fold1 = {1'b0, rx_udp_csum_accum} + {1'b0, rx_pseudo_comb_csum};
     wire [15:0] rx_chk_final = rx_chk_fold1[15:0] + {15'd0, rx_chk_fold1[16]};
 
     wire [12:0] rx_frag_off_8b  = rx_flags_frag[12:0];

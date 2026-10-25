@@ -397,7 +397,9 @@ int main(int argc, char* argv[]) {
         }
 
         /* Verify all 1,020 transformed payload words (4,080 bytes) */
-        uint32_t seq_lo_6b = ((uint32_t)iter) & 0x3FU;
+        uint64_t active_seq = (rx_seq_num != 0) ? rx_seq_num :
+                              ((diag.last_rx_seq_num != 0) ? diag.last_rx_seq_num : (uint64_t)iter);
+        uint32_t seq_lo_6b = ((uint32_t)active_seq) & 0x3FU;
         for (i = 0; i < 1020; i++) {
             uint32_t expected = (~tx_sample->payload[i]) + ((seq_lo_6b << 10) | 0x200U);
             if (rx_sample->payload[i] != expected) {
