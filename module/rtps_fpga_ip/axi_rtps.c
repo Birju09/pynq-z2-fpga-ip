@@ -272,8 +272,7 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 
         case AXI_RTPS_IOC_GET_DIAG:
             memset(&diag, 0, sizeof(diag));
-            diag.status_reg          = dev->last_ip_status ? dev->last_ip_status :
-                                       ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            diag.status_reg          = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
             diag.last_cycle_ticks    = ioread32(dev->ip_regs + RTPS_IP_CYCLE_TICKS_OFFSET);
             diag.stat_tx_samples     = ioread32(dev->ip_regs + RTPS_IP_STAT_TX_SAMPLES_OFFSET);
             diag.stat_rx_samples     = ioread32(dev->ip_regs + RTPS_IP_STAT_RX_SAMPLES_OFFSET);
@@ -394,16 +393,30 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     wmb();
     dma_write(dev, XAXIDMA_S2MM_TAILDESC_OFFSET, (u32)dev->rx_bd_phys);
 
-    /* Kick S2MM egress streaming from RTPS Fast-Path IP (S_WAIT_EGRESS -> S_TX_RUN, Bit 1) */
-    if (dev->ip_regs)
-        iowrite32(RTPS_STATUS_KICK_EGRESS, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+    /* Guarantee DMA descriptor commit to memory before signalling IP */
+    mb();
+
+    /* Kick S2MM egress streaming from RTPS Fast-Path IP */
+    if (dev->ip_regs) {
+        u32 live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+        u8 cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
+        if (cur_state == 5) {
+            /* If IP is still holding S_DONE_IRQ, ACK IRQ first to transition to S_WAIT_EGRESS */
+            iowrite32(RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            wmb();
+        }
+        /* Kick egress streaming (asserting both Bit 1 and Bit 0 for backward/forward compatibility) */
+        iowrite32(RTPS_STATUS_KICK_EGRESS | RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+    }
 
     /* Wait for S2MM completion interrupt */
     ret = wait_event_interruptible_timeout(dev->rx_waitq, dev->rx_done != 0,
                                            msecs_to_jiffies(3000));
     if (ret == 0) {
-        pr_err("axi_rtps: S2MM wait timed out (DMASR: 0x%08x, BD STS: 0x%08x)\n",
-               dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET), dev->rx_bd->status);
+        u32 live_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
+        pr_err("axi_rtps: S2MM wait timed out (DMASR: 0x%08x, BD STS: 0x%08x, IP STS: 0x%08x [State %u])\n",
+               dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET), dev->rx_bd->status,
+               live_ip_status, (live_ip_status & RTPS_STATUS_STATE_MASK) >> 1);
         axi_dma_reset(dev);
         mutex_unlock(&dev->rx_lock);
         return -ETIMEDOUT;
@@ -482,6 +495,7 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         crc = 0;
     }
 
+    dev->last_ip_status = 0;
     dev->ip_done        = 0;
     dev->crc_err        = 0;
     dev->no_match_err   = 0;

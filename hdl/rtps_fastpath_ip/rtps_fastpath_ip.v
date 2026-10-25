@@ -1482,7 +1482,7 @@ module rtps_fastpath_ip #(
                         end else begin
                             rx_ptr  <= rx_ptr + 1'b1;
                         end
-                    end else if ((trigger_detected || (status_write_pulse && status_write_data[2])) && !mode_sub_only) begin
+                    end else if ((trigger_detected || (status_write_pulse && (status_write_data[2] || status_write_data[0]))) && !mode_sub_only) begin
                         pkt_len <= cfg_payload_words[ADDR_WIDTH:0];
                         rx_ptr  <= 0;
                         state   <= S_CHECK_CRC;
@@ -1702,7 +1702,7 @@ module rtps_fastpath_ip #(
                 // 7. S_WAIT_EGRESS: Wait for Driver read() to prime S2MM & kick
                 // -------------------------------------------------------------
                 S_WAIT_EGRESS: begin
-                    if (status_write_pulse && status_write_data[1]) begin
+                    if (status_write_pulse && (status_write_data[1] || status_write_data[0])) begin
                         egress_rd_ptr   <= 0;
                         bram_pipe_valid <= 1'b0;
                         bram_pipe_last  <= 1'b0;
