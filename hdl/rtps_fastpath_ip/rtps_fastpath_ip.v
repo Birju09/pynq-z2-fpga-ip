@@ -1482,7 +1482,7 @@ module rtps_fastpath_ip #(
                         end else begin
                             rx_ptr  <= rx_ptr + 1'b1;
                         end
-                    end else if (status_write_pulse && status_write_data[0] && !mode_sub_only) begin
+                    end else if ((trigger_detected || (status_write_pulse && status_write_data[2])) && !mode_sub_only) begin
                         pkt_len <= cfg_payload_words[ADDR_WIDTH:0];
                         rx_ptr  <= 0;
                         state   <= S_CHECK_CRC;
