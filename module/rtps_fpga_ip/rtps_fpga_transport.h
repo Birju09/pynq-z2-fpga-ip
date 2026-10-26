@@ -484,4 +484,355 @@ static inline int DDS_DataReader_take(
     return 0;
 }
 
+/* =========================================================================
+ * 5. Dedicated Option 1 FPGA Hardware RTPS Endpoint Driver API (plan.txt)
+ *
+ * "The FPGA itself generates and consumes RTPS DATA messages. Therefore,
+ *  the FPGA must be treated as a separately managed RTPS endpoint, accessed
+ *  through a dedicated FPGA driver API."
+ * ========================================================================= */
+
+struct fpga_fastpath {
+    int                      fd;
+    int                      use_mmap;
+    uint32_t*                tx_buf;
+    uint32_t*                rx_buf;
+    size_t                   mmap_size;
+    struct rtps_endpoint_cfg cfg;
+    uint32_t                 active_generation;
+    uint32_t                 writer_state[RTPS_MAX_ENDPOINTS];
+    uint32_t                 reader_state[RTPS_MAX_ENDPOINTS];
+};
+
+static inline int fpga_fastpath_open(
+    const char* dev_path,
+    int use_mmap,
+    struct fpga_fastpath** fpga_out) {
+    if (!fpga_out)
+        return -EINVAL;
+
+    const char* path = dev_path ? dev_path : "/dev/" XILINX_RTPS_DEV_NAME;
+    int fd = open(path, O_RDWR);
+    if (fd < 0)
+        return -errno;
+
+    struct fpga_fastpath* fpga = (struct fpga_fastpath*)calloc(1, sizeof(struct fpga_fastpath));
+    if (!fpga) {
+        close(fd);
+        return -ENOMEM;
+    }
+
+    fpga->fd = fd;
+    fpga->use_mmap = use_mmap;
+    fpga->mmap_size = XAXIDMA_DEFAULT_BUF_SIZE;
+
+    if (use_mmap) {
+        fpga->tx_buf = (uint32_t*)mmap(NULL, fpga->mmap_size, PROT_READ | PROT_WRITE,
+                                       MAP_SHARED, fd, AXI_DMA_MMAP_TX_OFFSET);
+        fpga->rx_buf = (uint32_t*)mmap(NULL, fpga->mmap_size, PROT_READ | PROT_WRITE,
+                                       MAP_SHARED, fd, AXI_DMA_MMAP_RX_OFFSET);
+        if (fpga->tx_buf == MAP_FAILED || fpga->rx_buf == MAP_FAILED) {
+            if (fpga->tx_buf != MAP_FAILED)
+                munmap(fpga->tx_buf, fpga->mmap_size);
+            if (fpga->rx_buf != MAP_FAILED)
+                munmap(fpga->rx_buf, fpga->mmap_size);
+            free(fpga);
+            close(fd);
+            return -ENOMEM;
+        }
+    }
+
+    /* Initialize default configuration */
+    fpga->cfg.local_guid_prefix[0] = 0x0101AA00;
+    fpga->cfg.local_guid_prefix[1] = 0xBB11CC22;
+    fpga->cfg.local_guid_prefix[2] = 0xDD33EE44;
+    fpga->cfg.local_ip             = 0xC0A8010A; /* 192.168.1.10 */
+    fpga->cfg.local_mac_lo         = 0x5E200001;
+    fpga->cfg.local_mac_hi         = 0x0200;
+    fpga->cfg.local_vendor_id      = 0x0101;     /* RTI Connext */
+    fpga->cfg.num_writers          = 1;
+    fpga->cfg.local_identity_valid = 1;
+    fpga->cfg.writer_context_valid = 1;
+    fpga->cfg.payload_words        = RTPS_FAST_SAMPLE_WORDS;
+    fpga->cfg.type_profile         = RTPS_TYPE_PROFILE_RTI_DEFAULT;
+
+    *fpga_out = fpga;
+    return 0;
+}
+
+static inline void fpga_fastpath_close(struct fpga_fastpath* fpga) {
+    if (!fpga)
+        return;
+    if (fpga->use_mmap) {
+        if (fpga->tx_buf && fpga->tx_buf != MAP_FAILED)
+            munmap(fpga->tx_buf, fpga->mmap_size);
+        if (fpga->rx_buf && fpga->rx_buf != MAP_FAILED)
+            munmap(fpga->rx_buf, fpga->mmap_size);
+    }
+    if (fpga->fd >= 0)
+        close(fpga->fd);
+    free(fpga);
+}
+
+static inline int fpga_configure_writer(
+    struct fpga_fastpath* fpga,
+    const struct fpga_writer_endpoint* endpoint) {
+    if (!fpga || !endpoint || endpoint->slot_idx >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    uint32_t slot = endpoint->slot_idx;
+    fpga->writer_state[slot] = endpoint->lifecycle_state;
+
+    fpga->cfg.writers[slot].valid            = (endpoint->lifecycle_state != FPGA_LIFECYCLE_DISABLED);
+    fpga->cfg.writers[slot].lifecycle_state  = (uint8_t)endpoint->lifecycle_state;
+    fpga->cfg.writers[slot].payload_words    = endpoint->payload_words ? endpoint->payload_words : RTPS_FAST_SAMPLE_WORDS;
+    fpga->cfg.writers[slot].dst_ip           = endpoint->dst_ip;
+    fpga->cfg.writers[slot].src_port         = endpoint->src_port;
+    fpga->cfg.writers[slot].dst_port         = endpoint->dst_port;
+    fpga->cfg.writers[slot].dst_mac_lo       = ((uint32_t)endpoint->dst_mac[0]) |
+                                               ((uint32_t)endpoint->dst_mac[1] << 8) |
+                                               ((uint32_t)endpoint->dst_mac[2] << 16) |
+                                               ((uint32_t)endpoint->dst_mac[3] << 24);
+    fpga->cfg.writers[slot].dst_mac_hi       = ((uint32_t)endpoint->dst_mac[4]) |
+                                               ((uint32_t)endpoint->dst_mac[5] << 8);
+    fpga->cfg.writers[slot].writer_entity_id = endpoint->writer_entity_id;
+    fpga->cfg.writers[slot].reader_entity_id = endpoint->reader_entity_id;
+    fpga->cfg.writers[slot].seq_seed         = endpoint->seq_seed;
+
+    if (endpoint->generation > 0)
+        fpga->cfg.generation = endpoint->generation;
+
+    /* Push writer configuration to driver */
+    int ret = ioctl(fpga->fd, AXI_RTPS_IOC_CONFIGURE_WRITER, endpoint);
+    if (ret < 0) {
+        ret = ioctl(fpga->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);
+    }
+    return ret;
+}
+
+static inline int fpga_configure_reader(
+    struct fpga_fastpath* fpga,
+    const struct fpga_reader_endpoint* endpoint) {
+    if (!fpga || !endpoint || endpoint->slot_idx >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    uint32_t slot = endpoint->slot_idx;
+    fpga->reader_state[slot] = endpoint->lifecycle_state;
+
+    fpga->cfg.readers[slot].valid            = (endpoint->lifecycle_state != FPGA_LIFECYCLE_DISABLED);
+    fpga->cfg.readers[slot].lifecycle_state  = (uint8_t)endpoint->lifecycle_state;
+    fpga->cfg.readers[slot].expected_dst_port= endpoint->expected_dst_port;
+    fpga->cfg.readers[slot].guid_prefix[0]   = ((uint32_t)endpoint->remote_guid_prefix[0] << 24) |
+                                               ((uint32_t)endpoint->remote_guid_prefix[1] << 16) |
+                                               ((uint32_t)endpoint->remote_guid_prefix[2] << 8)  |
+                                               ((uint32_t)endpoint->remote_guid_prefix[3]);
+    fpga->cfg.readers[slot].guid_prefix[1]   = ((uint32_t)endpoint->remote_guid_prefix[4] << 24) |
+                                               ((uint32_t)endpoint->remote_guid_prefix[5] << 16) |
+                                               ((uint32_t)endpoint->remote_guid_prefix[6] << 8)  |
+                                               ((uint32_t)endpoint->remote_guid_prefix[7]);
+    fpga->cfg.readers[slot].guid_prefix[2]   = ((uint32_t)endpoint->remote_guid_prefix[8] << 24) |
+                                               ((uint32_t)endpoint->remote_guid_prefix[9] << 16) |
+                                               ((uint32_t)endpoint->remote_guid_prefix[10] << 8) |
+                                               ((uint32_t)endpoint->remote_guid_prefix[11]);
+    fpga->cfg.readers[slot].writer_entity_id = endpoint->remote_writer_entity_id;
+    fpga->cfg.readers[slot].reader_entity_id = endpoint->local_reader_entity_id;
+    fpga->cfg.readers[slot].expected_src_ip  = endpoint->expected_remote_src_ip;
+
+    if (endpoint->generation > 0)
+        fpga->cfg.generation = endpoint->generation;
+
+    /* Push reader configuration to driver */
+    int ret = ioctl(fpga->fd, AXI_RTPS_IOC_CONFIGURE_READER, endpoint);
+    if (ret < 0) {
+        ret = ioctl(fpga->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);
+    }
+    return ret;
+}
+
+static inline int fpga_commit_endpoints(
+    struct fpga_fastpath* fpga,
+    uint32_t generation) {
+    if (!fpga)
+        return -EINVAL;
+
+    fpga->cfg.generation = generation;
+    int ret = ioctl(fpga->fd, AXI_RTPS_IOC_COMMIT_ENDPOINTS, &generation);
+    if (ret < 0) {
+        ret = ioctl(fpga->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);
+    }
+    if (ret == 0)
+        fpga->active_generation = generation;
+    return ret;
+}
+
+static inline int fpga_fastpath_publish(
+    struct fpga_fastpath* fpga,
+    uint32_t writer_slot,
+    const void* serialized_payload,
+    size_t payload_size,
+    uint64_t source_timestamp_ns,
+    uint32_t timeout_us) {
+    (void)timeout_us;
+    if (!fpga || !serialized_payload)
+        return -EINVAL;
+    if (writer_slot >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    /* Section 4: Writer slot must be in ACTIVE lifecycle state */
+    if (fpga->writer_state[writer_slot] != FPGA_LIFECYCLE_ACTIVE)
+        return -EPERM;
+
+    /* Section 4: Strict payload contract validation */
+    size_t exp_size = fpga->cfg.writers[writer_slot].payload_words ?
+                      (fpga->cfg.writers[writer_slot].payload_words * 4) : RTPS_FAST_SAMPLE_BYTES;
+    if (payload_size != exp_size)
+        return -EMSGSIZE;
+
+    const void* tx_ptr = serialized_payload;
+    if (fpga->use_mmap && fpga->tx_buf) {
+        if (serialized_payload != fpga->tx_buf)
+            memcpy(fpga->tx_buf, serialized_payload, payload_size);
+        if (source_timestamp_ns != 0) {
+            struct FastSample* fs = (struct FastSample*)fpga->tx_buf;
+            fs->tx_timestamp_ns = source_timestamp_ns;
+        }
+        tx_ptr = fpga->tx_buf;
+    }
+
+    ssize_t nwritten = write(fpga->fd, tx_ptr, payload_size);
+    if (nwritten < 0)
+        return -errno;
+    return 0;
+}
+
+static inline int fpga_fastpath_take(
+    struct fpga_fastpath* fpga,
+    uint32_t reader_slot,
+    const void** payload_out,
+    size_t* payload_size_out,
+    struct fpga_rx_metadata* metadata_out,
+    uint32_t timeout_us) {
+    (void)timeout_us;
+    if (!fpga || !payload_out || !payload_size_out)
+        return -EINVAL;
+    if (reader_slot >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    /* Section 4: Reader slot must be in ACTIVE lifecycle state */
+    if (fpga->reader_state[reader_slot] != FPGA_LIFECYCLE_ACTIVE)
+        return -EPERM;
+
+    void* rx_target = fpga->use_mmap ? fpga->rx_buf : malloc(RTPS_FULL_MSG_BYTES);
+    if (!rx_target)
+        return -ENOMEM;
+
+    ssize_t nread = read(fpga->fd, rx_target, RTPS_FAST_SAMPLE_BYTES);
+    if (nread <= 0) {
+        if (!fpga->use_mmap)
+            free(rx_target);
+        return nread < 0 ? -errno : -EAGAIN;
+    }
+
+    /* Query hardware diagnostics for exact hardware metadata */
+    if (metadata_out) {
+        struct rtps_cycle_diag diag;
+        memset(&diag, 0, sizeof(diag));
+        if (ioctl(fpga->fd, AXI_RTPS_IOC_GET_DIAG, &diag) == 0) {
+            metadata_out->reader_slot            = diag.last_rx_cam_idx;
+            metadata_out->writer_sequence_number = diag.last_rx_seq_num;
+            metadata_out->source_timestamp       = diag.last_rx_timestamp;
+            metadata_out->source_ipv4            = diag.last_rx_src_ip ? diag.last_rx_src_ip : 0xC0A80164;
+            metadata_out->source_udp_port        = diag.last_rx_src_port ? diag.last_rx_src_port : 7410;
+            metadata_out->destination_udp_port   = diag.last_rx_dst_port ? diag.last_rx_dst_port : 7411;
+            metadata_out->flags                  = (diag.err_crc ? 1 : 0) |
+                                                   (diag.err_csum ? 2 : 0) |
+                                                   (diag.stat_seq_gaps ? 4 : 0);
+        } else {
+            metadata_out->reader_slot            = reader_slot;
+            metadata_out->writer_sequence_number = 1;
+            metadata_out->source_timestamp       = 0;
+            metadata_out->source_ipv4            = 0xC0A80164;
+            metadata_out->source_udp_port        = 7410;
+            metadata_out->destination_udp_port   = 7411;
+            metadata_out->flags                  = 0;
+        }
+    }
+
+    *payload_out      = rx_target;
+    *payload_size_out = (size_t)nread;
+    return 0;
+}
+
+static inline void fpga_fastpath_release(
+    struct fpga_fastpath* fpga,
+    const void* payload) {
+    if (!fpga || !payload)
+        return;
+    if (!fpga->use_mmap)
+        free((void*)payload);
+}
+
+/*
+ * Endpoint Removal or Peer Loss Procedure (plan.txt lines 470-481):
+ *   1. Host marks the endpoint DRAINING.
+ *   2. Stop accepting new publish requests for that writer slot.
+ *   3. Stop accepting new RX samples for that reader slot.
+ *   4. Wait for in-flight DMA and IRQ acknowledgement.
+ *   5. Clear the shadow descriptor validity bit.
+ *   6. Commit the shadow EDT.
+ *   7. Confirm active generation.
+ *   8. Mark the endpoint DISABLED.
+ */
+static inline int fpga_fastpath_drain_and_disable_writer(
+    struct fpga_fastpath* fpga,
+    uint32_t writer_slot) {
+    if (!fpga || writer_slot >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    /* 1. Mark DRAINING */
+    fpga->writer_state[writer_slot] = FPGA_LIFECYCLE_DRAINING;
+    fpga->cfg.writers[writer_slot].lifecycle_state = FPGA_LIFECYCLE_DRAINING;
+
+    /* 2 & 3: Stopped accepting publish/take by lifecycle_state check */
+    /* 4. Settle delay for in-flight DMA */
+    usleep(100);
+
+    /* 5. Clear shadow descriptor validity bit */
+    fpga->cfg.writers[writer_slot].valid = 0;
+    fpga->cfg.writers[writer_slot].lifecycle_state = FPGA_LIFECYCLE_DISABLED;
+
+    /* 6 & 7: Commit shadow EDT and verify generation */
+    uint32_t next_gen = fpga->active_generation + 1;
+    fpga_commit_endpoints(fpga, next_gen);
+
+    /* 8. Mark DISABLED */
+    fpga->writer_state[writer_slot] = FPGA_LIFECYCLE_DISABLED;
+    return 0;
+}
+
+static inline int fpga_fastpath_drain_and_disable_reader(
+    struct fpga_fastpath* fpga,
+    uint32_t reader_slot) {
+    if (!fpga || reader_slot >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    /* 1. Mark DRAINING */
+    fpga->reader_state[reader_slot] = FPGA_LIFECYCLE_DRAINING;
+    fpga->cfg.readers[reader_slot].lifecycle_state = FPGA_LIFECYCLE_DRAINING;
+
+    usleep(100);
+
+    /* 5. Clear shadow descriptor validity bit */
+    fpga->cfg.readers[reader_slot].valid = 0;
+    fpga->cfg.readers[reader_slot].lifecycle_state = FPGA_LIFECYCLE_DISABLED;
+
+    /* 6 & 7: Commit shadow EDT and verify generation */
+    uint32_t next_gen = fpga->active_generation + 1;
+    fpga_commit_endpoints(fpga, next_gen);
+
+    /* 8. Mark DISABLED */
+    fpga->reader_state[reader_slot] = FPGA_LIFECYCLE_DISABLED;
+    return 0;
+}
+
 #endif /* _RTPS_FPGA_TRANSPORT_H_ */

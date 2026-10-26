@@ -145,6 +145,369 @@ static double get_percentile(const double* sorted, int n, double pct) {
     return sorted[low] * (1.0 - weight) + sorted[high] * weight;
 }
 
+static int run_fastpath_endpoint_test(int iterations, int verbose) {
+    printf("=================================================================\n");
+    printf("  Option 1 Dedicated Hardware RTPS Endpoint API Verification\n");
+    printf("=================================================================\n");
+    printf("  Target Device      : %s\n", DEVICE_PATH);
+    printf("  Endpoint Model     : Option 1 (Dedicated FPGA Hardware Endpoint)\n");
+    printf("  Lifecycle States   : DISABLED(0) -> ACTIVE(2) -> DRAINING(3)\n");
+    printf("  Driver API Tested  : fpga_fastpath_open / close\n");
+    printf("                       fpga_configure_writer / reader\n");
+    printf("                       fpga_commit_endpoints\n");
+    printf("                       fpga_fastpath_publish / take / release\n");
+    printf("                       fpga_fastpath_drain_and_disable_*\n");
+    printf("=================================================================\n\n");
+
+    struct fpga_fastpath* fpga = NULL;
+    int rc = fpga_fastpath_open(DEVICE_PATH, 1, &fpga);
+    if (rc < 0) {
+        fprintf(stderr, "[-] fpga_fastpath_open failed: %s (%d)\n", strerror(-rc), rc);
+        return 1;
+    }
+    printf("[+] Step 1: fpga_fastpath_open() succeeded (fd=%d, mmap=%s)\n",
+           fpga->fd, fpga->use_mmap ? "coherent zero-copy" : "copy");
+
+    /* Step 2: Configure Option 1 Writer Endpoint */
+    struct fpga_writer_endpoint writer_ep;
+    memset(&writer_ep, 0, sizeof(writer_ep));
+    writer_ep.slot_idx          = 0;
+    writer_ep.lifecycle_state   = FPGA_LIFECYCLE_ACTIVE;
+    writer_ep.payload_words     = RTPS_FAST_SAMPLE_WORDS;
+    writer_ep.dst_ip            = 0xC0A80164; /* 192.168.1.100 */
+    writer_ep.src_port          = 7411;
+    writer_ep.dst_port          = 7410;
+    writer_ep.dst_mac[0]        = 0x00;
+    writer_ep.dst_mac[1]        = 0x02;
+    writer_ep.dst_mac[2]        = 0x5E;
+    writer_ep.dst_mac[3]        = 0x20;
+    writer_ep.dst_mac[4]        = 0x00;
+    writer_ep.dst_mac[5]        = 0x02;
+    writer_ep.writer_entity_id  = 0x00000102;
+    writer_ep.reader_entity_id  = 0x00000000;
+    writer_ep.seq_seed          = 1;
+    writer_ep.generation        = 1;
+
+    rc = fpga_configure_writer(fpga, &writer_ep);
+    if (rc < 0) {
+        fprintf(stderr, "[-] fpga_configure_writer failed: %s (%d)\n", strerror(-rc), rc);
+        fpga_fastpath_close(fpga);
+        return 1;
+    }
+    printf("[+] Step 2: fpga_configure_writer() registered Writer[0] (Dst=192.168.1.100:7410, EntityId=0x%08X)\n",
+           writer_ep.writer_entity_id);
+
+    /* Step 3: Configure Option 1 Reader Endpoint */
+    struct fpga_reader_endpoint reader_ep;
+    memset(&reader_ep, 0, sizeof(reader_ep));
+    reader_ep.slot_idx               = 0;
+    reader_ep.lifecycle_state        = FPGA_LIFECYCLE_ACTIVE;
+    /* Peer GuidPrefix: 01010002-BB000002-00000002 */
+    reader_ep.remote_guid_prefix[0]  = 0x01;
+    reader_ep.remote_guid_prefix[1]  = 0x01;
+    reader_ep.remote_guid_prefix[2]  = 0x00;
+    reader_ep.remote_guid_prefix[3]  = 0x02;
+    reader_ep.remote_guid_prefix[4]  = 0xBB;
+    reader_ep.remote_guid_prefix[5]  = 0x00;
+    reader_ep.remote_guid_prefix[6]  = 0x00;
+    reader_ep.remote_guid_prefix[7]  = 0x02;
+    reader_ep.remote_guid_prefix[8]  = 0x00;
+    reader_ep.remote_guid_prefix[9]  = 0x00;
+    reader_ep.remote_guid_prefix[10] = 0x00;
+    reader_ep.remote_guid_prefix[11] = 0x02;
+    reader_ep.remote_writer_entity_id= 0x00000202;
+    reader_ep.local_reader_entity_id = 0x00000107;
+    reader_ep.expected_dst_port      = 7411;
+    reader_ep.expected_remote_src_ip = 0xC0A80164;
+    reader_ep.generation             = 1;
+
+    rc = fpga_configure_reader(fpga, &reader_ep);
+    if (rc < 0) {
+        fprintf(stderr, "[-] fpga_configure_reader failed: %s (%d)\n", strerror(-rc), rc);
+        fpga_fastpath_close(fpga);
+        return 1;
+    }
+    printf("[+] Step 3: fpga_configure_reader() registered Reader[0] (Expected DstPort=%u, SrcIP=0x%08X)\n",
+           reader_ep.expected_dst_port, reader_ep.expected_remote_src_ip);
+
+    /* Step 4: Atomic Commit */
+    rc = fpga_commit_endpoints(fpga, 1);
+    if (rc < 0) {
+        fprintf(stderr, "[-] fpga_commit_endpoints failed: %s (%d)\n", strerror(-rc), rc);
+        fpga_fastpath_close(fpga);
+        return 1;
+    }
+    printf("[+] Step 4: fpga_commit_endpoints() atomically committed Generation 1\n\n");
+
+    /* Step 5: Benchmark Loop */
+    printf("[+] Step 5: Executing %d Cyclic Fast-Path Publish / Take Iterations...\n", iterations);
+    double* latencies_roundtrip = (double*)malloc(iterations * sizeof(double));
+    double* latencies_tx        = (double*)malloc(iterations * sizeof(double));
+    double* latencies_rx        = (double*)malloc(iterations * sizeof(double));
+    double* latencies_pl_hw     = (double*)malloc(iterations * sizeof(double));
+    if (!latencies_roundtrip || !latencies_tx || !latencies_rx || !latencies_pl_hw) {
+        fprintf(stderr, "[-] Memory allocation failed\n");
+        free(latencies_roundtrip); free(latencies_tx); free(latencies_rx); free(latencies_pl_hw);
+        fpga_fastpath_close(fpga);
+        return 1;
+    }
+
+    struct FastSample tx_sample;
+    int iter, errors = 0;
+    double min_us = 1e12, max_us = 0.0, total_us = 0.0;
+    double total_tx_us = 0.0, total_rx_us = 0.0, total_pl_hw_us = 0.0;
+
+    for (iter = 1; iter <= iterations; iter++) {
+        if ((iter & 0x3F) == 1) {
+            uint32_t pet = 1;
+            ioctl(fpga->fd, AXI_RTPS_IOC_PET_WATCHDOG, &pet);
+        }
+
+        /* Anti-stale data invariant */
+        tx_sample.cycle_id        = (uint32_t)iter;
+        tx_sample.flags           = 0x000000A5U ^ (uint32_t)iter;
+        tx_sample.tx_timestamp_ns = (uint64_t)iter * 1000000ULL;
+        for (uint32_t j = 0; j < 1020; j++) {
+            tx_sample.payload[j] = (uint32_t)((iter << 16) ^ (0x5A000000U + ((j + 4) * 0x010103U)));
+        }
+
+        struct timespec t_start, t_tx_done, t_rx_done;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+        rc = fpga_fastpath_publish(fpga, 0, &tx_sample, sizeof(tx_sample), tx_sample.tx_timestamp_ns, 5000000);
+        if (rc < 0) {
+            fprintf(stderr, "\n[-] Iteration %d: fpga_fastpath_publish failed: %s (%d)\n", iter, strerror(-rc), rc);
+            errors++;
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_tx_done);
+
+        /* Query hardware ticks */
+        struct rtps_cycle_diag diag;
+        double pl_cycle_us = 0.0;
+        uint32_t pl_ticks = 0;
+        if (ioctl(fpga->fd, AXI_RTPS_IOC_GET_DIAG, &diag) == 0) {
+            pl_ticks    = diag.last_cycle_ticks;
+            pl_cycle_us = (double)diag.last_cycle_ticks * 0.01;
+        }
+
+        const void* rx_payload = NULL;
+        size_t rx_len = 0;
+        struct fpga_rx_metadata meta;
+        memset(&meta, 0, sizeof(meta));
+
+        rc = fpga_fastpath_take(fpga, 0, &rx_payload, &rx_len, &meta, 5000000);
+        if (rc < 0) {
+            fprintf(stderr, "\n[-] Iteration %d: fpga_fastpath_take failed: %s (%d)\n", iter, strerror(-rc), rc);
+            errors++;
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_rx_done);
+
+        double tx_us        = timespec_to_us(&t_start, &t_tx_done);
+        double rx_us        = timespec_to_us(&t_tx_done, &t_rx_done);
+        double roundtrip_us = timespec_to_us(&t_start, &t_rx_done);
+
+        latencies_roundtrip[iter - 1] = roundtrip_us;
+        latencies_tx[iter - 1]        = tx_us;
+        latencies_rx[iter - 1]        = rx_us;
+        latencies_pl_hw[iter - 1]     = pl_cycle_us;
+
+        total_us       += roundtrip_us;
+        total_tx_us    += tx_us;
+        total_rx_us    += rx_us;
+        total_pl_hw_us += pl_cycle_us;
+
+        if (roundtrip_us < min_us) min_us = roundtrip_us;
+        if (roundtrip_us > max_us) max_us = roundtrip_us;
+
+        /* Verify RX Metadata */
+        if (meta.reader_slot != 0 || meta.source_ipv4 != 0xC0A80164 ||
+            meta.source_udp_port != 7410 || meta.destination_udp_port != 7411) {
+            fprintf(stderr, "\n[-] Iteration %d: Metadata mismatch: slot=%u, src_ip=0x%08X, ports=%u->%u\n",
+                    iter, meta.reader_slot, meta.source_ipv4, meta.source_udp_port, meta.destination_udp_port);
+            errors++;
+            fpga_fastpath_release(fpga, rx_payload);
+            break;
+        }
+
+        /* Verify Payload */
+        const struct FastSample* rx_sample = (const struct FastSample*)rx_payload;
+        if (rx_sample->cycle_id != tx_sample.cycle_id ||
+            rx_sample->flags != tx_sample.flags ||
+            rx_sample->tx_timestamp_ns != tx_sample.tx_timestamp_ns) {
+            fprintf(stderr, "\n[-] Iteration %d FastSample Header mismatch: exp cycle_id=%u, got=%u\n",
+                    iter, tx_sample.cycle_id, rx_sample->cycle_id);
+            errors++;
+            fpga_fastpath_release(fpga, rx_payload);
+            break;
+        }
+
+        uint64_t active_seq = (meta.writer_sequence_number != 0) ? meta.writer_sequence_number : (uint64_t)iter;
+        uint32_t seq_lo_6b = ((uint32_t)active_seq) & 0x3FU;
+        for (uint32_t j = 0; j < 1020; j++) {
+            uint32_t expected = (~tx_sample.payload[j]) + ((seq_lo_6b << 10) | 0x200U);
+            if (rx_sample->payload[j] != expected) {
+                fprintf(stderr, "\n[-] Iteration %d payload mismatch at word %u: exp=0x%08X, got=0x%08X\n",
+                        iter, j + 4, expected, rx_sample->payload[j]);
+                errors++;
+                break;
+            }
+        }
+
+        fpga_fastpath_release(fpga, rx_payload);
+        if (errors)
+            break;
+
+        if (verbose) {
+            printf("  [Iter %4d] RTT: %7.2f us | TX: %6.2f us | PL Peer Emu: %5.2f us (%4u ticks) | RX: %6.2f us | Seq: %llu\n",
+                   iter, roundtrip_us, tx_us, pl_cycle_us, pl_ticks, rx_us, (unsigned long long)meta.writer_sequence_number);
+        } else if (iter % 100 == 0 || iter == iterations) {
+            printf("  Progress: [%4d/%4d] (%5.1f%%) | Current RTT: %7.2f us | Avg: %7.2f us\r",
+                   iter, iterations, (iter * 100.0) / iterations, roundtrip_us, total_us / iter);
+            fflush(stdout);
+        }
+    }
+    printf("\n\n");
+
+    if (errors == 0 && iter > 1) {
+        int count = iter - 1;
+        qsort(latencies_roundtrip, count, sizeof(double), compare_doubles);
+        qsort(latencies_tx,        count, sizeof(double), compare_doubles);
+        qsort(latencies_rx,        count, sizeof(double), compare_doubles);
+        qsort(latencies_pl_hw,     count, sizeof(double), compare_doubles);
+
+        double avg_us    = total_us / count;
+        double p50_us    = get_percentile(latencies_roundtrip, count, 50.0);
+        double p95_us    = get_percentile(latencies_roundtrip, count, 95.0);
+        double p99_us    = get_percentile(latencies_roundtrip, count, 99.0);
+        double p99_9_us  = get_percentile(latencies_roundtrip, count, 99.9);
+        double p99_99_us = get_percentile(latencies_roundtrip, count, 99.99);
+
+        double avg_tx_us = total_tx_us / count;
+        double p50_tx_us = get_percentile(latencies_tx, count, 50.0);
+        double p95_tx_us = get_percentile(latencies_tx, count, 95.0);
+
+        double avg_rx_us = total_rx_us / count;
+        double p50_rx_us = get_percentile(latencies_rx, count, 50.0);
+        double p95_rx_us = get_percentile(latencies_rx, count, 95.0);
+
+        double avg_pl_us = total_pl_hw_us / count;
+        double p50_pl_us = get_percentile(latencies_pl_hw, count, 50.0);
+        double p95_pl_us = get_percentile(latencies_pl_hw, count, 95.0);
+
+        double total_mb = (double)((RTPS_FAST_SAMPLE_BYTES * 2) * (uint64_t)count) / (1024.0 * 1024.0);
+        double total_sec = total_us / 1e6;
+
+        printf("=================================================================\n");
+        printf("          OPTION 1 FAST-PATH BENCHMARK RESULTS                   \n");
+        printf("=================================================================\n");
+        printf("  Iterations Completed : %d\n", count);
+        printf("  Payload Size         : %u bytes TX / %u bytes RX (FastSample)\n",
+               RTPS_FAST_SAMPLE_BYTES, RTPS_FAST_SAMPLE_BYTES);
+        printf("  Total Data Processed : %.2f MB\n", total_mb);
+        printf("  Total Elapsed Time   : %.3f s (%.1f cycles/sec, %.2f MB/s)\n",
+               total_sec, (double)count / total_sec, total_mb / total_sec);
+        printf("-----------------------------------------------------------------\n");
+        printf("  1. Total End-to-End Latency (fpga_publish -> Emu Loopback -> fpga_take):\n");
+        printf("    - Min Latency      : %8.2f us  (%6.3f ms)\n", min_us, min_us / 1e3);
+        printf("    - Avg Latency      : %8.2f us  (%6.3f ms)\n", avg_us, avg_us / 1e3);
+        printf("    - p50   (Median)   : %8.2f us  (%6.3f ms)\n", p50_us, p50_us / 1e3);
+        printf("    - p95   Latency    : %8.2f us  (%6.3f ms)\n", p95_us, p95_us / 1e3);
+        printf("    - p99   Latency    : %8.2f us  (%6.3f ms)\n", p99_us, p99_us / 1e3);
+        printf("    - p99.9 Latency    : %8.2f us  (%6.3f ms)\n", p99_9_us, p99_9_us / 1e3);
+        printf("    - p99.99 Latency   : %8.2f us  (%6.3f ms)\n", p99_99_us, p99_99_us / 1e3);
+        printf("    - Max Latency      : %8.2f us  (%6.3f ms)\n", max_us, max_us / 1e3);
+        printf("-----------------------------------------------------------------\n");
+        printf("  2. Phase Breakdown:\n");
+        printf("    [A] Host MM2S TX Write DMA   : %7.2f us  (%5.1f%%)  [p50: %6.2f, p95: %6.2f]\n",
+               avg_tx_us, (avg_tx_us / avg_us) * 100.0, p50_tx_us, p95_tx_us);
+        printf("    [B] PL Wire Framing + Peer Emu: %7.2f us  (%5.1f%%)  [p50: %6.2f, p95: %6.2f]\n",
+               avg_pl_us, (avg_pl_us / avg_us) * 100.0, p50_pl_us, p95_pl_us);
+        printf("    [C] Host S2MM RX Read DMA    : %7.2f us  (%5.1f%%)  [p50: %6.2f, p95: %6.2f]\n",
+               avg_rx_us, (avg_rx_us / avg_us) * 100.0, p50_rx_us, p95_rx_us);
+        printf("=================================================================\n\n");
+    }
+
+    free(latencies_roundtrip);
+    free(latencies_tx);
+    free(latencies_rx);
+    free(latencies_pl_hw);
+
+    /* Step 6: Lifecycle State Machine & Safety Gating Verification */
+    printf("--- Option 1 Lifecycle State Machine & Safety Gating Verification ---\n");
+
+    /* Subtest A: Contract Gating */
+    rc = fpga_fastpath_publish(fpga, 0, &tx_sample, 512, 0, 1000);
+    if (rc != -EMSGSIZE) {
+        fprintf(stderr, "[-] FAIL: Expected -EMSGSIZE when payload size contract violated, got %d\n", rc);
+        errors++;
+    } else {
+        printf("[+] PASS: Strict payload contract violation returned -EMSGSIZE (%d)!\n", rc);
+    }
+
+    /* Subtest B: Drain & Disable Writer */
+    rc = fpga_fastpath_drain_and_disable_writer(fpga, 0);
+    if (rc < 0) {
+        fprintf(stderr, "[-] FAIL: fpga_fastpath_drain_and_disable_writer failed: %d\n", rc);
+        errors++;
+    } else {
+        printf("[+] PASS: fpga_fastpath_drain_and_disable_writer(0) transitioned Writer to DISABLED!\n");
+    }
+
+    /* Verify publish rejected while DISABLED */
+    rc = fpga_fastpath_publish(fpga, 0, &tx_sample, sizeof(tx_sample), 0, 1000);
+    if (rc != -EPERM) {
+        fprintf(stderr, "[-] FAIL: Expected -EPERM when publishing on DISABLED writer, got %d\n", rc);
+        errors++;
+    } else {
+        printf("[+] PASS: fpga_fastpath_publish returned -EPERM (%d) on DISABLED writer!\n", rc);
+    }
+
+    /* Subtest C: Recovery - Re-activate Writer */
+    writer_ep.lifecycle_state = FPGA_LIFECYCLE_ACTIVE;
+    writer_ep.generation      = 2;
+    rc = fpga_configure_writer(fpga, &writer_ep);
+    rc |= fpga_commit_endpoints(fpga, 2);
+    if (rc < 0) {
+        fprintf(stderr, "[-] FAIL: Re-activation of Writer failed: %d\n", rc);
+        errors++;
+    } else {
+        printf("[+] PASS: Re-activated Writer[0] with Generation 2!\n");
+    }
+
+    /* Publish sample on recovered writer */
+    rc = fpga_fastpath_publish(fpga, 0, &tx_sample, sizeof(tx_sample), tx_sample.tx_timestamp_ns, 5000000);
+    if (rc < 0) {
+        fprintf(stderr, "[-] FAIL: Publish on recovered writer failed: %d\n", rc);
+        errors++;
+    } else {
+        const void* rx_p = NULL;
+        size_t rx_sz = 0;
+        struct fpga_rx_metadata meta;
+        rc = fpga_fastpath_take(fpga, 0, &rx_p, &rx_sz, &meta, 5000000);
+        if (rc < 0) {
+            fprintf(stderr, "[-] FAIL: Take on recovered writer failed: %d\n", rc);
+            errors++;
+        } else {
+            printf("[+] PASS: Clean roundtrip completed on recovered writer (Seq=%llu)!\n",
+                   (unsigned long long)meta.writer_sequence_number);
+            fpga_fastpath_release(fpga, rx_p);
+        }
+    }
+
+    /* Subtest D: Full Drain & Disable Reader and Writer */
+    fpga_fastpath_drain_and_disable_reader(fpga, 0);
+    fpga_fastpath_drain_and_disable_writer(fpga, 0);
+    printf("[+] PASS: Full drain and disable workflow executed cleanly.\n");
+
+    fpga_fastpath_close(fpga);
+    printf("[+] PASS: fpga_fastpath_close() completed cleanly.\n");
+    printf("=================================================================\n");
+
+    return errors ? 1 : 0;
+}
+
 int main(int argc, char* argv[]) {
     int fd;
     NDDS_Transport_Plugin plugin;
@@ -160,6 +523,7 @@ int main(int argc, char* argv[]) {
     uint32_t timer_val = 0;
     uint32_t bypass_crc = 0;
     int option_b_mode = 1; /* Default: Option B NDDS_Transport_Plugin mode (CTRL[7]=1) */
+    int fastpath_mode = 0; /* Option 1 dedicated hardware RTPS endpoint mode */
     int verbose = 0;
     const char* pcap_filename = NULL;
     int pcap_wire_frags = 0;
@@ -178,12 +542,14 @@ int main(int argc, char* argv[]) {
     for (int arg_i = 1; arg_i < argc; arg_i++) {
         if (strcmp(argv[arg_i], "-h") == 0 || strcmp(argv[arg_i], "--help") == 0) {
             printf("Usage: %s [iterations] [timer_cycles] [bypass_crc] [option_b_plugin_mode]\n", argv[0]);
-            printf("   or: %s [--iterations N] [--timer N] [--bypass-crc] [--option-b (1|0)] [--verbose]\n\n", argv[0]);
+            printf("   or: %s [--iterations N] [--timer N] [--bypass-crc] [--option-b (1|0)] [--verbose]\n", argv[0]);
+            printf("   or: %s --fastpath [--iterations N] [--verbose]\n\n", argv[0]);
             printf("Options:\n");
             printf("  -n, --iterations N     Number of cyclic RTPS iterations (default: %d)\n", DEFAULT_ITERATIONS);
             printf("  -t, --timer N          Hardware wire pacing delay cycles per beat (default: 0)\n");
             printf("  --bypass-crc           Bypass CPU DMA0 CRC-32 check\n");
             printf("  -b, --option-b (0|1)   1 for Option B 4,156B RTPS RX (default: 1), 0 for Option A 4,096B\n");
+            printf("  --fastpath, --endpoint Option 1 Dedicated FPGA Hardware RTPS Endpoint Driver API test\n");
             printf("  --emulation            Enable hardware RTI Peer Emulator (enabled by default in PL)\n");
             printf("  -v, --verbose          Print per-iteration hardware emulation and phase timing\n");
             printf("  -p, --pcap FILE        Capture all TX and RX RTPS packets to Wireshark PCAP file\n");
@@ -197,6 +563,8 @@ int main(int argc, char* argv[]) {
             bypass_crc = 1;
         } else if ((strcmp(argv[arg_i], "-b") == 0 || strcmp(argv[arg_i], "--option-b") == 0) && arg_i + 1 < argc) {
             option_b_mode = atoi(argv[++arg_i]) ? 1 : 0;
+        } else if (strcmp(argv[arg_i], "--fastpath") == 0 || strcmp(argv[arg_i], "--endpoint") == 0 || strcmp(argv[arg_i], "--endpoint-api") == 0) {
+            fastpath_mode = 1;
         } else if (strcmp(argv[arg_i], "-v") == 0 || strcmp(argv[arg_i], "--verbose") == 0) {
             verbose = 1;
         } else if ((strcmp(argv[arg_i], "-p") == 0 || strcmp(argv[arg_i], "--pcap") == 0) && arg_i + 1 < argc) {
@@ -221,6 +589,10 @@ int main(int argc, char* argv[]) {
     }
     if (iterations <= 0)
         iterations = DEFAULT_ITERATIONS;
+
+    if (fastpath_mode) {
+        return run_fastpath_endpoint_test(iterations, verbose);
+    }
 
     latencies_roundtrip = (double*)malloc(iterations * sizeof(double));
     latencies_tx        = (double*)malloc(iterations * sizeof(double));

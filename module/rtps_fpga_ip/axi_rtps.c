@@ -297,8 +297,10 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 
             /* Program Shadow Writer EDT [0..3] */
             for (i = 0; i < RTPS_MAX_ENDPOINTS; i++) {
+                u8 wr_state = cfg.writers[i].lifecycle_state ? cfg.writers[i].lifecycle_state :
+                              (cfg.writers[i].valid ? FPGA_LIFECYCLE_ACTIVE : FPGA_LIFECYCLE_DISABLED);
                 u32 wr_ctrl = ((u32)(cfg.writers[i].payload_words & 0x0FFFU) << 4) |
-                              ((cfg.writers[i].use_multicast ? 1U : 0U) << 1) |
+                              ((u32)(wr_state & 0x7U) << 1) |
                               (cfg.writers[i].valid ? 1U : 0U);
                 u32 wr_ports = ((u32)cfg.writers[i].src_port << 16) |
                                ((u32)cfg.writers[i].dst_port);
@@ -315,12 +317,18 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 
             /* Program Shadow Reader CAM [0..3] */
             for (i = 0; i < RTPS_MAX_ENDPOINTS; i++) {
-                iowrite32(cfg.readers[i].valid ? 1U : 0U,   dev->ip_regs + RTPS_RD_CTRL(i));
+                u8 rd_state = cfg.readers[i].lifecycle_state ? cfg.readers[i].lifecycle_state :
+                              (cfg.readers[i].valid ? FPGA_LIFECYCLE_ACTIVE : FPGA_LIFECYCLE_DISABLED);
+                u32 rd_ctrl = ((u32)cfg.readers[i].expected_dst_port << 16) |
+                              ((u32)(rd_state & 0x7U) << 1) |
+                              (cfg.readers[i].valid ? 1U : 0U);
+                iowrite32(rd_ctrl,                          dev->ip_regs + RTPS_RD_CTRL(i));
                 iowrite32(cfg.readers[i].guid_prefix[0],    dev->ip_regs + RTPS_RD_GUID_0(i));
                 iowrite32(cfg.readers[i].guid_prefix[1],    dev->ip_regs + RTPS_RD_GUID_1(i));
                 iowrite32(cfg.readers[i].guid_prefix[2],    dev->ip_regs + RTPS_RD_GUID_2(i));
                 iowrite32(cfg.readers[i].writer_entity_id,  dev->ip_regs + RTPS_RD_WRITER_ID(i));
                 iowrite32(cfg.readers[i].reader_entity_id,  dev->ip_regs + RTPS_RD_READER_ID(i));
+                iowrite32(cfg.readers[i].expected_src_ip,   dev->ip_regs + RTPS_RD_SRC_IP(i));
             }
 
             /* Atomically commit Shadow -> Active EDT at S_IDLE boundary */
@@ -359,6 +367,14 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             diag.last_rx_timestamp   = ((u64)ioread32(dev->ip_regs + RTPS_IP_LAST_RX_TS_HI_OFFSET) << 32) |
                                        ioread32(dev->ip_regs + RTPS_IP_LAST_RX_TS_LO_OFFSET);
             diag.last_rx_rtps_words  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_RTPS_WORDS);
+            diag.last_rx_src_ip      = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_IP_OFFSET);
+            {
+                u32 ports_word       = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_PORTS_OFFSET);
+                u32 meta_word        = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_META_OFFSET);
+                diag.last_rx_src_port= (u16)(ports_word >> 16);
+                diag.last_rx_dst_port= (u16)(ports_word & 0xFFFFU);
+                diag.last_rx_cam_idx = meta_word & 0x03U;
+            }
             diag.active_generation   = ioread32(dev->ip_regs + RTPS_IP_COMMIT_STATUS_OFFSET);
             diag.commit_status       = diag.active_generation;
             diag.type_profile        = ioread32(dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
@@ -433,6 +449,96 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                 return -EFAULT;
             iowrite32(val & 0x0FU, dev->ip_regs + RTPS_IP_FAULT_INJECT_OFFSET);
             return 0;
+
+        case AXI_RTPS_IOC_CONFIGURE_WRITER: {
+            struct fpga_writer_endpoint wep;
+            u32 wr_ctrl, wr_ports, dst_mac_lo, dst_mac_hi;
+            if (copy_from_user(&wep, (void __user*)arg, sizeof(wep)))
+                return -EFAULT;
+            if (wep.slot_idx >= RTPS_MAX_ENDPOINTS)
+                return -EINVAL;
+            i = wep.slot_idx;
+            wr_ctrl = ((u32)(wep.payload_words & 0x0FFFU) << 4) |
+                      ((u32)(wep.lifecycle_state & 0x7U) << 1) |
+                      (wep.lifecycle_state != FPGA_LIFECYCLE_DISABLED ? 1U : 0U);
+            wr_ports = ((u32)wep.src_port << 16) | ((u32)wep.dst_port);
+            dst_mac_lo = ((u32)wep.dst_mac[0]) |
+                         ((u32)wep.dst_mac[1] << 8) |
+                         ((u32)wep.dst_mac[2] << 16) |
+                         ((u32)wep.dst_mac[3] << 24);
+            dst_mac_hi = ((u32)wep.dst_mac[4]) |
+                         ((u32)wep.dst_mac[5] << 8);
+
+            iowrite32(wr_ctrl,             dev->ip_regs + RTPS_WR_CTRL(i));
+            iowrite32(wep.dst_ip,          dev->ip_regs + RTPS_WR_DST_IP(i));
+            iowrite32(wr_ports,            dev->ip_regs + RTPS_WR_PORTS(i));
+            iowrite32(dst_mac_lo,          dev->ip_regs + RTPS_WR_DST_MAC_LO(i));
+            iowrite32(dst_mac_hi,          dev->ip_regs + RTPS_WR_DST_MAC_HI(i));
+            iowrite32(wep.writer_entity_id,dev->ip_regs + RTPS_WR_ENTITY_ID(i));
+            iowrite32(wep.reader_entity_id,dev->ip_regs + RTPS_WR_READER_ID(i));
+            iowrite32(wep.seq_seed,        dev->ip_regs + RTPS_WR_SEQ_SEED(i));
+            if (wep.generation > 0)
+                iowrite32(wep.generation,  dev->ip_regs + RTPS_IP_GENERATION_OFFSET);
+            return 0;
+        }
+
+        case AXI_RTPS_IOC_CONFIGURE_READER: {
+            struct fpga_reader_endpoint rep;
+            u32 rd_ctrl, g0, g1, g2;
+            if (copy_from_user(&rep, (void __user*)arg, sizeof(rep)))
+                return -EFAULT;
+            if (rep.slot_idx >= RTPS_MAX_ENDPOINTS)
+                return -EINVAL;
+            i = rep.slot_idx;
+            rd_ctrl = ((u32)rep.expected_dst_port << 16) |
+                      ((u32)(rep.lifecycle_state & 0x7U) << 1) |
+                      (rep.lifecycle_state != FPGA_LIFECYCLE_DISABLED ? 1U : 0U);
+            g0 = ((u32)rep.remote_guid_prefix[0] << 24) |
+                 ((u32)rep.remote_guid_prefix[1] << 16) |
+                 ((u32)rep.remote_guid_prefix[2] << 8)  |
+                 ((u32)rep.remote_guid_prefix[3]);
+            g1 = ((u32)rep.remote_guid_prefix[4] << 24) |
+                 ((u32)rep.remote_guid_prefix[5] << 16) |
+                 ((u32)rep.remote_guid_prefix[6] << 8)  |
+                 ((u32)rep.remote_guid_prefix[7]);
+            g2 = ((u32)rep.remote_guid_prefix[8] << 24) |
+                 ((u32)rep.remote_guid_prefix[9] << 16) |
+                 ((u32)rep.remote_guid_prefix[10] << 8) |
+                 ((u32)rep.remote_guid_prefix[11]);
+
+            iowrite32(rd_ctrl,                   dev->ip_regs + RTPS_RD_CTRL(i));
+            iowrite32(g0,                         dev->ip_regs + RTPS_RD_GUID_0(i));
+            iowrite32(g1,                         dev->ip_regs + RTPS_RD_GUID_1(i));
+            iowrite32(g2,                         dev->ip_regs + RTPS_RD_GUID_2(i));
+            iowrite32(rep.remote_writer_entity_id,dev->ip_regs + RTPS_RD_WRITER_ID(i));
+            iowrite32(rep.local_reader_entity_id, dev->ip_regs + RTPS_RD_READER_ID(i));
+            iowrite32(rep.expected_remote_src_ip, dev->ip_regs + RTPS_RD_SRC_IP(i));
+            if (rep.generation > 0)
+                iowrite32(rep.generation,         dev->ip_regs + RTPS_IP_GENERATION_OFFSET);
+            return 0;
+        }
+
+        case AXI_RTPS_IOC_COMMIT_ENDPOINTS: {
+            u32 gen;
+            int poll_i;
+            if (copy_from_user(&gen, (u32 __user*)arg, sizeof(u32)))
+                return -EFAULT;
+            if (gen > 0)
+                iowrite32(gen, dev->ip_regs + RTPS_IP_GENERATION_OFFSET);
+
+            ctrl_word = ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET);
+            ctrl_word |= RTPS_CTRL_ENABLE | RTPS_CTRL_EMU_EN | RTPS_CTRL_COMMIT_EDT;
+            iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
+
+            if (gen > 0) {
+                for (poll_i = 0; poll_i < 100; poll_i++) {
+                    if (ioread32(dev->ip_regs + RTPS_IP_COMMIT_STATUS_OFFSET) == gen)
+                        break;
+                    udelay(5);
+                }
+            }
+            return 0;
+        }
 
         default:
             return -ENOTTY;

@@ -58,6 +58,18 @@
 #define RTPS_IP_GENERATION_OFFSET        0x180 /* Word 96: Shadow generation number */
 #define RTPS_IP_COMMIT_STATUS_OFFSET     0x184 /* Word 97: Active writer generation number / commit status */
 #define RTPS_IP_TYPE_PROFILE_OFFSET      0x188 /* Word 98: Type profile & strict payload contract */
+#define RTPS_IP_LAST_RX_SRC_IP_OFFSET    0x18C /* Word 99: Last accepted RX source IPv4 */
+#define RTPS_IP_LAST_RX_PORTS_OFFSET     0x190 /* Word 100: Last accepted RX {src_port[15:0], dst_port[15:0]} */
+#define RTPS_IP_LAST_RX_META_OFFSET      0x194 /* Word 101: Last accepted RX {24'd0, 6'd0, reader_slot[1:0]} */
+
+/* =========================================================================
+ * Option 1 Hardware RTPS Endpoint Lifecycle States (plan.txt Section 4)
+ * ========================================================================= */
+#define FPGA_LIFECYCLE_DISABLED          0
+#define FPGA_LIFECYCLE_CONFIGURING       1
+#define FPGA_LIFECYCLE_ACTIVE            2
+#define FPGA_LIFECYCLE_DRAINING          3
+#define FPGA_LIFECYCLE_ERROR             4
 
 /* IDENTITY_CTRL (0x7C) Bit Masks */
 #define RTPS_IDENTITY_LOCAL_VALID        (1U << 0)
@@ -123,6 +135,7 @@
 #define RTPS_RD_GUID_2(i)                (RTPS_SHADOW_RD_BASE + ((i) * RTPS_SHADOW_RD_STRIDE) + 0x0C)
 #define RTPS_RD_WRITER_ID(i)             (RTPS_SHADOW_RD_BASE + ((i) * RTPS_SHADOW_RD_STRIDE) + 0x10)
 #define RTPS_RD_READER_ID(i)             (RTPS_SHADOW_RD_BASE + ((i) * RTPS_SHADOW_RD_STRIDE) + 0x14)
+#define RTPS_RD_SRC_IP(i)                (RTPS_SHADOW_RD_BASE + ((i) * RTPS_SHADOW_RD_STRIDE) + 0x18)
 
 /* Sample & RTPS Frame Sizing Constants */
 #define RTPS_FAST_SAMPLE_WORDS           1024
@@ -184,30 +197,76 @@
 #define AXI_DMA_MMAP_RX_OFFSET           0x00100000 /* 1MB page offset to map RX buffer */
 
 /* =========================================================================
+ * Option 1 Hardware RTPS Dedicated Endpoint Structures (plan.txt)
+ * Populated and manipulated through dedicated FPGA Driver API
+ * ========================================================================= */
+struct fpga_writer_endpoint {
+    __u32 slot_idx;            /* Writer slot index (0..3) */
+    __u32 lifecycle_state;     /* FPGA_LIFECYCLE_DISABLED/CONFIGURING/ACTIVE/DRAINING/ERROR */
+    __u32 payload_words;       /* 1024 words = 4,096 bytes */
+    __u32 dst_ip;              /* Remote peer IPv4 address (host order) */
+    __u16 src_port;            /* Local RTPS source UDP port (e.g. 7411) */
+    __u16 dst_port;            /* Remote RTPS destination UDP port (e.g. 7410) */
+    __u8  dst_mac[6];          /* Resolved remote MAC address */
+    __u16 reserved;
+    __u32 writer_entity_id;    /* Local writer entityId */
+    __u32 reader_entity_id;    /* Remote reader entityId or ENTITYID_UNKNOWN */
+    __u32 seq_seed;            /* Initial sequence number seed */
+    __u32 generation;          /* Endpoint generation number */
+};
+
+struct fpga_reader_endpoint {
+    __u32 slot_idx;            /* Reader CAM slot index (0..3) */
+    __u32 lifecycle_state;     /* FPGA_LIFECYCLE_DISABLED/CONFIGURING/ACTIVE/DRAINING/ERROR */
+    __u16 expected_dst_port;   /* Expected destination UDP port (e.g. 7411) */
+    __u16 reserved;
+    __u8  remote_guid_prefix[12]; /* Remote participant 96-bit GuidPrefix */
+    __u32 remote_writer_entity_id;/* Expected remote writer entityId */
+    __u32 local_reader_entity_id; /* Local reader entityId */
+    __u32 expected_remote_src_ip; /* Expected remote source IPv4 address (0 = any) */
+    __u32 generation;          /* Endpoint generation number */
+};
+
+struct fpga_rx_metadata {
+    __u32 reader_slot;            /* Matched reader CAM slot index (0..3) */
+    __u64 writer_sequence_number; /* Monotonically increasing 64-bit sequence number */
+    __u64 source_timestamp;       /* 64-bit timestamp (NTP/PTP epoch) */
+    __u32 source_ipv4;            /* Wire source IPv4 address */
+    __u16 source_udp_port;        /* Wire source UDP port */
+    __u16 destination_udp_port;   /* Wire destination UDP port */
+    __u32 flags;                  /* Validation and error status flags */
+};
+
+/* =========================================================================
  * Option B Control-Plane Hook & Endpoint Descriptor Table Structures
  * Populated by on_publication_matched() / on_subscription_matched()
  * ========================================================================= */
 struct rtps_writer_edt_entry {
     __u8  valid;           /* 1 = matched & active */
     __u8  use_multicast;   /* 1 = multicast locator */
+    __u8  lifecycle_state; /* FPGA_LIFECYCLE_DISABLED/CONFIGURING/ACTIVE/DRAINING/ERROR */
+    __u8  reserved;
     __u16 payload_words;   /* 1024 words = 4,096 bytes */
+    __u16 reserved2;
     __u32 dst_ip;          /* Peer/Multicast IPv4 address (host order) */
     __u16 src_port;        /* Local RTPS UDP source port (e.g., 7411) */
     __u16 dst_port;        /* Remote RTPS user-unicast/multicast port (e.g., 7410) */
     __u32 dst_mac_lo;      /* Resolved Next-Hop / Multicast MAC [31:0] */
     __u16 dst_mac_hi;      /* Resolved Next-Hop / Multicast MAC [47:32] */
-    __u16 reserved;
+    __u16 reserved3;
     __u32 writer_entity_id;/* Local DDS DataWriter entityId (e.g., 0x00000102) */
     __u32 reader_entity_id;/* Remote DDS DataReader entityId or ENTITYID_UNKNOWN (0) */
     __u32 seq_seed;        /* Starting SequenceNumber Lo after discovery handoff */
 };
 
 struct rtps_reader_cam_entry {
-    __u8  valid;           /* 1 = CAM entry active */
-    __u8  reserved[3];
-    __u32 guid_prefix[3];  /* Remote Participant 96-bit guidPrefix[95:0] */
-    __u32 writer_entity_id;/* Remote DDS DataWriter entityId (e.g., 0x00000202) */
-    __u32 reader_entity_id;/* Local DDS DataReader entityId (e.g., 0x00000207) */
+    __u8  valid;              /* 1 = CAM entry active */
+    __u8  lifecycle_state;    /* FPGA_LIFECYCLE_DISABLED/CONFIGURING/ACTIVE/DRAINING/ERROR */
+    __u16 expected_dst_port;  /* Expected destination UDP port (e.g. 7411) */
+    __u32 guid_prefix[3];     /* Remote Participant 96-bit guidPrefix[95:0] */
+    __u32 writer_entity_id;   /* Remote DDS DataWriter entityId (e.g., 0x00000202) */
+    __u32 reader_entity_id;   /* Local DDS DataReader entityId (e.g., 0x00000207) */
+    __u32 expected_src_ip;    /* Expected remote peer source IPv4 (0 = any) */
 };
 
 struct rtps_endpoint_cfg {
@@ -242,6 +301,10 @@ struct rtps_cycle_diag {
     __u64 last_rx_seq_num;
     __u64 last_rx_timestamp;
     __u32 last_rx_rtps_words;
+    __u32 last_rx_src_ip;
+    __u16 last_rx_src_port;
+    __u16 last_rx_dst_port;
+    __u32 last_rx_cam_idx;
     __u32 active_generation;
     __u32 commit_status;
     __u32 type_profile;
@@ -293,6 +356,9 @@ struct rtps_cycle_diag {
 #define AXI_RTPS_IOC_SET_PLUGIN_MODE     _IOW(AXI_RTPS_IOC_MAGIC, 4, __u32)
 #define AXI_RTPS_IOC_SET_CRC_BYPASS      _IOW(AXI_RTPS_IOC_MAGIC, 5, __u32)
 #define AXI_RTPS_IOC_SET_FAULT_INJECT    _IOW(AXI_RTPS_IOC_MAGIC, 6, __u32)
+#define AXI_RTPS_IOC_CONFIGURE_WRITER    _IOW(AXI_RTPS_IOC_MAGIC, 7, struct fpga_writer_endpoint)
+#define AXI_RTPS_IOC_CONFIGURE_READER    _IOW(AXI_RTPS_IOC_MAGIC, 8, struct fpga_reader_endpoint)
+#define AXI_RTPS_IOC_COMMIT_ENDPOINTS    _IOW(AXI_RTPS_IOC_MAGIC, 9, __u32)
 
 /* AXI DMA SG Buffer Descriptor Structure (64 bytes aligned) */
 struct axi_dma_bd {

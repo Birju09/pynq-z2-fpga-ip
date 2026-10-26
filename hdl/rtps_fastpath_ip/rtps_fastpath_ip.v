@@ -153,7 +153,10 @@ module rtps_fastpath_ip #(
         IDENTITY_CTRL_ADDR  = 8'h1F, // 0x7C: [0]=local_identity_valid, [1]=writer_context_valid, [2]=clear_seq
         GENERATION_ADDR     = 8'h60, // 0x180: Shadow writer generation number
         COMMIT_STATUS_ADDR  = 8'h61, // 0x184: Active writer generation number / commit status
-        TYPE_PROFILE_ADDR   = 8'h62; // 0x188: Type profile & strict payload contract
+        TYPE_PROFILE_ADDR   = 8'h62, // 0x188: Type profile & strict payload contract
+        LAST_RX_SRC_IP_ADDR = 8'h63, // 0x18C: Last accepted RX source IPv4
+        LAST_RX_PORTS_ADDR  = 8'h64, // 0x190: Last accepted RX {src_port[15:0], dst_port[15:0]}
+        LAST_RX_META_ADDR   = 8'h65; // 0x194: Last accepted RX {24'd0, 6'd0, reader_slot[1:0]}
 
     // =========================================================================
     // Endpoint Descriptor Table (EDT): Shadow & Active Banks
@@ -231,6 +234,10 @@ module rtps_fastpath_ip #(
     reg [63:0] last_rx_seq_num;
     reg [63:0] last_rx_ts;
     reg [11:0] latest_rtps_words;
+    reg [31:0] last_rx_src_ip;
+    reg [15:0] last_rx_src_port;
+    reg [15:0] last_rx_dst_port;
+    reg [1:0]  last_rx_cam_idx;
 
     reg        status_write_pulse;
     reg [31:0] status_write_data;
@@ -468,7 +475,7 @@ module rtps_fastpath_ip #(
             end
 
             // Default Writer 0 (Command Topic -> RTI Peer 192.168.1.100:7410)
-            shadow_wr_edt[0][0] <= {16'd0, 12'd1024, 3'd0, 1'b1}; // valid=1, 1024 words (4096B)
+            shadow_wr_edt[0][0] <= {16'd0, 12'd1024, 3'd2, 1'b1}; // valid=1, state=ACTIVE(2), 1024 words (4096B)
             shadow_wr_edt[0][1] <= 32'hC0A8_0164;                 // 192.168.1.100
             shadow_wr_edt[0][2] <= {16'd7411, 16'd7410};          // src_port=7411, dst_port=7410
             shadow_wr_edt[0][3] <= 32'h5E20_0002;                 // Dst MAC Lo
@@ -477,7 +484,7 @@ module rtps_fastpath_ip #(
             shadow_wr_edt[0][6] <= 32'h0000_0000;                 // Reader EntityId = ENTITYID_UNKNOWN
             shadow_wr_edt[0][7] <= 32'h0000_0001;                 // Initial seqNum seed = 1
 
-            active_wr_edt[0][0] <= {16'd0, 12'd1024, 3'd0, 1'b1};
+            active_wr_edt[0][0] <= {16'd0, 12'd1024, 3'd2, 1'b1};
             active_wr_edt[0][1] <= 32'hC0A8_0164;
             active_wr_edt[0][2] <= {16'd7411, 16'd7410};
             active_wr_edt[0][3] <= 32'h5E20_0002;
@@ -487,7 +494,7 @@ module rtps_fastpath_ip #(
             active_wr_edt[0][7] <= 32'h0000_0001;
 
             // Default Reader CAM 0 (Feedback Topic <- RTI Peer 192.168.1.100)
-            shadow_rd_edt[0][0] <= {16'd7411, 15'd0, 1'b1};       // valid=1, dst_port=7411
+            shadow_rd_edt[0][0] <= {16'd7411, 12'd0, 3'd2, 1'b1}; // valid=1, state=ACTIVE(2), dst_port=7411
             shadow_rd_edt[0][1] <= 32'h0101_AA00;                 // RTI Peer GuidPrefix[95:64]
             shadow_rd_edt[0][2] <= 32'hBB11_CC22;                 // RTI Peer GuidPrefix[63:32]
             shadow_rd_edt[0][3] <= 32'hDD33_EE44;                 // RTI Peer GuidPrefix[31:0]
@@ -495,7 +502,7 @@ module rtps_fastpath_ip #(
             shadow_rd_edt[0][5] <= 32'h0000_0107;                 // Local Reader EntityId
             shadow_rd_edt[0][6] <= 32'hC0A8_0164;                 // Expected SrcIP 192.168.1.100
 
-            active_rd_edt[0][0] <= {16'd7411, 15'd0, 1'b1};
+            active_rd_edt[0][0] <= {16'd7411, 12'd0, 3'd2, 1'b1};
             active_rd_edt[0][1] <= 32'h0101_AA00;
             active_rd_edt[0][2] <= 32'hBB11_CC22;
             active_rd_edt[0][3] <= 32'hDD33_EE44;
@@ -640,12 +647,18 @@ module rtps_fastpath_ip #(
     wire any_reader_valid = active_rd_edt[0][0][0] || active_rd_edt[1][0][0] ||
                             active_rd_edt[2][0][0] || active_rd_edt[3][0][0];
 
+    wire [2:0] wr0_lifecycle_state = active_wr_edt[0][0][3:1];
+    wire wr0_lifecycle_active      = (wr0_lifecycle_state == 3'd2);
+    wire wr0_route_valid           = (wr0_dst_ip != 32'd0) && (wr0_dst_port != 16'd0) && (wr0_dst_mac != 48'd0);
+    wire generation_match          = (shadow_generation == 32'd0) || (active_generation == shadow_generation);
+
     wire lifecycle_ok     = ctrl_reg[0] &&
                             !wdog_expired &&
                             local_identity_valid &&
                             payload_contract_ok &&
+                            generation_match &&
                             (mode_sub_only ? any_reader_valid :
-                                              (wr0_valid && writer_context_valid));
+                                              (wr0_valid && wr0_lifecycle_active && wr0_route_valid && writer_context_valid));
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -715,6 +728,9 @@ module rtps_fastpath_ip #(
                         GENERATION_ADDR:     s_axi_rdata <= shadow_generation;
                         COMMIT_STATUS_ADDR:  s_axi_rdata <= active_generation;
                         TYPE_PROFILE_ADDR:   s_axi_rdata <= type_profile_reg;
+                        LAST_RX_SRC_IP_ADDR: s_axi_rdata <= last_rx_src_ip;
+                        LAST_RX_PORTS_ADDR:  s_axi_rdata <= {last_rx_src_port, last_rx_dst_port};
+                        LAST_RX_META_ADDR:   s_axi_rdata <= {24'd0, 6'd0, last_rx_cam_idx};
                         default:             s_axi_rdata <= 32'd0;
                     endcase
                 end
@@ -817,7 +833,8 @@ module rtps_fastpath_ip #(
         R_INFO_DST_0      = 5'd20, // Latch INFO_DST GuidPrefix[95:64]
         R_INFO_DST_1      = 5'd21, // Latch INFO_DST GuidPrefix[63:32]
         R_INFO_DST_2      = 5'd22, // Latch INFO_DST GuidPrefix[31:0]
-        R_DATA_READER_ID  = 5'd23; // Check DATA readerEntityId against local reader / ENTITYID_UNKNOWN
+        R_DATA_READER_ID  = 5'd23, // Check DATA readerEntityId against local reader / ENTITYID_UNKNOWN
+        R_REASM_CHECK     = 5'd24; // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
 
     reg [4:0]  rx_state;
     reg [11:0] rx_wire_beat;
@@ -836,6 +853,8 @@ module rtps_fastpath_ip #(
     reg        rx_saw_last;
     reg [15:0] rx_udp_csum_accum;
     reg [15:0] rx_udp_len_bytes;
+    reg [15:0] rx_udp_src_port;
+    reg [15:0] rx_udp_dst_port;
 
     // Fragment Coverage Bitmap per Reassembly Slot (Section 6)
     localparam integer REASM_MAX_BYTES   = REASM_DEPTH * 4; // 1536 * 4 = 6144 bytes
@@ -913,12 +932,27 @@ module rtps_fastpath_ip #(
                                         (walk_dst_guid_prefix == 96'd0) ||
                                         (walk_dst_guid_prefix == local_guid_prefix);
 
-    // 4-Entry Reader CAM Match on GuidPrefix
+    // 4-Entry Reader CAM Match on GuidPrefix, Lifecycle, Expected Port & Expected Source IP
     // Optimization: walker_dout[31:0] is the last word of the RTPS header (GuidPrefix[31:0]), so we can compare all 3 words in a single cycle instead of waiting for 1 cycle to populate the 3rd word of walk_guid_prefix.
-    wire cam_hit_0 = active_rd_edt[0][0][0] && ({active_rd_edt[0][1], active_rd_edt[0][2], active_rd_edt[0][3]} == {walk_guid_prefix[95:32], walker_dout});
-    wire cam_hit_1 = active_rd_edt[1][0][0] && ({active_rd_edt[1][1], active_rd_edt[1][2], active_rd_edt[1][3]} == {walk_guid_prefix[95:32], walker_dout});
-    wire cam_hit_2 = active_rd_edt[2][0][0] && ({active_rd_edt[2][1], active_rd_edt[2][2], active_rd_edt[2][3]} == {walk_guid_prefix[95:32], walker_dout});
-    wire cam_hit_3 = active_rd_edt[3][0][0] && ({active_rd_edt[3][1], active_rd_edt[3][2], active_rd_edt[3][3]} == {walk_guid_prefix[95:32], walker_dout});
+    wire rd0_active = active_rd_edt[0][0][0] && (active_rd_edt[0][0][3:1] == 3'd2);
+    wire rd1_active = active_rd_edt[1][0][0] && (active_rd_edt[1][0][3:1] == 3'd2);
+    wire rd2_active = active_rd_edt[2][0][0] && (active_rd_edt[2][0][3:1] == 3'd2);
+    wire rd3_active = active_rd_edt[3][0][0] && (active_rd_edt[3][0][3:1] == 3'd2);
+
+    wire rd0_port_ok = (active_rd_edt[0][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[0][0][31:16]);
+    wire rd1_port_ok = (active_rd_edt[1][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[1][0][31:16]);
+    wire rd2_port_ok = (active_rd_edt[2][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[2][0][31:16]);
+    wire rd3_port_ok = (active_rd_edt[3][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[3][0][31:16]);
+
+    wire rd0_ip_ok   = (active_rd_edt[0][6] == 32'd0) || (rx_src_ip == active_rd_edt[0][6]);
+    wire rd1_ip_ok   = (active_rd_edt[1][6] == 32'd0) || (rx_src_ip == active_rd_edt[1][6]);
+    wire rd2_ip_ok   = (active_rd_edt[2][6] == 32'd0) || (rx_src_ip == active_rd_edt[2][6]);
+    wire rd3_ip_ok   = (active_rd_edt[3][6] == 32'd0) || (rx_src_ip == active_rd_edt[3][6]);
+
+    wire cam_hit_0 = rd0_active && rd0_port_ok && rd0_ip_ok && ({active_rd_edt[0][1], active_rd_edt[0][2], active_rd_edt[0][3]} == {walk_guid_prefix[95:32], walker_dout});
+    wire cam_hit_1 = rd1_active && rd1_port_ok && rd1_ip_ok && ({active_rd_edt[1][1], active_rd_edt[1][2], active_rd_edt[1][3]} == {walk_guid_prefix[95:32], walker_dout});
+    wire cam_hit_2 = rd2_active && rd2_port_ok && rd2_ip_ok && ({active_rd_edt[2][1], active_rd_edt[2][2], active_rd_edt[2][3]} == {walk_guid_prefix[95:32], walker_dout});
+    wire cam_hit_3 = rd3_active && rd3_port_ok && rd3_ip_ok && ({active_rd_edt[3][1], active_rd_edt[3][2], active_rd_edt[3][3]} == {walk_guid_prefix[95:32], walker_dout});
 
     // Helper for endian-aware 16-bit extraction
     wire        submsg_e_flag = walker_dout[16]; // Bit 0 of flags byte (walker_dout[23:16])
@@ -1213,6 +1247,12 @@ module rtps_fastpath_ip #(
             rx_saw_last             <= 1'b0;
             rx_udp_csum_accum       <= 16'd0;
             rx_udp_len_bytes        <= 16'd0;
+            rx_udp_src_port         <= 16'd0;
+            rx_udp_dst_port         <= 16'd0;
+            last_rx_src_ip          <= 32'd0;
+            last_rx_src_port        <= 16'd0;
+            last_rx_dst_port        <= 16'd0;
+            last_rx_cam_idx         <= 2'd0;
 
             walk_guid_prefix        <= 96'd0;
             walk_cam_idx            <= 2'd0;
@@ -1355,6 +1395,10 @@ module rtps_fastpath_ip #(
                                     reasm_wr_addr     <= rx_wr_ptr;
                                     reasm_wr_data     <= {rx_prev_half, eng_rx_tdata[31:16]};
                                     rx_udp_csum_accum <= csum_add32(rx_udp_csum_accum, {rx_prev_half, eng_rx_tdata[31:16]});
+                                    if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd0) begin
+                                        rx_udp_src_port <= rx_prev_half;
+                                        rx_udp_dst_port <= eng_rx_tdata[31:16];
+                                    end
                                     if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd1) begin
                                         rx_udp_len_bytes <= rx_prev_half;
                                     end
@@ -1376,7 +1420,7 @@ module rtps_fastpath_ip #(
                                         stat_csum_errs  <= stat_csum_errs + 32'd1;
                                         rx_active_valid <= 1'b0;
                                     end else begin
-                                        // Update reassembly status and check full fragment coverage (Section 6)
+                                        // Update reassembly status
                                         if (!rx_frag_mf) begin
                                             rx_bytes_total               <= {rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes;
                                             rx_saw_last                  <= 1'b1;
@@ -1384,26 +1428,28 @@ module rtps_fastpath_ip #(
                                             reasm_total_bytes[fill_slot] <= {rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes;
                                         end
                                         rx_bytes_rcvd <= rx_bytes_rcvd + rx_ip_pay_bytes;
-
-                                        // Evaluate coverage completion
-                                        if ((!rx_frag_mf || rx_saw_last || reasm_last_seen[fill_slot]) &&
-                                            ((reasm_blocks_covered[fill_slot] +
-                                              ((rx_wr_ptr < (rx_frag_w_start + rx_ip_pay_bytes[13:2]) &&
-                                                !reasm_coverage[fill_slot][rx_wr_ptr[10:1]]) ? 10'd1 : 10'd0)) ==
-                                             (((!rx_frag_mf ? ({rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes) : reasm_total_bytes[fill_slot]) + 16'd7) >> 3)) &&
-                                            (((!rx_frag_mf ? ({rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes) : reasm_total_bytes[fill_slot]) + 16'd7) >> 3) > 0) begin
-                                            rx_active_valid <= 1'b0;
-                                            rx_bytes_rcvd   <= 16'd0;
-                                            rx_saw_last     <= 1'b0;
-                                            walker_rd_addr  <= 12'd2; // Prime Word 2 ("RTPS")
-                                            rx_state        <= R_CHECK_UDP;
-                                        end
+                                        rx_state      <= R_REASM_CHECK;
                                     end
                                 end else begin
                                     rx_wire_beat <= rx_wire_beat + 12'd1;
                                 end
                             end
                         endcase
+                    end
+                end
+
+                // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
+                R_REASM_CHECK: begin
+                    if (reasm_last_seen[fill_slot] &&
+                        (reasm_total_bytes[fill_slot] > 16'd0) &&
+                        (reasm_blocks_covered[fill_slot] == ((reasm_total_bytes[fill_slot] + 16'd7) >> 3))) begin
+                        rx_active_valid <= 1'b0;
+                        rx_bytes_rcvd   <= 16'd0;
+                        rx_saw_last     <= 1'b0;
+                        walker_rd_addr  <= 12'd2; // Prime Word 2 ("RTPS")
+                        rx_state        <= R_CHECK_UDP;
+                    end else begin
+                        rx_state        <= R_IDLE;
                     end
                 end
 
@@ -1657,6 +1703,10 @@ module rtps_fastpath_ip #(
                         last_rx_ts_by_cam[walk_cam_idx]      <= walk_ts;
                         last_rx_seq_num                      <= walk_seq_num;
                         last_rx_ts                           <= walk_ts;
+                        last_rx_src_ip                       <= rx_src_ip;
+                        last_rx_src_port                     <= rx_udp_src_port;
+                        last_rx_dst_port                     <= rx_udp_dst_port;
+                        last_rx_cam_idx                      <= walk_cam_idx;
                         stat_rx_samples                      <= stat_rx_samples + 32'd1;
                         rd_match_count[walk_cam_idx]         <= rd_match_count[walk_cam_idx] + 32'd1;
                         latest_payload_word_off              <= walk_cur_word + 12'd7; // Skip 4B encapsulation word (+6)
@@ -1692,6 +1742,10 @@ module rtps_fastpath_ip #(
                             last_rx_ts_by_cam[walk_cam_idx]      <= walk_ts;
                             last_rx_seq_num                      <= walk_seq_num;
                             last_rx_ts                           <= walk_ts;
+                            last_rx_src_ip                       <= rx_src_ip;
+                            last_rx_src_port                     <= rx_udp_src_port;
+                            last_rx_dst_port                     <= rx_udp_dst_port;
+                            last_rx_cam_idx                      <= walk_cam_idx;
                             stat_rx_samples                      <= stat_rx_samples + 32'd1;
                             rd_match_count[walk_cam_idx]         <= rd_match_count[walk_cam_idx] + 32'd1;
                             latest_payload_word_off              <= walk_cur_word + 12'd2;

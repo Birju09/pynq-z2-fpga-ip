@@ -278,7 +278,7 @@ module tb_rtps_fastpath;
         axi_write(10'h188, 32'h0007_0101); // TYPE_PROFILE: CDR/XCDR LE fixed unkeyed, vendor 0x0101
 
         // Program Shadow Writer[0] and Shadow Reader CAM[0] and commit atomically
-        axi_write(10'h080, {16'd0, 12'd1024, 3'd0, 1'b1}); // WR_CTRL[0]: valid=1, 1024 words
+        axi_write(10'h080, {16'd0, 12'd1024, 3'd2, 1'b1}); // WR_CTRL[0]: valid=1, state=ACTIVE(2), 1024 words
         axi_write(10'h084, 32'hC0A8_0164);                 // WR_DST_IP[0]: 192.168.1.100
         axi_write(10'h088, {16'd7411, 16'd7410});          // WR_PORTS[0]: src=7411, dst=7410
         axi_write(10'h08C, 32'h5E20_0002);                 // WR_DST_MAC_LO[0]
@@ -1033,6 +1033,222 @@ module tb_rtps_fastpath;
         axi_write(10'h07C, 32'h0000_0003); // clear bit 2
         repeat (5) @(posedge clk);
         $display("[+] PASS: Identity clear sequence pulse executed cleanly.");
+
+        // =====================================================================
+        // TEST 14: Endpoint Lifecycle State Gating (DRAINING / DISABLED)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 14: Endpoint Lifecycle State Gating (DRAINING / DISABLED)");
+        $display("==================================================================");
+        // Subtest A: Transition Writer[0] to DRAINING (state = 3)
+        // WR_CTRL[0]: valid=1, state=3 (DRAINING), 1024 words
+        axi_write(10'h080, {16'd0, 12'd1024, 3'd3, 1'b1});
+        axi_write(10'h008, 32'h0000_0033); // Commit EDT (bit 5)
+        repeat (5) @(posedge clk);
+
+        axi_read(10'h004, status_val);
+        if (status_val[15] !== 1'b0) begin
+            $display("[-] FAIL: Expected lifecycle_ok=0 when writer is DRAINING! status=0x%08X", status_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Writer DRAINING state correctly cleared lifecycle_ok (status[15]=0)!");
+        end
+
+        // Attempt cycle kick while DRAINING -> must assert ERR_NO_MATCH
+        axi_write(10'h004, 32'h0000_0001);
+        wait (ip_done_irq == 1'b1);
+        axi_read(10'h004, status_val);
+        if (status_val[6] !== 1'b1) begin
+            $display("[-] FAIL: Expected ERR_NO_MATCH when writer is DRAINING! status=0x%08X", status_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Transmission rejected with ERR_NO_MATCH=1 while writer is DRAINING!");
+        end
+        axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+        repeat (5) @(posedge clk);
+
+        // Subtest B: Transition Writer[0] to DISABLED (state = 0)
+        axi_write(10'h080, {16'd0, 12'd1024, 3'd0, 1'b1});
+        axi_write(10'h008, 32'h0000_0033); // Commit EDT
+        repeat (5) @(posedge clk);
+
+        axi_read(10'h004, status_val);
+        if (status_val[15] !== 1'b0) begin
+            $display("[-] FAIL: Expected lifecycle_ok=0 when writer is DISABLED! status=0x%08X", status_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Writer DISABLED state correctly cleared lifecycle_ok (status[15]=0)!");
+        end
+
+        // Attempt cycle kick while DISABLED -> must assert ERR_NO_MATCH
+        axi_write(10'h004, 32'h0000_0001);
+        wait (ip_done_irq == 1'b1);
+        axi_read(10'h004, status_val);
+        if (status_val[6] !== 1'b1) begin
+            $display("[-] FAIL: Expected ERR_NO_MATCH when writer is DISABLED! status=0x%08X", status_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Transmission rejected with ERR_NO_MATCH=1 while writer is DISABLED!");
+        end
+        axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+        repeat (5) @(posedge clk);
+
+        // Subtest C: Recovery - Transition Writer[0] back to ACTIVE (state = 2)
+        axi_write(10'h080, {16'd0, 12'd1024, 3'd2, 1'b1});
+        axi_write(10'h008, 32'h0000_0033); // Commit EDT
+        repeat (5) @(posedge clk);
+
+        axi_read(10'h004, status_val);
+        if (status_val[15] !== 1'b1) begin
+            $display("[-] FAIL: Expected lifecycle_ok=1 after writer restored to ACTIVE! status=0x%08X", status_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Writer restored to ACTIVE state successfully re-asserted lifecycle_ok!");
+        end
+
+        // =====================================================================
+        // TEST 15: Reader CAM Expected IP/Port Filtering & Metadata Capture (Sections 4, 5)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 15: Reader CAM IP/Port Filtering & RX Metadata Capture");
+        $display("==================================================================");
+        // Switch to Subscribe-Only mode for unsolicited wire ingress testing
+        axi_write(10'h008, 32'h0000_0203); // Subscribe-only mode, emu_enable=0
+        repeat (5) @(posedge clk);
+
+        // Subtest A: Reader CAM Remote Source IP Mismatch
+        // Reprogram Reader CAM[0] expected_src_ip to 192.168.1.99 (0xC0A8_0163)
+        axi_write(10'h118, 32'hC0A8_0163); // RD_SRC_IP[0] = 192.168.1.99
+        axi_write(10'h008, 32'h0000_0223); // Commit EDT (bit 5)
+        repeat (5) @(posedge clk);
+        axi_write(10'h008, 32'h0000_0203);
+
+        // Stream wire frame (has src_ip = 192.168.1.100) -> should NOT match CAM
+        for (k = 0; k < rec_wire_cnt; k = k + 1) begin
+            @(posedge clk);
+            s_axis_wire_tdata  <= rec_wire_data[k];
+            s_axis_wire_tlast  <= rec_wire_last[k];
+            s_axis_wire_tvalid <= 1'b1;
+            while (!s_axis_wire_tready) @(posedge clk);
+        end
+        @(posedge clk);
+        s_axis_wire_tvalid <= 1'b0;
+        s_axis_wire_tlast  <= 1'b0;
+
+        repeat (50) @(posedge clk);
+        if (ip_done_irq !== 1'b0) begin
+            $display("[-] FAIL: Expected wire packet to be dropped due to CAM expected_src_ip mismatch!");
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Packet with mismatched source IP correctly filtered by Reader CAM!");
+        end
+
+        // Subtest B: Reader CAM Expected Destination UDP Port Mismatch
+        // Restore src_ip to 192.168.1.100, but set expected_dst_port to 7499
+        axi_write(10'h118, 32'hC0A8_0164); // Restore correct src_ip
+        axi_write(10'h100, {16'd7499, 12'd0, 3'd2, 1'b1}); // expected_dst_port=7499
+        axi_write(10'h008, 32'h0000_0223); // Commit EDT
+        repeat (5) @(posedge clk);
+        axi_write(10'h008, 32'h0000_0203);
+
+        // Stream wire frame (has dst_port = 7411) -> should NOT match CAM
+        for (k = 0; k < rec_wire_cnt; k = k + 1) begin
+            @(posedge clk);
+            s_axis_wire_tdata  <= rec_wire_data[k];
+            s_axis_wire_tlast  <= rec_wire_last[k];
+            s_axis_wire_tvalid <= 1'b1;
+            while (!s_axis_wire_tready) @(posedge clk);
+        end
+        @(posedge clk);
+        s_axis_wire_tvalid <= 1'b0;
+        s_axis_wire_tlast  <= 1'b0;
+
+        repeat (50) @(posedge clk);
+        if (ip_done_irq !== 1'b0) begin
+            $display("[-] FAIL: Expected wire packet to be dropped due to CAM expected_dst_port mismatch!");
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Packet with mismatched destination port correctly filtered by Reader CAM!");
+        end
+
+        // Subtest C: Matching Packet -> Ingress Accepted & Metadata CSRs Verified
+        // Restore correct expected_dst_port = 7411 and commit EDT (atomic seqNum reset)
+        axi_write(10'h100, {16'd7411, 12'd0, 3'd2, 1'b1});
+        axi_write(10'h008, 32'h0000_0223); // Commit EDT
+        repeat (5) @(posedge clk);
+        axi_write(10'h008, 32'h0000_0203);
+
+        for (k = 0; k < rec_wire_cnt; k = k + 1) begin
+            @(posedge clk);
+            s_axis_wire_tdata  <= rec_wire_data[k];
+            s_axis_wire_tlast  <= rec_wire_last[k];
+            s_axis_wire_tvalid <= 1'b1;
+            while (!s_axis_wire_tready) @(posedge clk);
+        end
+        @(posedge clk);
+        s_axis_wire_tvalid <= 1'b0;
+        s_axis_wire_tlast  <= 1'b0;
+
+        wait (ip_done_irq == 1'b1);
+        axi_read(10'h004, status_val);
+        if (status_val[10] !== 1'b1 || status_val[4:1] !== 4'd5) begin
+            $display("[-] FAIL: Expected valid CAM hit IRQ with irq_is_rx=1! status=0x%08X", status_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Matching packet accepted by CAM and raised Level-High IRQ with irq_is_rx=1!");
+        end
+
+        // Subtest D: Validate Hardware Metadata CSRs (LAST_RX_SRC_IP, LAST_RX_PORTS, LAST_RX_META)
+        axi_read(10'h18C, stat_val); // LAST_RX_SRC_IP
+        if (stat_val !== 32'hC0A8_0164) begin
+            $display("[-] FAIL: LAST_RX_SRC_IP expected 0xC0A80164, got 0x%08X", stat_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: LAST_RX_SRC_IP correctly captured 192.168.1.100 (0x%08X)!", stat_val);
+        end
+
+        axi_read(10'h190, stat_val); // LAST_RX_PORTS (src[31:16], dst[15:0])
+        if (stat_val[31:16] !== 16'd7410 || stat_val[15:0] !== 16'd7411) begin
+            $display("[-] FAIL: LAST_RX_PORTS expected src=7410, dst=7411, got 0x%08X", stat_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: LAST_RX_PORTS correctly captured src_port=7410, dst_port=7411 (0x%08X)!", stat_val);
+        end
+
+        axi_read(10'h194, stat_val); // LAST_RX_META (cam_idx in [1:0])
+        if (stat_val[1:0] !== 2'd0) begin
+            $display("[-] FAIL: LAST_RX_META expected cam_idx=0, got %0d", stat_val[1:0]);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: LAST_RX_META correctly captured matched reader cam_idx=0!");
+        end
+
+        // ACK IRQ & drain egress to return to S_IDLE
+        axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+        repeat (3) @(posedge clk);
+        axi_write(10'h004, 32'h0000_0002); // Kick S2MM Egress
+        repeat (3) @(posedge clk);
+
+        m_axis_tready <= 1'b1;
+        rx_cnt = 0;
+        sim_timeout = 0;
+        while (rx_cnt < PAYLOAD_WORDS && sim_timeout < 1500) begin
+            @(posedge clk);
+            if (m_axis_tvalid && m_axis_tready) begin
+                rx_cnt = rx_cnt + 1;
+            end
+            sim_timeout = sim_timeout + 1;
+        end
+        m_axis_tready <= 1'b0;
+        repeat (5) @(posedge clk);
+
+        axi_read(10'h004, status_val);
+        if (status_val[4:1] !== 4'd0) begin
+            $display("[-] FAIL: Expected FSM to return to S_IDLE, got %0d", status_val[4:1]);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Egress drained and FSM returned cleanly to S_IDLE!");
+        end
 
         $display("\n==================================================================");
         if (errors == 0)
