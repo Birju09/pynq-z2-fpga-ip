@@ -861,10 +861,10 @@ module rtps_fastpath_ip #(
     localparam integer REASM_BLOCK_BYTES = 8;
     localparam integer REASM_BLOCKS      = REASM_MAX_BYTES / REASM_BLOCK_BYTES; // 768 blocks
 
-    reg [REASM_BLOCKS-1:0] reasm_coverage [0:2];
-    reg [9:0]              reasm_blocks_covered [0:2];
-    reg [15:0]             reasm_total_bytes [0:2];
-    reg                    reasm_last_seen [0:2];
+    reg [REASM_BLOCKS-1:0] reasm_coverage;
+    reg [9:0]              reasm_blocks_covered;
+    reg [15:0]             reasm_total_bytes;
+    reg                    reasm_last_seen;
 
     // Pipelined RX UDP Pseudo-Header Checksum Engine:
     // Pipelined across 3 stages as headers stream in:
@@ -1292,12 +1292,10 @@ module rtps_fastpath_ip #(
                 last_rx_ts_by_cam[rst_ep]      <= 64'd0;
             end
 
-            for (rst_ep = 0; rst_ep < 3; rst_ep = rst_ep + 1) begin
-                reasm_coverage[rst_ep]       <= {REASM_BLOCKS{1'b0}};
-                reasm_blocks_covered[rst_ep] <= 10'd0;
-                reasm_total_bytes[rst_ep]    <= 16'd0;
-                reasm_last_seen[rst_ep]      <= 1'b0;
-            end
+            reasm_coverage       <= {REASM_BLOCKS{1'b0}};
+            reasm_blocks_covered <= 10'd0;
+            reasm_total_bytes    <= 16'd0;
+            reasm_last_seen      <= 1'b0;
         end else begin
             // Default single-cycle pulse deassertions
             reasm_wr_en <= 1'b0;
@@ -1361,10 +1359,10 @@ module rtps_fastpath_ip #(
                                     rx_bytes_total                 <= 16'd0;
                                     rx_saw_last                    <= 1'b0;
                                     rx_udp_csum_accum              <= 16'd0;
-                                    reasm_coverage[fill_slot]       <= {REASM_BLOCKS{1'b0}};
-                                    reasm_blocks_covered[fill_slot] <= 10'd0;
-                                    reasm_total_bytes[fill_slot]    <= 16'd0;
-                                    reasm_last_seen[fill_slot]      <= 1'b0;
+                                    reasm_coverage       <= {REASM_BLOCKS{1'b0}};
+                                    reasm_blocks_covered <= 10'd0;
+                                    reasm_total_bytes    <= 16'd0;
+                                    reasm_last_seen      <= 1'b0;
                                 end
                             end
                             12'd6: begin
@@ -1405,9 +1403,10 @@ module rtps_fastpath_ip #(
                                     rx_wr_ptr <= rx_wr_ptr + 12'd1;
 
                                     // Mark 8-byte block in coverage bitmap (Section 6)
-                                    if (!reasm_coverage[fill_slot][rx_wr_ptr[10:1]]) begin
-                                        reasm_coverage[fill_slot][rx_wr_ptr[10:1]] <= 1'b1;
-                                        reasm_blocks_covered[fill_slot] <= reasm_blocks_covered[fill_slot] + 10'd1;
+                                    // Qualified by !rx_wr_ptr[0] as each 8-byte block enters on Word 0
+                                    if (!rx_wr_ptr[0] && !reasm_coverage[rx_wr_ptr[10:1]]) begin
+                                        reasm_coverage[rx_wr_ptr[10:1]] <= 1'b1;
+                                        reasm_blocks_covered            <= reasm_blocks_covered + 10'd1;
                                     end
                                 end
                                 rx_prev_half <= eng_rx_tdata[15:0];
@@ -1422,10 +1421,10 @@ module rtps_fastpath_ip #(
                                     end else begin
                                         // Update reassembly status
                                         if (!rx_frag_mf) begin
-                                            rx_bytes_total               <= {rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes;
-                                            rx_saw_last                  <= 1'b1;
-                                            reasm_last_seen[fill_slot]   <= 1'b1;
-                                            reasm_total_bytes[fill_slot] <= {rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes;
+                                            rx_bytes_total    <= {rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes;
+                                            rx_saw_last       <= 1'b1;
+                                            reasm_last_seen   <= 1'b1;
+                                            reasm_total_bytes <= {rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes;
                                         end
                                         rx_bytes_rcvd <= rx_bytes_rcvd + rx_ip_pay_bytes;
                                         rx_state      <= R_REASM_CHECK;
@@ -1440,9 +1439,9 @@ module rtps_fastpath_ip #(
 
                 // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
                 R_REASM_CHECK: begin
-                    if (reasm_last_seen[fill_slot] &&
-                        (reasm_total_bytes[fill_slot] > 16'd0) &&
-                        (reasm_blocks_covered[fill_slot] == ((reasm_total_bytes[fill_slot] + 16'd7) >> 3))) begin
+                    if (reasm_last_seen &&
+                        (reasm_total_bytes > 16'd0) &&
+                        (reasm_blocks_covered == ((reasm_total_bytes + 16'd7) >> 3))) begin
                         rx_active_valid <= 1'b0;
                         rx_bytes_rcvd   <= 16'd0;
                         rx_saw_last     <= 1'b0;
