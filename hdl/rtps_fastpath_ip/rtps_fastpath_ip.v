@@ -848,8 +848,13 @@ module rtps_fastpath_ip #(
     reg                    reasm_last_seen [0:2];
 
     // Pipelined RX UDP Pseudo-Header Checksum Engine:
-    // Pre-sums the 6 pseudo-header half-words continuously while payload streams in,
-    // so R_CHECK_UDP only needs a single 16-bit add instead of a 32-CARRY4 cascade.
+    // Pipelined across 3 stages as headers stream in:
+    // - Stage 1 (Beat 8): Pre-sums IP addresses and UDP protocol (0x0011).
+    // - Stage 2 (Beat 10): Adds latched UDP datagram length (rx_udp_len_bytes).
+    // - Stage 3 (Beat 11): Latches 1's complement folded 16-bit pseudo-header checksum.
+    // By Beat 12 (thousands of clock cycles before reassembly completes), rx_pseudo_csum
+    // is 100% valid in flip-flops, completely breaking the 31-level CARRY4 timing path.
+    reg [19:0] rx_ip_pseudo_sum;
     reg [19:0] rx_pseudo_sum_pipe;
     reg [15:0] rx_pseudo_csum;
     wire [16:0] rx_pseudo_fold1 = {1'b0, rx_pseudo_sum_pipe[15:0]} + {13'd0, rx_pseudo_sum_pipe[19:16]};
@@ -857,26 +862,26 @@ module rtps_fastpath_ip #(
 
     always @(posedge clk) begin
         if (!rst_n) begin
+            rx_ip_pseudo_sum   <= 20'd0;
             rx_pseudo_sum_pipe <= 20'd0;
             rx_pseudo_csum     <= 16'd0;
         end else begin
-            rx_pseudo_sum_pipe <= {4'd0, rx_src_ip[31:16]} + {4'd0, rx_src_ip[15:0]} +
+            // Stage 1: Sum of IP addresses + UDP protocol (0x0011)
+            rx_ip_pseudo_sum   <= {4'd0, rx_src_ip[31:16]} + {4'd0, rx_src_ip[15:0]} +
                                   {4'd0, rx_dst_ip[31:16]} + {4'd0, rx_dst_ip[15:0]} +
-                                  {4'd0, 16'h0011}         + {4'd0, rx_udp_len_bytes};
+                                  20'h0011;
+            // Stage 2: Add UDP length
+            rx_pseudo_sum_pipe <= rx_ip_pseudo_sum + {4'd0, rx_udp_len_bytes};
+            // Stage 3: Fold into 16 bits (1's complement)
             rx_pseudo_csum     <= rx_pseudo_fold2;
         end
     end
 
-    // Combinational immediate pseudo-header sum used during R_CHECK_UDP
-    // to prevent 1-cycle pipeline lag when fragments reassemble back-to-back:
-    wire [19:0] rx_pseudo_comb_sum = {4'd0, rx_src_ip[31:16]} + {4'd0, rx_src_ip[15:0]} +
-                                     {4'd0, rx_dst_ip[31:16]} + {4'd0, rx_dst_ip[15:0]} +
-                                     {4'd0, 16'h0011}         + {4'd0, rx_udp_len_bytes};
-    wire [16:0] rx_pseudo_comb_f1  = {1'b0, rx_pseudo_comb_sum[15:0]} + {13'd0, rx_pseudo_comb_sum[19:16]};
-    wire [15:0] rx_pseudo_comb_csum = rx_pseudo_comb_f1[15:0] + {15'd0, rx_pseudo_comb_f1[16]};
-
-    wire [16:0] rx_chk_fold1 = {1'b0, rx_udp_csum_accum} + {1'b0, rx_pseudo_comb_csum};
+    // UDP Checksum validation fold evaluated in R_CHECK_UDP:
+    // Combines accumulated payload checksum and pre-folded pseudo-header checksum.
+    wire [16:0] rx_chk_fold1 = {1'b0, rx_udp_csum_accum} + {1'b0, rx_pseudo_csum};
     wire [15:0] rx_chk_final = rx_chk_fold1[15:0] + {15'd0, rx_chk_fold1[16]};
+    wire        rx_chk_valid = (&rx_chk_fold1[15:1]) && (rx_chk_fold1[0] ^ rx_chk_fold1[16]);
 
     wire [12:0] rx_frag_off_8b  = rx_flags_frag[12:0];
     wire        rx_frag_mf      = rx_flags_frag[13];
@@ -1407,7 +1412,7 @@ module rtps_fastpath_ip #(
                     walk_dst_valid       <= 1'b0;
                     walk_dst_guid_prefix <= 96'd0;
                     walk_dgram_words     <= rx_udp_len_bytes[13:2];
-                    if (rx_chk_final != 16'hFFFF) begin
+                    if (!rx_chk_valid) begin
                         err_csum       <= 1'b1;
                         stat_csum_errs <= stat_csum_errs + 32'd1;
                         rx_state       <= R_IDLE;
