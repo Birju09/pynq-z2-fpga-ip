@@ -556,6 +556,9 @@ static inline int fpga_fastpath_open(
     fpga->cfg.payload_words        = RTPS_FAST_SAMPLE_WORDS;
     fpga->cfg.type_profile         = RTPS_TYPE_PROFILE_RTI_DEFAULT;
 
+    /* Push initial configuration to hardware */
+    ioctl(fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);
+
     *fpga_out = fpga;
     return 0;
 }
@@ -589,12 +592,12 @@ static inline int fpga_configure_writer(
     fpga->cfg.writers[slot].dst_ip           = endpoint->dst_ip;
     fpga->cfg.writers[slot].src_port         = endpoint->src_port;
     fpga->cfg.writers[slot].dst_port         = endpoint->dst_port;
-    fpga->cfg.writers[slot].dst_mac_lo       = ((uint32_t)endpoint->dst_mac[0]) |
-                                               ((uint32_t)endpoint->dst_mac[1] << 8) |
-                                               ((uint32_t)endpoint->dst_mac[2] << 16) |
-                                               ((uint32_t)endpoint->dst_mac[3] << 24);
-    fpga->cfg.writers[slot].dst_mac_hi       = ((uint32_t)endpoint->dst_mac[4]) |
-                                               ((uint32_t)endpoint->dst_mac[5] << 8);
+    fpga->cfg.writers[slot].dst_mac_hi       = ((uint32_t)endpoint->dst_mac[0] << 8) |
+                                               ((uint32_t)endpoint->dst_mac[1]);
+    fpga->cfg.writers[slot].dst_mac_lo       = ((uint32_t)endpoint->dst_mac[2] << 24) |
+                                               ((uint32_t)endpoint->dst_mac[3] << 16) |
+                                               ((uint32_t)endpoint->dst_mac[4] << 8) |
+                                               ((uint32_t)endpoint->dst_mac[5]);
     fpga->cfg.writers[slot].writer_entity_id = endpoint->writer_entity_id;
     fpga->cfg.writers[slot].reader_entity_id = endpoint->reader_entity_id;
     fpga->cfg.writers[slot].seq_seed         = endpoint->seq_seed;
@@ -656,9 +659,17 @@ static inline int fpga_commit_endpoints(
         return -EINVAL;
 
     fpga->cfg.generation = generation;
-    int ret = ioctl(fpga->fd, AXI_RTPS_IOC_COMMIT_ENDPOINTS, &generation);
+    int any_writer_active = 0;
+    for (int i = 0; i < RTPS_MAX_ENDPOINTS; i++) {
+        if (fpga->cfg.writers[i].valid && fpga->cfg.writers[i].lifecycle_state == FPGA_LIFECYCLE_ACTIVE)
+            any_writer_active = 1;
+    }
+    fpga->cfg.writer_context_valid = any_writer_active ? 1 : 0;
+    fpga->cfg.local_identity_valid = 1;
+
+    int ret = ioctl(fpga->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);
     if (ret < 0) {
-        ret = ioctl(fpga->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);
+        ret = ioctl(fpga->fd, AXI_RTPS_IOC_COMMIT_ENDPOINTS, &generation);
     }
     if (ret == 0)
         fpga->active_generation = generation;

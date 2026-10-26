@@ -452,7 +452,7 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 
         case AXI_RTPS_IOC_CONFIGURE_WRITER: {
             struct fpga_writer_endpoint wep;
-            u32 wr_ctrl, wr_ports, dst_mac_lo, dst_mac_hi;
+            u32 wr_ctrl, wr_ports, dst_mac_lo, dst_mac_hi, id_ctrl;
             if (copy_from_user(&wep, (void __user*)arg, sizeof(wep)))
                 return -EFAULT;
             if (wep.slot_idx >= RTPS_MAX_ENDPOINTS)
@@ -462,12 +462,11 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                       ((u32)(wep.lifecycle_state & 0x7U) << 1) |
                       (wep.lifecycle_state != FPGA_LIFECYCLE_DISABLED ? 1U : 0U);
             wr_ports = ((u32)wep.src_port << 16) | ((u32)wep.dst_port);
-            dst_mac_lo = ((u32)wep.dst_mac[0]) |
-                         ((u32)wep.dst_mac[1] << 8) |
-                         ((u32)wep.dst_mac[2] << 16) |
-                         ((u32)wep.dst_mac[3] << 24);
-            dst_mac_hi = ((u32)wep.dst_mac[4]) |
-                         ((u32)wep.dst_mac[5] << 8);
+            dst_mac_hi = ((u32)wep.dst_mac[0] << 8) | ((u32)wep.dst_mac[1]);
+            dst_mac_lo = ((u32)wep.dst_mac[2] << 24) |
+                         ((u32)wep.dst_mac[3] << 16) |
+                         ((u32)wep.dst_mac[4] << 8) |
+                         ((u32)wep.dst_mac[5]);
 
             iowrite32(wr_ctrl,             dev->ip_regs + RTPS_WR_CTRL(i));
             iowrite32(wep.dst_ip,          dev->ip_regs + RTPS_WR_DST_IP(i));
@@ -479,6 +478,21 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             iowrite32(wep.seq_seed,        dev->ip_regs + RTPS_WR_SEQ_SEED(i));
             if (wep.generation > 0)
                 iowrite32(wep.generation,  dev->ip_regs + RTPS_IP_GENERATION_OFFSET);
+
+            /* Ensure local identity and writer context flags match writer state */
+            id_ctrl = ioread32(dev->ip_regs + RTPS_IP_IDENTITY_CTRL_OFFSET);
+            id_ctrl |= RTPS_IDENTITY_LOCAL_VALID;
+            if (wep.lifecycle_state == FPGA_LIFECYCLE_ACTIVE)
+                id_ctrl |= RTPS_IDENTITY_WRITER_VALID;
+            else if (wep.lifecycle_state == FPGA_LIFECYCLE_DISABLED && i == 0)
+                id_ctrl &= ~RTPS_IDENTITY_WRITER_VALID;
+            iowrite32(id_ctrl, dev->ip_regs + RTPS_IP_IDENTITY_CTRL_OFFSET);
+
+            /* Ensure Type Profile is set to valid contract if uninitialized */
+            val = ioread32(dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
+            if ((val & 0x000F0000U) == 0)
+                iowrite32(RTPS_TYPE_PROFILE_RTI_DEFAULT, dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
+
             return 0;
         }
 
@@ -519,12 +533,24 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
         }
 
         case AXI_RTPS_IOC_COMMIT_ENDPOINTS: {
-            u32 gen;
+            u32 gen, id_ctrl;
             int poll_i;
             if (copy_from_user(&gen, (u32 __user*)arg, sizeof(u32)))
                 return -EFAULT;
             if (gen > 0)
                 iowrite32(gen, dev->ip_regs + RTPS_IP_GENERATION_OFFSET);
+
+            /* Ensure Identity Control reflects active writer 0 */
+            id_ctrl = RTPS_IDENTITY_LOCAL_VALID;
+            val = ioread32(dev->ip_regs + RTPS_WR_CTRL(0));
+            if ((val & 1U) && (((val >> 1) & 7U) == FPGA_LIFECYCLE_ACTIVE))
+                id_ctrl |= RTPS_IDENTITY_WRITER_VALID;
+            iowrite32(id_ctrl, dev->ip_regs + RTPS_IP_IDENTITY_CTRL_OFFSET);
+
+            /* Ensure Type Profile is set to valid contract if uninitialized */
+            val = ioread32(dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
+            if ((val & 0x000F0000U) == 0)
+                iowrite32(RTPS_TYPE_PROFILE_RTI_DEFAULT, dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
 
             ctrl_word = ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET);
             ctrl_word |= RTPS_CTRL_ENABLE | RTPS_CTRL_EMU_EN | RTPS_CTRL_COMMIT_EDT;

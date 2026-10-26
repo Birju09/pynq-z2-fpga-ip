@@ -440,8 +440,8 @@ module rtps_fastpath_ip #(
             identity_clear_seq_pulse <= 1'b0;
             wdog_pet_pulse           <= 1'b0;
 
-            local_identity_valid     <= 1'b0;
-            writer_context_valid     <= 1'b0;
+            local_identity_valid     <= 1'b1;
+            writer_context_valid     <= 1'b1;
             active_generation        <= 32'd0;
             shadow_generation        <= 32'd0;
             type_profile_reg         <= 32'h0007_0101; // [18:16]=3'b111, [19]=0, [15:0]=0x0101

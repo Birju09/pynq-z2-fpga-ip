@@ -177,8 +177,8 @@ static int run_fastpath_endpoint_test(int iterations, int verbose) {
     writer_ep.dst_ip            = 0xC0A80164; /* 192.168.1.100 */
     writer_ep.src_port          = 7411;
     writer_ep.dst_port          = 7410;
-    writer_ep.dst_mac[0]        = 0x00;
-    writer_ep.dst_mac[1]        = 0x02;
+    writer_ep.dst_mac[0]        = 0x02;
+    writer_ep.dst_mac[1]        = 0x00;
     writer_ep.dst_mac[2]        = 0x5E;
     writer_ep.dst_mac[3]        = 0x20;
     writer_ep.dst_mac[4]        = 0x00;
