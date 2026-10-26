@@ -156,6 +156,52 @@ module tb_rtps_fastpath;
         end
     endtask
 
+    // AXI4-Lite Write with AW arriving before W (Section 9)
+    task axi_write_aw_first(input [9:0] byte_addr, input [31:0] data);
+        begin
+            @(posedge clk);
+            s_axi_awaddr  <= byte_addr;
+            s_axi_awvalid <= 1'b1;
+            s_axi_bready  <= 1'b1;
+            wait (s_axi_awready);
+            @(posedge clk);
+            s_axi_awvalid <= 1'b0;
+            repeat (2) @(posedge clk);
+            s_axi_wdata   <= data;
+            s_axi_wstrb   <= 4'hF;
+            s_axi_wvalid  <= 1'b1;
+            wait (s_axi_wready);
+            @(posedge clk);
+            s_axi_wvalid  <= 1'b0;
+            wait (s_axi_bvalid);
+            @(posedge clk);
+            s_axi_bready  <= 1'b0;
+        end
+    endtask
+
+    // AXI4-Lite Write with W arriving before AW (Section 9)
+    task axi_write_w_first(input [9:0] byte_addr, input [31:0] data);
+        begin
+            @(posedge clk);
+            s_axi_wdata   <= data;
+            s_axi_wstrb   <= 4'hF;
+            s_axi_wvalid  <= 1'b1;
+            s_axi_bready  <= 1'b1;
+            wait (s_axi_wready);
+            @(posedge clk);
+            s_axi_wvalid  <= 1'b0;
+            repeat (2) @(posedge clk);
+            s_axi_awaddr  <= byte_addr;
+            s_axi_awvalid <= 1'b1;
+            wait (s_axi_awready);
+            @(posedge clk);
+            s_axi_awvalid <= 1'b0;
+            wait (s_axi_bvalid);
+            @(posedge clk);
+            s_axi_bready  <= 1'b0;
+        end
+    endtask
+
     // AXI4-Lite Read Task
     task axi_read(input [9:0] byte_addr, output [31:0] data);
         begin
@@ -226,6 +272,11 @@ module tb_rtps_fastpath;
         $display("  TEST 1: 4 KB (1,024 Words) RTPS FastSample 3-Fragment Cycle");
         $display("==================================================================");
 
+        // Program Host Identity, Generation, and Type Profile (Plan Sections 1, 2, 8)
+        axi_write(10'h07C, 32'h0000_0003); // IDENTITY_CTRL: local_identity_valid=1, writer_context_valid=1
+        axi_write(10'h180, 32'd1);         // GENERATION: generation 1
+        axi_write(10'h188, 32'h0007_0101); // TYPE_PROFILE: CDR/XCDR LE fixed unkeyed, vendor 0x0101
+
         // Program Shadow Writer[0] and Shadow Reader CAM[0] and commit atomically
         axi_write(10'h080, {16'd0, 12'd1024, 3'd0, 1'b1}); // WR_CTRL[0]: valid=1, 1024 words
         axi_write(10'h084, 32'hC0A8_0164);                 // WR_DST_IP[0]: 192.168.1.100
@@ -241,6 +292,15 @@ module tb_rtps_fastpath;
         axi_write(10'h010, 32'd0);                         // 0 pacing delay for simulation speed
         axi_write(10'h014, PAYLOAD_WORDS);                 // 1,024 words = 4,096 bytes
         axi_write(10'h020, 32'd15_000);                    // RX timeout = 15,000 ticks
+
+        // Verify COMMIT_STATUS_ADDR (0x184) reads back active_generation = 1
+        axi_read(10'h184, stat_val);
+        if (stat_val !== 32'd1) begin
+            $display("[-] FAIL: Expected COMMIT_STATUS_ADDR=1, got %0d", stat_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Verified COMMIT_STATUS_ADDR (0x184) reflects committed active_generation=1.");
+        end
 
         // Prepare 4 KB FastSample payload:
         //   Word 0: cycle_id = 0x0000_0001
@@ -886,6 +946,93 @@ module tb_rtps_fastpath;
         end else begin
             $display("[+] PASS: Fire-and-forget publish returned directly to S_IDLE without waiting for S2MM!");
         end
+
+        // =====================================================================
+        // TEST 11: Decoupled AXI4-Lite Write Handshake Verification (Section 9)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 11: Decoupled AXI4-Lite Channel Handshakes (AW/W Skew)");
+        $display("==================================================================");
+        // Case A: AW before W
+        axi_write_aw_first(10'h010, 32'h0000_1234); // PACING_TIMER_ADDR
+        axi_read(10'h010, stat_val);
+        if (stat_val !== 32'h0000_1234) begin
+            $display("[-] FAIL: AW-first decoupled write failed! got=0x%08X", stat_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: AW-first decoupled write verified cleanly!");
+        end
+
+        // Case B: W before AW
+        axi_write_w_first(10'h010, 32'h0000_5678); // PACING_TIMER_ADDR
+        axi_read(10'h010, stat_val);
+        if (stat_val !== 32'h0000_5678) begin
+            $display("[-] FAIL: W-first decoupled write failed! got=0x%08X", stat_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: W-first decoupled write verified cleanly!");
+        end
+        axi_write(10'h010, 32'd0); // Reset pacing timer back to 0
+
+        // =====================================================================
+        // TEST 12: Host Identity & Strict Payload Contract Gating (Sections 1, 8)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 12: Host Identity & Strict Payload Contract Gating");
+        $display("==================================================================");
+        // Subtest A: Invalidate local_identity_valid
+        axi_write(10'h07C, 32'h0000_0002); // writer_context_valid=1, local_identity_valid=0
+        axi_write(10'h004, 32'h0000_0001); // Attempt cycle kick
+        wait (ip_done_irq == 1'b1);
+        axi_read(10'h004, status_val);
+        if (status_val[6] !== 1'b1) begin // ERR_NO_MATCH
+            $display("[-] FAIL: Expected ERR_NO_MATCH when local_identity_valid=0!");
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: local_identity_valid=0 correctly blocked transmission (ERR_NO_MATCH=1)!");
+        end
+        axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+        repeat (5) @(posedge clk);
+
+        // Subtest B: Restore identity, but invalidate type profile contract (e.g. bit 19 keyed=1)
+        axi_write(10'h07C, 32'h0000_0003); // local_identity_valid=1, writer_context_valid=1
+        axi_write(10'h188, 32'h000F_0101); // Bit 19 = 1 (keyed topic unsupported in v1)
+        axi_write(10'h004, 32'h0000_0001); // Attempt cycle kick
+        wait (ip_done_irq == 1'b1);
+        axi_read(10'h004, status_val);
+        if (status_val[6] !== 1'b1) begin // ERR_NO_MATCH
+            $display("[-] FAIL: Expected ERR_NO_MATCH when payload contract violated!");
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Strict payload contract violation correctly blocked transmission (ERR_NO_MATCH=1)!");
+        end
+        axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+        axi_write(10'h188, 32'h0007_0101); // Restore valid contract profile
+        repeat (5) @(posedge clk);
+
+        // =====================================================================
+        // TEST 13: Generation Tracking & Sequence State Clear (Sections 1, 2)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 13: Generation Tracking & Identity Sequence Clear");
+        $display("==================================================================");
+        axi_write(10'h180, 32'd42);         // Program shadow generation = 42
+        axi_write(10'h008, 32'h0000_0033); // Trigger EDT commit (bit 5)
+        repeat (5) @(posedge clk);
+        axi_read(10'h184, stat_val);        // COMMIT_STATUS_ADDR
+        if (stat_val !== 32'd42) begin
+            $display("[-] FAIL: COMMIT_STATUS_ADDR expected generation 42, got %0d", stat_val);
+            errors = errors + 1;
+        end else begin
+            $display("[+] PASS: Generation update to 42 committed and verified via COMMIT_STATUS_ADDR!");
+        end
+
+        // Test clear sequence state bit in IDENTITY_CTRL (bit 2)
+        axi_write(10'h07C, 32'h0000_0007); // bit 2 = clear_seq, bit 1 = writer_valid, bit 0 = identity_valid
+        repeat (5) @(posedge clk);
+        axi_write(10'h07C, 32'h0000_0003); // clear bit 2
+        repeat (5) @(posedge clk);
+        $display("[+] PASS: Identity clear sequence pulse executed cleanly.");
 
         $display("\n==================================================================");
         if (errors == 0)

@@ -54,6 +54,22 @@
 #define RTPS_IP_LAST_RX_TS_HI_OFFSET     0x70 /* Word 28: Last accepted RX INFO_TS seconds */
 #define RTPS_IP_LAST_RX_RTPS_WORDS       0x74 /* Word 29: Total 32-bit words in latest RX RTPS message (default 1039 = 4,156 B) */
 #define RTPS_IP_CLK_PERIOD_OFFSET        0x78 /* Word 30: Clock period in nanoseconds (e.g. 10 for 100MHz, 8 for 125MHz) */
+#define RTPS_IP_IDENTITY_CTRL_OFFSET     0x7C /* Word 31: [0]=local_identity_valid, [1]=writer_context_valid, [2]=clear_seq */
+#define RTPS_IP_GENERATION_OFFSET        0x180 /* Word 96: Shadow generation number */
+#define RTPS_IP_COMMIT_STATUS_OFFSET     0x184 /* Word 97: Active writer generation number / commit status */
+#define RTPS_IP_TYPE_PROFILE_OFFSET      0x188 /* Word 98: Type profile & strict payload contract */
+
+/* IDENTITY_CTRL (0x7C) Bit Masks */
+#define RTPS_IDENTITY_LOCAL_VALID        (1U << 0)
+#define RTPS_IDENTITY_WRITER_VALID       (1U << 1)
+#define RTPS_IDENTITY_CLEAR_SEQ          (1U << 2)
+
+/* TYPE_PROFILE (0x188) Bit Masks */
+#define RTPS_TYPE_PROFILE_SERIALIZED_CDR (1U << 16)
+#define RTPS_TYPE_PROFILE_LITTLE_ENDIAN  (1U << 17)
+#define RTPS_TYPE_PROFILE_FIXED_SIZE     (1U << 18)
+#define RTPS_TYPE_PROFILE_KEYED_TOPIC    (1U << 19) /* 1 = unsupported in v1 */
+#define RTPS_TYPE_PROFILE_RTI_DEFAULT    (0x0101U | RTPS_TYPE_PROFILE_SERIALIZED_CDR | RTPS_TYPE_PROFILE_LITTLE_ENDIAN | RTPS_TYPE_PROFILE_FIXED_SIZE)
 
 /* CTRL_ADDR (0x08) Bit Masks */
 #define RTPS_CTRL_ENABLE                 (1U << 0)
@@ -199,8 +215,13 @@ struct rtps_endpoint_cfg {
     __u32 local_ip;             /* Local IPv4 address */
     __u32 local_mac_lo;         /* Local MAC [31:0] */
     __u16 local_mac_hi;         /* Local MAC [47:32] */
+    __u16 local_vendor_id;      /* Local Vendor ID (0x0101 for RTI Connext) */
     __u8  num_writers;          /* Number of active TX writers (1..4) */
     __u8  plugin_rx_rtps_mode;  /* 1 = Option B NDDS_Transport_Plugin mode (4,156 B RX) */
+    __u8  local_identity_valid; /* 1 = local participant identity valid */
+    __u8  writer_context_valid; /* 1 = writer route context valid */
+    __u32 generation;           /* Endpoint configuration generation */
+    __u32 type_profile;         /* Type profile / strict payload contract */
     __u32 payload_words;        /* Sample payload words (1024 = 4,096 B) */
     __u32 pacing_timer_ticks;   /* Inter-beat pacing delay (0 = max speed) */
     __u32 rx_timeout_ticks;     /* S_WAIT_RX_FB timeout in 100 MHz clock ticks */
@@ -221,6 +242,10 @@ struct rtps_cycle_diag {
     __u64 last_rx_seq_num;
     __u64 last_rx_timestamp;
     __u32 last_rx_rtps_words;
+    __u32 active_generation;
+    __u32 commit_status;
+    __u32 type_profile;
+    __u32 identity_ctrl;
     __u8  completed_frags;
     __u8  err_crc;
     __u8  err_no_match;

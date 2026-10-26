@@ -267,16 +267,33 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                 return -EINVAL;
 
             /* Program Local Participant Identity CSRs (does NOT trigger S_IDLE transition) */
-            iowrite32(cfg.local_guid_prefix[0], dev->ip_regs + RTPS_IP_LOCAL_GUID_0_OFFSET);
-            iowrite32(cfg.local_guid_prefix[1], dev->ip_regs + RTPS_IP_LOCAL_GUID_1_OFFSET);
-            iowrite32(cfg.local_guid_prefix[2], dev->ip_regs + RTPS_IP_LOCAL_GUID_2_OFFSET);
-            iowrite32(cfg.local_ip,             dev->ip_regs + RTPS_IP_LOCAL_IP_OFFSET);
-            iowrite32(cfg.local_mac_lo,         dev->ip_regs + RTPS_IP_LOCAL_MAC_LO_OFFSET);
-            iowrite32(cfg.local_mac_hi,         dev->ip_regs + RTPS_IP_LOCAL_MAC_HI_OFFSET);
-            iowrite32(cfg.pacing_timer_ticks,   dev->ip_regs + RTPS_IP_PACING_TIMER_OFFSET);
-            iowrite32(cfg.payload_words,        dev->ip_regs + RTPS_IP_PAYLOAD_WORDS_OFFSET);
-            if (cfg.rx_timeout_ticks > 0)
-                iowrite32(cfg.rx_timeout_ticks, dev->ip_regs + RTPS_IP_RX_TIMEOUT_OFFSET);
+            {
+                u32 mac_hi = ((u32)(cfg.local_vendor_id ? cfg.local_vendor_id : 0x0101) << 16) |
+                             ((u32)cfg.local_mac_hi & 0xFFFFU);
+                u32 type_prof = cfg.type_profile ? cfg.type_profile : RTPS_TYPE_PROFILE_RTI_DEFAULT;
+                u32 id_ctrl = (cfg.local_identity_valid ? RTPS_IDENTITY_LOCAL_VALID : 0U) |
+                              (cfg.writer_context_valid ? RTPS_IDENTITY_WRITER_VALID : 0U);
+
+                iowrite32(cfg.local_guid_prefix[0], dev->ip_regs + RTPS_IP_LOCAL_GUID_0_OFFSET);
+                iowrite32(cfg.local_guid_prefix[1], dev->ip_regs + RTPS_IP_LOCAL_GUID_1_OFFSET);
+                iowrite32(cfg.local_guid_prefix[2], dev->ip_regs + RTPS_IP_LOCAL_GUID_2_OFFSET);
+                iowrite32(cfg.local_ip,             dev->ip_regs + RTPS_IP_LOCAL_IP_OFFSET);
+                iowrite32(cfg.local_mac_lo,         dev->ip_regs + RTPS_IP_LOCAL_MAC_LO_OFFSET);
+                iowrite32(mac_hi,                   dev->ip_regs + RTPS_IP_LOCAL_MAC_HI_OFFSET);
+                iowrite32(cfg.pacing_timer_ticks,   dev->ip_regs + RTPS_IP_PACING_TIMER_OFFSET);
+                iowrite32(cfg.payload_words,        dev->ip_regs + RTPS_IP_PAYLOAD_WORDS_OFFSET);
+                if (cfg.rx_timeout_ticks > 0)
+                    iowrite32(cfg.rx_timeout_ticks, dev->ip_regs + RTPS_IP_RX_TIMEOUT_OFFSET);
+
+                /* Program Type Profile & Strict Payload Contract (Section 8) */
+                iowrite32(type_prof, dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
+
+                /* Program Shadow Generation (Section 2) */
+                iowrite32(cfg.generation, dev->ip_regs + RTPS_IP_GENERATION_OFFSET);
+
+                /* Program Identity Control (Section 1) */
+                iowrite32(id_ctrl, dev->ip_regs + RTPS_IP_IDENTITY_CTRL_OFFSET);
+            }
 
             /* Program Shadow Writer EDT [0..3] */
             for (i = 0; i < RTPS_MAX_ENDPOINTS; i++) {
@@ -314,6 +331,16 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                         RTPS_CTRL_COMMIT_EDT |
                         (dev->plugin_rx_rtps_mode ? RTPS_CTRL_PLUGIN_RX_RTPS_MODE : 0U);
             iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
+
+            /* Poll COMMIT_STATUS until active generation matches cfg.generation (Section 10) */
+            if (cfg.generation > 0) {
+                int poll_i;
+                for (poll_i = 0; poll_i < 100; poll_i++) {
+                    if (ioread32(dev->ip_regs + RTPS_IP_COMMIT_STATUS_OFFSET) == cfg.generation)
+                        break;
+                    udelay(5);
+                }
+            }
             return 0;
 
         case AXI_RTPS_IOC_GET_DIAG:
@@ -332,6 +359,10 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             diag.last_rx_timestamp   = ((u64)ioread32(dev->ip_regs + RTPS_IP_LAST_RX_TS_HI_OFFSET) << 32) |
                                        ioread32(dev->ip_regs + RTPS_IP_LAST_RX_TS_LO_OFFSET);
             diag.last_rx_rtps_words  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_RTPS_WORDS);
+            diag.active_generation   = ioread32(dev->ip_regs + RTPS_IP_COMMIT_STATUS_OFFSET);
+            diag.commit_status       = diag.active_generation;
+            diag.type_profile        = ioread32(dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
+            diag.identity_ctrl       = ioread32(dev->ip_regs + RTPS_IP_IDENTITY_CTRL_OFFSET);
             diag.completed_frags     = (u8)((diag.status_reg & RTPS_STATUS_FRAGS_MASK) >>
                                             RTPS_STATUS_FRAGS_SHIFT);
             diag.err_crc             = (diag.status_reg & RTPS_STATUS_ERR_CRC) ? 1 : 0;

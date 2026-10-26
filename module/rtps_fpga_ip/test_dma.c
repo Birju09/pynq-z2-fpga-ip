@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "rtps_fpga_transport.h"
+#include "rtps_pcap.h"
 
 #define DEVICE_PATH        "/dev/axi_dma_dev"
 #define DEFAULT_ITERATIONS 1000
@@ -55,6 +56,8 @@ static void print_detailed_diag(FILE* out, const struct rtps_cycle_diag* diag) {
             (diag->ctrl_reg >> 7) & 1U,
             (diag->ctrl_reg >> 8) & 1U,
             (diag->ctrl_reg >> 9) & 1U);
+    fprintf(out, "      - Identity & Generation: ActiveGen=%u, CommitStatus=%u, TypeProfile=0x%08X, IdCtrl=0x%08X\n",
+            diag->active_generation, diag->commit_status, diag->type_profile, diag->identity_ctrl);
     fprintf(out, "      - TX / RX Samples      : %u TX / %u RX (Frags=%u, OptionB_Words=%u [%u B])\n",
             diag->stat_tx_samples, diag->stat_rx_samples, diag->completed_frags,
             diag->last_rx_rtps_words, diag->last_rx_rtps_words * 4);
@@ -158,6 +161,9 @@ int main(int argc, char* argv[]) {
     uint32_t bypass_crc = 0;
     int option_b_mode = 1; /* Default: Option B NDDS_Transport_Plugin mode (CTRL[7]=1) */
     int verbose = 0;
+    const char* pcap_filename = NULL;
+    int pcap_wire_frags = 0;
+    rtps_pcap_dumper_t pcap_dumper = {0};
     struct rtps_cycle_diag diag;
 
     double min_us = 1e12;
@@ -180,6 +186,8 @@ int main(int argc, char* argv[]) {
             printf("  -b, --option-b (0|1)   1 for Option B 4,156B RTPS RX (default: 1), 0 for Option A 4,096B\n");
             printf("  --emulation            Enable hardware RTI Peer Emulator (enabled by default in PL)\n");
             printf("  -v, --verbose          Print per-iteration hardware emulation and phase timing\n");
+            printf("  -p, --pcap FILE        Capture all TX and RX RTPS packets to Wireshark PCAP file\n");
+            printf("  --pcap-wire-frags      Capture in exact 3-fragment IPv4 wire layout (default: reassembled UDP)\n");
             return 0;
         } else if ((strcmp(argv[arg_i], "-n") == 0 || strcmp(argv[arg_i], "--iterations") == 0) && arg_i + 1 < argc) {
             iterations = atoi(argv[++arg_i]);
@@ -191,6 +199,10 @@ int main(int argc, char* argv[]) {
             option_b_mode = atoi(argv[++arg_i]) ? 1 : 0;
         } else if (strcmp(argv[arg_i], "-v") == 0 || strcmp(argv[arg_i], "--verbose") == 0) {
             verbose = 1;
+        } else if ((strcmp(argv[arg_i], "-p") == 0 || strcmp(argv[arg_i], "--pcap") == 0) && arg_i + 1 < argc) {
+            pcap_filename = argv[++arg_i];
+        } else if (strcmp(argv[arg_i], "--pcap-wire-frags") == 0) {
+            pcap_wire_frags = 1;
         } else if (strcmp(argv[arg_i], "--emulation") == 0) {
             /* Hardware Peer Emulator is active */
         } else if (argv[arg_i][0] != '-') {
@@ -282,6 +294,16 @@ int main(int argc, char* argv[]) {
 
     /* 3. Loan Zero-Copy `FastSample` directly from `mmap` TX buffer */
     tx_sample = DDS_DataWriter_get_loan(&plugin);
+
+    if (pcap_filename) {
+        if (rtps_pcap_open(&pcap_dumper, pcap_filename) == 0) {
+            printf("[+] PCAP capture enabled -> writing packets to '%s' (%s)\n",
+                   pcap_filename, pcap_wire_frags ? "3-Fragment Wire Format" : "Full Reassembled UDP");
+        } else {
+            fprintf(stderr, "[-] Failed to open PCAP file '%s': %s\n", pcap_filename, strerror(errno));
+            pcap_filename = NULL;
+        }
+    }
 
     printf("=================================================================\n");
     printf("  Hybrid PS+PL RTPS v2.x Fast-Path & Option B Transport Benchmark\n");
@@ -384,6 +406,62 @@ int main(int argc, char* argv[]) {
 
         if (roundtrip_us < min_us) min_us = roundtrip_us;
         if (roundtrip_us > max_us) max_us = roundtrip_us;
+
+        /* Dump TX and RX packets to PCAP if capturing */
+        if (pcap_filename) {
+            uint8_t master_mac[6] = {0x00, 0x01, 0x5E, 0x10, 0x00, 0x02};
+            uint8_t peer_mac[6]   = {0x00, 0x02, 0x5E, 0x20, 0x00, 0x02};
+            uint32_t master_ip    = 0xC0A801C9; /* 192.168.1.201 (PL TX Secondary IP) */
+            uint32_t peer_ip      = 0xC0A80164; /* 192.168.1.100 */
+            uint16_t master_port  = 7411;
+            uint16_t peer_port    = 7410;
+
+            /* 1. Build & Dump Complete Wire RTPS message for TX (Command) */
+            uint32_t tx_rtps_buf[RTPS_FULL_MSG_WORDS];
+            /* RTPS Header */
+            tx_rtps_buf[0] = 0x52545053; /* "RTPS" */
+            tx_rtps_buf[1] = 0x02010110; /* Version 2.1, VendorId 0x0110 (Cyclone DDS) */
+            tx_rtps_buf[2] = plugin.edt_cfg.local_guid_prefix[0];
+            tx_rtps_buf[3] = plugin.edt_cfg.local_guid_prefix[1];
+            tx_rtps_buf[4] = plugin.edt_cfg.local_guid_prefix[2];
+            /* INFO_TS */
+            tx_rtps_buf[5] = 0x09010800; /* Submsg 0x09, E=1, len=8 */
+            tx_rtps_buf[6] = __builtin_bswap32((uint32_t)(tx_sample->tx_timestamp_ns / 1000000000ULL));
+            tx_rtps_buf[7] = __builtin_bswap32((uint32_t)(((tx_sample->tx_timestamp_ns % 1000000000ULL) << 32) / 1000000000ULL));
+            /* DATA */
+            uint16_t tx_data_octets = (uint16_t)(24 + sizeof(struct FastSample));
+            tx_rtps_buf[8]  = 0x15050000 | tx_data_octets; /* Submsg 0x15, flags 0x05 */
+            tx_rtps_buf[9]  = 0x00001000;                  /* extraFlags=0, octetsToInlineQos=16 */
+            tx_rtps_buf[10] = 0x00000000;                  /* readerEntityId (ENTITYID_UNKNOWN) */
+            tx_rtps_buf[11] = 0x00000102;                  /* writerEntityId (Local Writer) */
+            tx_rtps_buf[12] = 0x00000000;                  /* writerSeqNum Hi */
+            tx_rtps_buf[13] = __builtin_bswap32((uint32_t)iter); /* writerSeqNum Lo */
+            tx_rtps_buf[14] = 0x00010000;                  /* CDR_LE encapsulation */
+            memcpy(&tx_rtps_buf[15], tx_sample, sizeof(struct FastSample));
+
+            if (pcap_wire_frags) {
+                rtps_pcap_dump_fragments(&pcap_dumper, &t_start, master_mac, peer_mac,
+                                         master_ip, peer_ip, master_port, peer_port,
+                                         (uint16_t)iter, tx_rtps_buf, RTPS_FULL_MSG_BYTES);
+            } else {
+                rtps_pcap_dump_udp(&pcap_dumper, &t_start, master_mac, peer_mac,
+                                   master_ip, peer_ip, master_port, peer_port,
+                                   (uint16_t)iter, tx_rtps_buf, RTPS_FULL_MSG_BYTES);
+            }
+
+            /* 2. Dump Received Wire RTPS message for RX (Feedback from Peer Emulator) */
+            if (option_b_mode && plugin.rx_mmap_buf) {
+                if (pcap_wire_frags) {
+                    rtps_pcap_dump_fragments(&pcap_dumper, &t_rx_done, peer_mac, master_mac,
+                                             peer_ip, master_ip, peer_port, master_port,
+                                             (uint16_t)(iter + 1000), plugin.rx_mmap_buf, RTPS_FULL_MSG_BYTES);
+                } else {
+                    rtps_pcap_dump_udp(&pcap_dumper, &t_rx_done, peer_mac, master_mac,
+                                       peer_ip, master_ip, peer_port, master_port,
+                                       (uint16_t)(iter + 1000), plugin.rx_mmap_buf, RTPS_FULL_MSG_BYTES);
+                }
+            }
+        }
 
         /* Verify 16-byte FastSample header (echoed intact by RTI Peer Emulator) */
         if (rx_sample->cycle_id != tx_sample->cycle_id ||
@@ -502,6 +580,11 @@ int main(int argc, char* argv[]) {
         printf("    [C] Host S2MM RX Read DMA    : %7.2f us  (%5.1f%%)  [p50: %6.2f, p95: %6.2f]\n",
                avg_rx_us, (avg_rx_us / avg_us) * 100.0, p50_rx_us, p95_rx_us);
         printf("=================================================================\n");
+    }
+
+    if (pcap_filename) {
+        printf("[+] Saved %u packets to '%s' (Wireshark PCAP)\n\n", pcap_dumper.pkt_count, pcap_filename);
+        rtps_pcap_close(&pcap_dumper);
     }
 
     FpgaTransport_cleanup_plugin(&plugin);

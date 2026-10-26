@@ -263,6 +263,14 @@ static inline int FpgaTransport_on_publication_matched(
     if (slot_idx + 1 > self->edt_cfg.num_writers)
         self->edt_cfg.num_writers = (uint8_t)(slot_idx + 1);
 
+    self->edt_cfg.writer_context_valid = 1;
+    self->edt_cfg.local_identity_valid = 1;
+    self->edt_cfg.generation++;
+    if (!self->edt_cfg.type_profile)
+        self->edt_cfg.type_profile = RTPS_TYPE_PROFILE_RTI_DEFAULT;
+    if (!self->edt_cfg.local_vendor_id)
+        self->edt_cfg.local_vendor_id = 0x0101U;
+
     return ioctl(self->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &self->edt_cfg);
 }
 
@@ -282,6 +290,13 @@ static inline int FpgaTransport_on_subscription_matched(
     rd->guid_prefix[2]   = remote_guid_prefix[2];
     rd->writer_entity_id = remote_writer_entity_id;
     rd->reader_entity_id = local_reader_entity_id;
+
+    self->edt_cfg.local_identity_valid = 1;
+    self->edt_cfg.generation++;
+    if (!self->edt_cfg.type_profile)
+        self->edt_cfg.type_profile = RTPS_TYPE_PROFILE_RTI_DEFAULT;
+    if (!self->edt_cfg.local_vendor_id)
+        self->edt_cfg.local_vendor_id = 0x0101U;
 
     return ioctl(self->fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &self->edt_cfg);
 }
@@ -316,8 +331,13 @@ static inline int FpgaTransport_init_plugin(
     plugin->edt_cfg.local_ip             = 0xC0A8010AU; /* 192.168.1.10 */
     plugin->edt_cfg.local_mac_lo         = 0x5E100001U;
     plugin->edt_cfg.local_mac_hi         = 0x0000U;
+    plugin->edt_cfg.local_vendor_id      = 0x0101U;     /* RTI Connext VendorId (0x0101) */
     plugin->edt_cfg.num_writers          = 1;
     plugin->edt_cfg.plugin_rx_rtps_mode  = (uint8_t)plugin->option_b_rtps_rx_mode;
+    plugin->edt_cfg.local_identity_valid = 1;
+    plugin->edt_cfg.writer_context_valid = 1;
+    plugin->edt_cfg.generation           = 1;
+    plugin->edt_cfg.type_profile         = RTPS_TYPE_PROFILE_RTI_DEFAULT;
     plugin->edt_cfg.payload_words        = RTPS_FAST_SAMPLE_WORDS;
     plugin->edt_cfg.pacing_timer_ticks   = wire_pacing_ticks;
     plugin->edt_cfg.rx_timeout_ticks     = 500000U; /* 5 ms @ 100 MHz */
