@@ -802,7 +802,7 @@ int main(int argc, char* argv[]) {
             tx_rtps_buf[7] = __builtin_bswap32((uint32_t)(((tx_sample->tx_timestamp_ns % 1000000000ULL) << 32) / 1000000000ULL));
             /* DATA */
             uint16_t tx_data_octets = (uint16_t)(24 + sizeof(struct FastSample));
-            tx_rtps_buf[8]  = 0x15050000 | tx_data_octets; /* Submsg 0x15, flags 0x05 */
+            tx_rtps_buf[8]  = 0x15050000 | __builtin_bswap16(tx_data_octets); /* Submsg 0x15, flags 0x05 (E=1: octets LE on wire) */
             tx_rtps_buf[9]  = 0x00001000;                  /* extraFlags=0, octetsToInlineQos=16 */
             tx_rtps_buf[10] = 0x00000000;                  /* readerEntityId (ENTITYID_UNKNOWN) */
             tx_rtps_buf[11] = 0x00000102;                  /* writerEntityId (Local Writer) */
