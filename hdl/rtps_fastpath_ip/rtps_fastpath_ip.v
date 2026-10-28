@@ -186,7 +186,7 @@ module rtps_fastpath_ip #(
     reg [31:0] shadow_rd_edt [0:NUM_ENDPOINTS-1][0:7];
     reg [31:0] active_rd_edt [0:NUM_ENDPOINTS-1][0:7];
 
-    // Identity and Generation States (Rules Section 1 & 2)
+    // Identity and Generation States
     reg        local_identity_valid;
     reg        writer_context_valid;
     reg [31:0] active_generation;
@@ -405,7 +405,7 @@ module rtps_fastpath_ip #(
     end
 
     // =========================================================================
-    // AXI4-Lite Slave Write Channel (CSRs & Shadow EDT) - Fully Decoupled (Section 9)
+    // AXI4-Lite Slave Write Channel (CSRs & Shadow EDT) - Fully Decoupled
     // =========================================================================
     assign s_axi_bresp = 2'b00;
     assign s_axi_rresp = 2'b00;
