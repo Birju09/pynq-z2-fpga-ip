@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,7 +146,7 @@ static double get_percentile(const double* sorted, int n, double pct) {
     return sorted[low] * (1.0 - weight) + sorted[high] * weight;
 }
 
-static int run_fastpath_endpoint_test(int iterations, int verbose) {
+static int run_fastpath_endpoint_test(int iterations, int verbose, int enable_peer_emu, uint32_t peer_mac_lo, uint16_t peer_mac_hi) {
     printf("=================================================================\n");
     printf("  Option 1 Dedicated Hardware RTPS Endpoint API Verification\n");
     printf("=================================================================\n");
@@ -177,12 +178,12 @@ static int run_fastpath_endpoint_test(int iterations, int verbose) {
     writer_ep.dst_ip            = 0xC0A80164; /* 192.168.1.100 */
     writer_ep.src_port          = 7411;
     writer_ep.dst_port          = 7410;
-    writer_ep.dst_mac[0]        = 0x02;
-    writer_ep.dst_mac[1]        = 0x00;
-    writer_ep.dst_mac[2]        = 0x5E;
-    writer_ep.dst_mac[3]        = 0x20;
-    writer_ep.dst_mac[4]        = 0x00;
-    writer_ep.dst_mac[5]        = 0x02;
+    writer_ep.dst_mac[0]        = (uint8_t)(peer_mac_hi >> 8);
+    writer_ep.dst_mac[1]        = (uint8_t)(peer_mac_hi & 0xFF);
+    writer_ep.dst_mac[2]        = (uint8_t)(peer_mac_lo >> 24);
+    writer_ep.dst_mac[3]        = (uint8_t)((peer_mac_lo >> 16) & 0xFF);
+    writer_ep.dst_mac[4]        = (uint8_t)((peer_mac_lo >> 8) & 0xFF);
+    writer_ep.dst_mac[5]        = (uint8_t)(peer_mac_lo & 0xFF);
     writer_ep.writer_entity_id  = 0x00000102;
     writer_ep.reader_entity_id  = 0x00000000;
     writer_ep.seq_seed          = 1;
@@ -231,6 +232,7 @@ static int run_fastpath_endpoint_test(int iterations, int verbose) {
            reader_ep.expected_dst_port, reader_ep.expected_remote_src_ip);
 
     /* Step 4: Atomic Commit */
+    fpga->cfg.enable_peer_emu = enable_peer_emu ? 1 : 0;
     rc = fpga_commit_endpoints(fpga, 1);
     if (rc < 0) {
         fprintf(stderr, "[-] fpga_commit_endpoints failed: %s (%d)\n", strerror(-rc), rc);
@@ -346,10 +348,13 @@ static int run_fastpath_endpoint_test(int iterations, int verbose) {
         uint64_t active_seq = (meta.writer_sequence_number != 0) ? meta.writer_sequence_number : (uint64_t)iter;
         uint32_t seq_lo_6b = ((uint32_t)active_seq) & 0x3FU;
         for (uint32_t j = 0; j < 1020; j++) {
-            uint32_t expected = (~tx_sample.payload[j]) + ((seq_lo_6b << 10) | 0x200U);
-            if (rx_sample->payload[j] != expected) {
-                fprintf(stderr, "\n[-] Iteration %d payload mismatch at word %u: exp=0x%08X, got=0x%08X\n",
-                        iter, j + 4, expected, rx_sample->payload[j]);
+            uint32_t expected_emu  = (~tx_sample.payload[j]) + ((seq_lo_6b << 10) | 0x200U);
+            uint32_t expected_echo = tx_sample.payload[j];
+            int match = (rx_sample->payload[j] == expected_emu) ||
+                        (!enable_peer_emu && rx_sample->payload[j] == expected_echo);
+            if (!match) {
+                fprintf(stderr, "\n[-] Iteration %d payload mismatch at word %u: exp=0x%08X (or echo 0x%08X), got=0x%08X\n",
+                        iter, j + 4, expected_emu, expected_echo, rx_sample->payload[j]);
                 errors++;
                 break;
             }
@@ -508,6 +513,163 @@ static int run_fastpath_endpoint_test(int iterations, int verbose) {
     return errors ? 1 : 0;
 }
 
+/*
+ * =============================================================================
+ * Asynchronous 1 kHz - 2 kHz Multi-Threaded Pub/Sub Engine
+ * =============================================================================
+ */
+struct async_ctx {
+    NDDS_Transport_Plugin* plugin;
+    int                    fd;
+    int                    rate_hz;
+    int                    iterations;
+    volatile int           running;
+    uint32_t               published_count;
+    uint32_t               received_count;
+    double                 pub_rate_actual;
+    double                 sub_rate_actual;
+    double*                sub_latencies_us;
+};
+
+static void* async_publisher_thread(void* arg) {
+    struct async_ctx* ctx = (struct async_ctx*)arg;
+    struct FastSample tx_sample;
+    memset(&tx_sample, 0, sizeof(tx_sample));
+
+    long period_ns = 1000000000L / (ctx->rate_hz > 0 ? ctx->rate_hz : 1000);
+    struct timespec next_tick;
+    clock_gettime(CLOCK_MONOTONIC, &next_tick);
+
+    for (int iter = 1; iter <= ctx->iterations && ctx->running; iter++) {
+        /* High-precision timer cadence */
+        next_tick.tv_nsec += period_ns;
+        while (next_tick.tv_nsec >= 1000000000L) {
+            next_tick.tv_sec++;
+            next_tick.tv_nsec -= 1000000000L;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
+
+        /* Pet watchdog every 64 cycles */
+        if ((iter & 0x3F) == 1) {
+            uint32_t pet = 1;
+            ioctl(ctx->fd, AXI_RTPS_IOC_PET_WATCHDOG, &pet);
+        }
+
+        /* Dynamically populate FastSample */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        tx_sample.cycle_id        = (uint32_t)iter;
+        tx_sample.flags           = 0x000000A5U ^ (uint32_t)iter;
+        tx_sample.tx_timestamp_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+        for (int i = 0; i < 1020; i++) {
+            tx_sample.payload[i] = (uint32_t)((iter << 16) ^ (0x5A000000U + ((i + 4) * 0x010103U)));
+        }
+
+        /* Asynchronous fire-and-forget DMA write */
+        if (DDS_DataWriter_write(ctx->plugin, &tx_sample) == 0) {
+            ctx->published_count++;
+        }
+    }
+    return NULL;
+}
+
+static void* async_subscriber_thread(void* arg) {
+    struct async_ctx* ctx = (struct async_ctx*)arg;
+    const struct FastSample* rx_sample = NULL;
+    uint64_t rx_seq = 0;
+    uint64_t rx_ts  = 0;
+
+    while (ctx->running && ctx->received_count < (uint32_t)ctx->iterations) {
+        if (DDS_DataReader_take(ctx->plugin, &rx_sample, &rx_seq, &rx_ts) == 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+            
+            if (rx_sample && rx_sample->tx_timestamp_ns > 0 && now_ns >= rx_sample->tx_timestamp_ns) {
+                double rtt_us = (double)(now_ns - rx_sample->tx_timestamp_ns) / 1000.0;
+                if (ctx->received_count < (uint32_t)ctx->iterations) {
+                    ctx->sub_latencies_us[ctx->received_count] = rtt_us;
+                }
+            }
+            ctx->received_count++;
+        } else {
+            usleep(100);
+        }
+    }
+    return NULL;
+}
+
+static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int iterations, int rate_hz) {
+    printf("=================================================================\n");
+    printf("     True Asynchronous 1 kHz - 2 kHz Decoupled Pub/Sub Benchmark \n");
+    printf("=================================================================\n");
+    printf("  Target Rate          : %d Hz (Period: %.1f us)\n", rate_hz, 1000000.0 / rate_hz);
+    printf("  Total Iterations     : %d\n", iterations);
+    printf("  Hardware Mode        : Asynchronous Stream Pipeline (CTRL[8]=1)\n");
+    printf("  Threads              : Dedicated Publisher Thread + Dedicated Subscriber Thread\n");
+    printf("=================================================================\n\n");
+
+    struct async_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.plugin          = plugin;
+    ctx.fd              = fd;
+    ctx.rate_hz         = rate_hz;
+    ctx.iterations      = iterations;
+    ctx.running         = 1;
+    ctx.sub_latencies_us= (double*)malloc(iterations * sizeof(double));
+    if (!ctx.sub_latencies_us) return 1;
+
+    pthread_t pub_tid, sub_tid;
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    pthread_create(&sub_tid, NULL, async_subscriber_thread, &ctx);
+    pthread_create(&pub_tid, NULL, async_publisher_thread, &ctx);
+
+    pthread_join(pub_tid, NULL);
+    /* Allow up to 1 second for remaining wire inflight frames to drain */
+    for (int drain = 0; drain < 100 && ctx.received_count < (uint32_t)iterations; drain++) {
+        usleep(10000);
+    }
+    ctx.running = 0;
+    pthread_join(sub_tid, NULL);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double total_sec = timespec_to_us(&t_start, &t_end) / 1e6;
+
+    printf("\n=================================================================\n");
+    printf("                ASYNCHRONOUS BENCHMARK RESULTS                   \n");
+    printf("=================================================================\n");
+    printf("  Elapsed Time         : %.3f s\n", total_sec);
+    printf("  Messages Published   : %u / %d  (Rate: %.1f Hz)\n",
+           ctx.published_count, iterations, (double)ctx.published_count / total_sec);
+    printf("  Messages Received    : %u / %d  (Rate: %.1f Hz)\n",
+           ctx.received_count, iterations, (double)ctx.received_count / total_sec);
+    printf("  Throughput           : %.2f MB/s TX / %.2f MB/s RX\n",
+           ((double)ctx.published_count * 4096.0) / (total_sec * 1e6),
+           ((double)ctx.received_count * 4156.0) / (total_sec * 1e6));
+
+    if (ctx.received_count > 0) {
+        qsort(ctx.sub_latencies_us, ctx.received_count, sizeof(double), compare_doubles);
+        double min_l = ctx.sub_latencies_us[0];
+        double max_l = ctx.sub_latencies_us[ctx.received_count - 1];
+        double p50_l = get_percentile(ctx.sub_latencies_us, ctx.received_count, 50.0);
+        double p95_l = get_percentile(ctx.sub_latencies_us, ctx.received_count, 95.0);
+        double p99_l = get_percentile(ctx.sub_latencies_us, ctx.received_count, 99.0);
+        printf("-----------------------------------------------------------------\n");
+        printf("  Asynchronous One-Way / Roundtrip Inflight Latencies:\n");
+        printf("    - Min Latency      : %8.2f us\n", min_l);
+        printf("    - p50 (Median)     : %8.2f us\n", p50_l);
+        printf("    - p95 Latency      : %8.2f us\n", p95_l);
+        printf("    - p99 Latency      : %8.2f us\n", p99_l);
+        printf("    - Max Latency      : %8.2f us\n", max_l);
+    }
+    printf("=================================================================\n\n");
+
+    free(ctx.sub_latencies_us);
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     int fd;
     NDDS_Transport_Plugin plugin;
@@ -524,6 +686,11 @@ int main(int argc, char* argv[]) {
     uint32_t bypass_crc = 0;
     int option_b_mode = 1; /* Default: Option B NDDS_Transport_Plugin mode (CTRL[7]=1) */
     int fastpath_mode = 0; /* Option 1 dedicated hardware RTPS endpoint mode */
+    int async_mode = 0;    /* 1 = True Asynchronous 1-2 kHz Pub/Sub benchmark */
+    int target_rate_hz = 1000; /* Default 1000 Hz (1 kHz) */
+    int enable_peer_emu = 1; /* 1 = Internal Hardware Peer Emulator, 0 = Physical Ethernet Wire (LAN8720) */
+    uint32_t peer_mac_lo = 0x5E200002U;
+    uint16_t peer_mac_hi = 0x0002U;
     int verbose = 0;
     const char* pcap_filename = NULL;
     int pcap_wire_frags = 0;
@@ -550,7 +717,11 @@ int main(int argc, char* argv[]) {
             printf("  --bypass-crc           Bypass CPU DMA0 CRC-32 check\n");
             printf("  -b, --option-b (0|1)   1 for Option B 4,156B RTPS RX (default: 1), 0 for Option A 4,096B\n");
             printf("  --fastpath, --endpoint Option 1 Dedicated FPGA Hardware RTPS Endpoint Driver API test\n");
-            printf("  --emulation            Enable hardware RTI Peer Emulator (enabled by default in PL)\n");
+            printf("  --wire                 Use Physical Ethernet Wire (LAN8720 PHY, disables internal emulator)\n");
+            printf("  --async                Enable True Asynchronous 1 kHz - 2 kHz Pub/Sub Pipeline\n");
+            printf("  --rate HZ              Target publish rate in Hz for --async mode (e.g. 1000, 2000)\n");
+            printf("  --peer-mac MAC         Destination Peer MAC address (e.g. c8:a3:62:30:54:90 or ff:ff:ff:ff:ff:ff)\n");
+            printf("  --emulation            Enable hardware RTI Peer Emulator (default)\n");
             printf("  -v, --verbose          Print per-iteration hardware emulation and phase timing\n");
             printf("  -p, --pcap FILE        Capture all TX and RX RTPS packets to Wireshark PCAP file\n");
             printf("  --pcap-wire-frags      Capture in exact 3-fragment IPv4 wire layout (default: reassembled UDP)\n");
@@ -571,8 +742,23 @@ int main(int argc, char* argv[]) {
             pcap_filename = argv[++arg_i];
         } else if (strcmp(argv[arg_i], "--pcap-wire-frags") == 0) {
             pcap_wire_frags = 1;
+        } else if (strcmp(argv[arg_i], "--wire") == 0) {
+            enable_peer_emu = 0; /* Route packets out physical LAN8720 RMII port */
+        } else if (strcmp(argv[arg_i], "--async") == 0) {
+            async_mode = 1;
+        } else if (strcmp(argv[arg_i], "--rate") == 0 && arg_i + 1 < argc) {
+            target_rate_hz = atoi(argv[++arg_i]);
+            if (target_rate_hz <= 0) target_rate_hz = 1000;
+        } else if (strcmp(argv[arg_i], "--peer-mac") == 0 && arg_i + 1 < argc) {
+            unsigned int m[6];
+            if (sscanf(argv[++arg_i], "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                peer_mac_lo = ((uint32_t)m[2] << 24) | ((uint32_t)m[3] << 16) |
+                              ((uint32_t)m[4] << 8)  | (uint32_t)m[5];
+                peer_mac_hi = (uint16_t)(((uint32_t)m[0] << 8) | (uint32_t)m[1]);
+            }
         } else if (strcmp(argv[arg_i], "--emulation") == 0) {
-            /* Hardware Peer Emulator is active */
+            enable_peer_emu = 1;
         } else if (argv[arg_i][0] != '-') {
             /* Fallback to positional parsing */
             if (arg_i == 1) {
@@ -591,7 +777,7 @@ int main(int argc, char* argv[]) {
         iterations = DEFAULT_ITERATIONS;
 
     if (fastpath_mode) {
-        return run_fastpath_endpoint_test(iterations, verbose);
+        return run_fastpath_endpoint_test(iterations, verbose, enable_peer_emu, peer_mac_lo, peer_mac_hi);
     }
 
     latencies_roundtrip = (double*)malloc(iterations * sizeof(double));
@@ -631,6 +817,8 @@ int main(int argc, char* argv[]) {
         free(latencies_pl_hw);
         return 1;
     }
+    plugin.edt_cfg.enable_peer_emu = enable_peer_emu ? 1 : 0;
+    plugin.edt_cfg.mode_pub_only   = async_mode ? 1 : 0;
 
     /*
      * 2. Simulate SEDP Discovery Handoff via Option B Control-Plane Hooks:
@@ -646,8 +834,8 @@ int main(int argc, char* argv[]) {
             0xC0A80164U,  /* Peer IPv4: 192.168.1.100 */
             7411,         /* Local UDP port */
             7410,         /* Remote RTPS user-unicast UDP port */
-            0x5E200002U,  /* Next-Hop MAC Lo */
-            0x0002U,      /* Next-Hop MAC Hi */
+            peer_mac_lo,  /* Next-Hop MAC Lo */
+            peer_mac_hi,  /* Next-Hop MAC Hi */
             0x00000102U,  /* Local DataWriter entityId */
             0x00000000U,  /* ENTITYID_UNKNOWN (broadcast to matched readers) */
             1U,           /* Starting writerSN = 1 */
@@ -684,7 +872,10 @@ int main(int argc, char* argv[]) {
            option_b_mode
                ? "Option B (NDDS_Transport_Plugin: 4,096B TX -> 4,156B RTPS RX)"
                : "Option A (Direct Zero-Copy FastSample: 4,096B TX / 4,096B RX)");
-    printf("  Hardware Mode : Integrated RTI Peer Emulator (100 MHz Hardware Wire Loopback)\n");
+    printf("  Hardware Mode : %s\n",
+           enable_peer_emu
+               ? "Integrated RTI Peer Emulator (100 MHz Hardware Fabric Loopback)"
+               : "Physical Ethernet Wire (LAN8720 RMII PHY -> RJ45)");
     printf("  Wire Framing  : 3 IPv4 Fragments/Sample (1480B + 1480B + 1204B)\n");
     printf("  Peer Endpoint : 192.168.1.100:7410 (GUID 01010002-BB000002-00000002)\n");
     printf("  Buffer Mode   : %s\n",
@@ -692,6 +883,17 @@ int main(int argc, char* argv[]) {
                            : "Standard copy_from/to_user");
     printf("  Verbosity     : %s\n", verbose ? "Enabled (Per-iteration breakdown)" : "Summary only");
     printf("=================================================================\n\n");
+
+    if (async_mode) {
+        int async_rc = run_async_pubsub_benchmark(&plugin, fd, iterations, target_rate_hz);
+        FpgaTransport_cleanup_plugin(&plugin);
+        free(latencies_roundtrip);
+        free(latencies_tx);
+        free(latencies_rx);
+        free(latencies_pl_hw);
+        close(fd);
+        return async_rc;
+    }
 
     for (iter = 1; iter <= iterations; iter++) {
         /* Pet hardware lifecycle watchdog periodically */
@@ -846,17 +1048,20 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        /* Verify all 1,020 transformed payload words (4,080 bytes) */
+        /* Verify all 1,020 payload words (4,080 bytes) */
         uint64_t active_seq = (rx_seq_num != 0) ? rx_seq_num :
                               ((diag.last_rx_seq_num != 0) ? diag.last_rx_seq_num : (uint64_t)iter);
         uint32_t seq_lo_6b = ((uint32_t)active_seq) & 0x3FU;
         for (i = 0; i < 1020; i++) {
-            uint32_t expected = (~tx_sample->payload[i]) + ((seq_lo_6b << 10) | 0x200U);
-            if (rx_sample->payload[i] != expected) {
+            uint32_t expected_emu  = (~tx_sample->payload[i]) + ((seq_lo_6b << 10) | 0x200U);
+            uint32_t expected_echo = tx_sample->payload[i];
+            int match = (rx_sample->payload[i] == expected_emu) ||
+                        (!enable_peer_emu && rx_sample->payload[i] == expected_echo);
+            if (!match) {
                 fprintf(stderr,
                         "\n[-] Iteration %d payload mismatch at word %u: "
-                        "wrote 0x%08X, expected 0x%08X, got 0x%08X\n",
-                        iter, i + 4, tx_sample->payload[i], expected, rx_sample->payload[i]);
+                        "wrote 0x%08X, expected 0x%08X (or echo 0x%08X), got 0x%08X\n",
+                        iter, i + 4, tx_sample->payload[i], expected_emu, expected_echo, rx_sample->payload[i]);
                 errors++;
                 break;
             }

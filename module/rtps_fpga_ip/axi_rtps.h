@@ -279,6 +279,9 @@ struct rtps_endpoint_cfg {
     __u8  plugin_rx_rtps_mode;  /* 1 = Option B NDDS_Transport_Plugin mode (4,156 B RX) */
     __u8  local_identity_valid; /* 1 = local participant identity valid */
     __u8  writer_context_valid; /* 1 = writer route context valid */
+    __u8  enable_peer_emu;      /* 0 = Physical Wire (LAN8720), 1 = Internal Peer Emulator */
+    __u8  mode_pub_only;        /* 1 = True Asynchronous Publish-Only mode (fire & forget, no wait for feedback) */
+    __u8  reserved_pad[2];      /* 32-bit alignment padding */
     __u32 generation;           /* Endpoint configuration generation */
     __u32 type_profile;         /* Type profile / strict payload contract */
     __u32 payload_words;        /* Sample payload words (1024 = 4,096 B) */

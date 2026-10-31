@@ -336,6 +336,7 @@ static inline int FpgaTransport_init_plugin(
     plugin->edt_cfg.plugin_rx_rtps_mode  = (uint8_t)plugin->option_b_rtps_rx_mode;
     plugin->edt_cfg.local_identity_valid = 1;
     plugin->edt_cfg.writer_context_valid = 1;
+    plugin->edt_cfg.enable_peer_emu      = 1;          /* Default to emulator for backwards-compatibility */
     plugin->edt_cfg.generation           = 1;
     plugin->edt_cfg.type_profile         = RTPS_TYPE_PROFILE_RTI_DEFAULT;
     plugin->edt_cfg.payload_words        = RTPS_FAST_SAMPLE_WORDS;

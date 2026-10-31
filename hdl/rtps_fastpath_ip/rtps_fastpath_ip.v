@@ -1,3 +1,4 @@
+
 `timescale 1ns / 1ps
 
 // =============================================================================
@@ -186,7 +187,7 @@ module rtps_fastpath_ip #(
     reg [31:0] shadow_rd_edt [0:NUM_ENDPOINTS-1][0:7];
     reg [31:0] active_rd_edt [0:NUM_ENDPOINTS-1][0:7];
 
-    // Identity and Generation States
+    // Identity and Generation States (Rules Section 1 & 2)
     reg        local_identity_valid;
     reg        writer_context_valid;
     reg [31:0] active_generation;
@@ -304,7 +305,6 @@ module rtps_fastpath_ip #(
         if (axis_wr) begin
             tx_sample_bram[rx_ptr[ADDR_WIDTH-1:0]] <= s_axis_tdata;
         end
-        tx_sample_dout <= tx_sample_bram[tx_sample_rd_addr];
     end
 
     // On-the-Fly 32-bit Additive Checksum & 1's Complement Payload Sum during MM2S Ingress
@@ -347,12 +347,15 @@ module rtps_fastpath_ip #(
 
     wire                  emu_enable = ctrl_reg[4];
 
-    assign m_axis_wire_tdata  = eng_tx_tdata;
+    // Engine words are network-order; the 8<->32 converters are LSB-first.
+
+    assign m_axis_wire_tdata  = {eng_tx_tdata[7:0], eng_tx_tdata[15:8], eng_tx_tdata[23:16], eng_tx_tdata[31:24]};
     assign m_axis_wire_tvalid = emu_enable ? 1'b0 : eng_tx_tvalid;
     assign m_axis_wire_tlast  = eng_tx_tlast;
     assign eng_tx_tready      = emu_enable ? emu_tx_tready : m_axis_wire_tready;
 
-    assign eng_rx_tdata       = emu_enable ? emu_rx_tdata  : s_axis_wire_tdata;
+    assign eng_rx_tdata       = emu_enable ? emu_rx_tdata  :
+                                {s_axis_wire_tdata[7:0], s_axis_wire_tdata[15:8], s_axis_wire_tdata[23:16], s_axis_wire_tdata[31:24]};
     assign eng_rx_tvalid      = emu_enable ? emu_rx_tvalid : s_axis_wire_tvalid;
     assign eng_rx_tlast       = emu_enable ? emu_rx_tlast  : s_axis_wire_tlast;
     assign emu_rx_tready      = emu_enable ? eng_rx_tready : 1'b0;
@@ -405,7 +408,7 @@ module rtps_fastpath_ip #(
     end
 
     // =========================================================================
-    // AXI4-Lite Slave Write Channel (CSRs & Shadow EDT) - Fully Decoupled
+    // AXI4-Lite Slave Write Channel (CSRs & Shadow EDT) - Fully Decoupled (Section 9)
     // =========================================================================
     assign s_axi_bresp = 2'b00;
     assign s_axi_rresp = 2'b00;
@@ -649,6 +652,9 @@ module rtps_fastpath_ip #(
 
     wire [2:0] wr0_lifecycle_state = active_wr_edt[0][0][3:1];
     wire wr0_lifecycle_active      = (wr0_lifecycle_state == 3'd2);
+    wire [31:0] wr0_dst_ip     = active_wr_edt[0][1];
+    wire [15:0] wr0_dst_port   = active_wr_edt[0][2][15:0];
+    wire [47:0] wr0_dst_mac    = {active_wr_edt[0][4][15:0], active_wr_edt[0][3]};
     wire wr0_route_valid           = (wr0_dst_ip != 32'd0) && (wr0_dst_port != 16'd0) && (wr0_dst_mac != 48'd0);
     wire generation_match          = (shadow_generation == 32'd0) || (active_generation == shadow_generation);
 
@@ -844,6 +850,7 @@ module rtps_fastpath_ip #(
     reg        rx_active_valid;
     reg [15:0] rx_flags_frag;
     reg [15:0] rx_hdr_csum_accum;
+    reg        rx_is_ipv4_udp;
     reg [31:0] rx_src_ip;
     reg [31:0] rx_dst_ip;
     reg [15:0] rx_prev_half;
@@ -990,10 +997,7 @@ module rtps_fastpath_ip #(
     reg                tx_frag_more;
 
     // Latch active Writer[0] fields
-    wire [31:0] wr0_dst_ip     = active_wr_edt[0][1];
     wire [15:0] wr0_src_port   = active_wr_edt[0][2][31:16];
-    wire [15:0] wr0_dst_port   = active_wr_edt[0][2][15:0];
-    wire [47:0] wr0_dst_mac    = {active_wr_edt[0][4][15:0], active_wr_edt[0][3]};
     wire [31:0] wr0_writer_id  = active_wr_edt[0][5];
     wire [31:0] wr0_reader_id  = active_wr_edt[0][6];
 
@@ -1012,6 +1016,14 @@ module rtps_fastpath_ip #(
         end
     end
     wire [31:0] tx_sample_word = (cfg_pacing_timer == 32'd0) ? tx_sample_dout : tx_sample_buf;
+
+    // Refresh only on beat loads: wire stalls must not let the read run ahead of the payload
+    wire tx_beat_load = (state == S_TX_FRAG_SEND) && (!eng_tx_tvalid || eng_tx_tready) && (pacing_timer == 16'd0);
+    always @(posedge clk) begin
+        if (state != S_TX_FRAG_SEND || tx_beat_load) begin
+            tx_sample_dout <= tx_sample_bram[tx_sample_rd_addr];
+        end
+    end
 
     // Combinational UDP/RTPS Datagram Word Mux (Word 0..16 headers, Word 17..1040 sample payload)
     reg [31:0] cur_dgram_word;
@@ -1232,6 +1244,7 @@ module rtps_fastpath_ip #(
             walker_rd_addr          <= 12'd0;
 
             rx_wire_beat            <= 12'd0;
+            rx_is_ipv4_udp          <= 1'b0;
             rx_ip_len               <= 16'd0;
             rx_ip_id                <= 16'd0;
             rx_active_ip_id         <= 16'd0;
@@ -1336,6 +1349,7 @@ module rtps_fastpath_ip #(
                             12'd3: begin
                                 // Beat 3: {EtherType(0x0800), VerIHL_TOS(0x4500)}
                                 rx_hdr_csum_accum <= csum_add32(16'h0000, {16'h0000, eng_rx_tdata[15:0]});
+                                rx_is_ipv4_udp    <= (eng_rx_tdata[31:16] == 16'h0800) && (eng_rx_tdata[15:8] == 8'h45);
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                             end
                             12'd4: begin
@@ -1350,9 +1364,11 @@ module rtps_fastpath_ip #(
                                 rx_flags_frag     <= eng_rx_tdata[31:16];
                                 rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, eng_rx_tdata);
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
+                                rx_is_ipv4_udp    <= rx_is_ipv4_udp && (eng_rx_tdata[7:0] == 8'h11);
 
                                 // If a new IP_ID arrives, reset reassembly context for the new datagram
-                                if (!rx_active_valid || (rx_active_ip_id != rx_ip_id)) begin
+                                if (rx_is_ipv4_udp && (eng_rx_tdata[7:0] == 8'h11) &&
+                                    (!rx_active_valid || (rx_active_ip_id != rx_ip_id))) begin
                                     rx_active_ip_id                <= rx_ip_id;
                                     rx_active_valid                <= 1'b1;
                                     rx_bytes_rcvd                  <= 16'd0;
@@ -1388,7 +1404,7 @@ module rtps_fastpath_ip #(
                             end
                             default: begin
                                 // Store reassembled 32-bit word into fill_slot at rx_wr_ptr
-                                if (rx_wr_ptr < (rx_frag_w_start + rx_ip_pay_bytes[13:2])) begin
+                                if (rx_is_ipv4_udp && rx_wr_ptr < (rx_frag_w_start + rx_ip_pay_bytes[13:2])) begin
                                     reasm_wr_en       <= 1'b1;
                                     reasm_wr_addr     <= rx_wr_ptr;
                                     reasm_wr_data     <= {rx_prev_half, eng_rx_tdata[31:16]};
@@ -1413,8 +1429,9 @@ module rtps_fastpath_ip #(
 
                                 if (eng_rx_tlast) begin
                                     rx_wire_beat <= 12'd0;
-                                    // Verify IPv4 header checksum (1's complement sum of valid header is 0xFFFF)
-                                    if (rx_hdr_csum_accum != 16'hFFFF) begin
+                                    // Non-IPv4/UDP frames (ARP, IPv6, mDNS) are dropped without a checksum error
+                                    if (!rx_is_ipv4_udp) begin
+                                    end else if (rx_hdr_csum_accum != 16'hFFFF) begin
                                         err_csum        <= 1'b1;
                                         stat_csum_errs  <= stat_csum_errs + 32'd1;
                                         rx_active_valid <= 1'b0;
@@ -1434,6 +1451,8 @@ module rtps_fastpath_ip #(
                                 end
                             end
                         endcase
+                        // A frame shorter than the header ends here; resync the beat counter
+                        if (eng_rx_tlast && rx_wire_beat <= 12'd8) rx_wire_beat <= 12'd0;
                     end
                 end
 
@@ -1849,33 +1868,36 @@ module rtps_fastpath_ip #(
                 S_TX_FRAG_INIT: begin
                     cycle_tick_cnt <= cycle_tick_cnt + 32'd1;
 
-                    if (tx_bytes_remaining > IPV4_NONFINAL_PAYLOAD) begin
-                        tx_frag_payload_bytes <= IPV4_NONFINAL_PAYLOAD;
-                        tx_frag_more          <= 1'b1;
-                        tx_frag_words         <= (IPV4_NONFINAL_PAYLOAD >> 2); // 370 words (1480B)
-                        tx_frag_ip_len        <= IPV4_HDR_BYTES + IPV4_NONFINAL_PAYLOAD; // 1500 bytes
-                        tx_frag_flags         <= {2'b00, 1'b1, tx_frag_offset_bytes[15:3]}; // MF=1
-                    end else begin
-                        tx_frag_payload_bytes <= tx_bytes_remaining;
-                        tx_frag_more          <= 1'b0;
-                        tx_frag_words         <= (tx_bytes_remaining + 16'd3) >> 2;
-                        tx_frag_ip_len        <= IPV4_HDR_BYTES + tx_bytes_remaining;
-                        tx_frag_flags         <= {2'b00, 1'b0, tx_frag_offset_bytes[15:3]}; // MF=0
+                    // Hold the previous fragment's tlast beat until the stream accepts it
+                    if (!(eng_tx_tvalid && !eng_tx_tready)) begin
+                        if (tx_bytes_remaining > IPV4_NONFINAL_PAYLOAD) begin
+                            tx_frag_payload_bytes <= IPV4_NONFINAL_PAYLOAD;
+                            tx_frag_more          <= 1'b1;
+                            tx_frag_words         <= (IPV4_NONFINAL_PAYLOAD >> 2); // 370 words (1480B)
+                            tx_frag_ip_len        <= IPV4_HDR_BYTES + IPV4_NONFINAL_PAYLOAD; // 1500 bytes
+                            tx_frag_flags         <= {2'b00, 1'b1, tx_frag_offset_bytes[15:3]}; // MF=1
+                        end else begin
+                            tx_frag_payload_bytes <= tx_bytes_remaining;
+                            tx_frag_more          <= 1'b0;
+                            tx_frag_words         <= (tx_bytes_remaining + 16'd3) >> 2;
+                            tx_frag_ip_len        <= IPV4_HDR_BYTES + tx_bytes_remaining;
+                            tx_frag_flags         <= {2'b00, 1'b0, tx_frag_offset_bytes[15:3]}; // MF=0
+                        end
+
+                        tx_dgram_word_idx <= tx_frag_offset_bytes >> 2;
+
+                        if ((tx_frag_offset_bytes >> 2) >= 12'd17) begin
+                            tx_sample_rd_addr <= (tx_frag_offset_bytes >> 2) - 12'd17;
+                        end else begin
+                            tx_sample_rd_addr <= 11'd0;
+                        end
+
+                        tx_beat_idx   <= 12'd0;
+                        eng_tx_tvalid <= 1'b0;
+                        eng_tx_tlast  <= 1'b0;
+                        pacing_timer  <= cfg_pacing_timer[15:0];
+                        state         <= S_TX_FRAG_SEND;
                     end
-
-                    tx_dgram_word_idx <= tx_frag_offset_bytes >> 2;
-
-                    if ((tx_frag_offset_bytes >> 2) >= 12'd17) begin
-                        tx_sample_rd_addr <= (tx_frag_offset_bytes >> 2) - 12'd17;
-                    end else begin
-                        tx_sample_rd_addr <= 11'd0;
-                    end
-
-                    tx_beat_idx   <= 12'd0;
-                    eng_tx_tvalid <= 1'b0;
-                    eng_tx_tlast  <= 1'b0;
-                    pacing_timer  <= cfg_pacing_timer[15:0];
-                    state         <= S_TX_FRAG_SEND;
                 end
 
                 // -------------------------------------------------------------
@@ -1987,8 +2009,10 @@ module rtps_fastpath_ip #(
                 // 6. S_DONE_IRQ: Hold Level-High IRQ until PS Driver ACKs
                 // -------------------------------------------------------------
                 S_DONE_IRQ: begin
-                    eng_tx_tvalid <= 1'b0;
-                    eng_tx_tlast  <= 1'b0;
+                    if (eng_tx_tvalid && eng_tx_tready) begin
+                        eng_tx_tvalid <= 1'b0;
+                        eng_tx_tlast  <= 1'b0;
+                    end
                     if (status_write_pulse && status_write_data[0]) begin
                         ip_done_irq <= 1'b0;
                         if (err_crc || err_no_match || err_rx_timeout || (!irq_is_rx && mode_pub_only)) begin

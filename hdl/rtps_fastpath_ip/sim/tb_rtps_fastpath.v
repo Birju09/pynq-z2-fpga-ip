@@ -234,7 +234,10 @@ module tb_rtps_fastpath;
     always @(posedge clk) begin
         if (rst_n && dut.u_rtps_peer_emulator.m_axis_tvalid && dut.u_rtps_peer_emulator.m_axis_tready) begin
             if (rec_wire_cnt < 1068) begin
-                rec_wire_data[rec_wire_cnt] <= dut.u_rtps_peer_emulator.m_axis_tdata;
+                rec_wire_data[rec_wire_cnt] <= {dut.u_rtps_peer_emulator.m_axis_tdata[7:0],
+                                                dut.u_rtps_peer_emulator.m_axis_tdata[15:8],
+                                                dut.u_rtps_peer_emulator.m_axis_tdata[23:16],
+                                                dut.u_rtps_peer_emulator.m_axis_tdata[31:24]};
                 rec_wire_last[rec_wire_cnt] <= dut.u_rtps_peer_emulator.m_axis_tlast;
                 rec_wire_cnt <= rec_wire_cnt + 1;
             end
@@ -757,7 +760,15 @@ module tb_rtps_fastpath;
         s_axis_wire_tlast  <= 1'b0;
 
         // In Subscribe-only mode, the 3 fragments are reassembled and walker validates the sample from S_IDLE!
-        wait (ip_done_irq == 1'b1);
+        sim_timeout = 0;
+        while (!ip_done_irq && sim_timeout < 5000) begin
+            @(posedge clk);
+            sim_timeout = sim_timeout + 1;
+        end
+        if (sim_timeout >= 5000) begin
+            $display("[-] TIMEOUT waiting for ip_done_irq in TEST 9!");
+            errors = errors + 1;
+        end
         axi_read(10'h004, status_val);
         $display("[+] Subscribe-Only IRQ Triggered! STATUS=0x%08X (State=%0d, RX_Samples=%0d, irq_is_rx=%b, Errors=%04b)",
                  status_val, status_val[4:1], status_val[31:16], status_val[10], status_val[8:5]);

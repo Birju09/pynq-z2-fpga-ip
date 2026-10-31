@@ -59,9 +59,14 @@ struct axi_rtps_dev {
     wait_queue_head_t tx_waitq;
     wait_queue_head_t rx_waitq;
     wait_queue_head_t ip_waitq;
+    wait_queue_head_t tx_ip_waitq;
+    wait_queue_head_t rx_packet_waitq;
+    u32 mode_pub_only;
     int tx_done;
     int rx_done;
     int ip_done;
+    int tx_ip_done;
+    int rx_packet_avail;
     int tx_err;
     int rx_err;
     int crc_err;
@@ -236,6 +241,14 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
             dev->rx_timeout_err = (ip_status & RTPS_STATUS_ERR_RX_TIMEOUT) ? 1 : 0;
             dev->csum_err       = (ip_status & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
 
+            if (ip_status & RTPS_STATUS_IRQ_IS_RX) {
+                dev->rx_packet_avail = 1;
+                wake_up_interruptible(&dev->rx_packet_waitq);
+            } else {
+                dev->tx_ip_done = 1;
+                wake_up_interruptible(&dev->tx_ip_waitq);
+            }
+
             dev->ip_done = 1;
             wake_up_interruptible(&dev->ip_waitq);
             handled = IRQ_HANDLED;
@@ -333,9 +346,11 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 
             /* Atomically commit Shadow -> Active EDT at S_IDLE boundary */
             dev->plugin_rx_rtps_mode = cfg.plugin_rx_rtps_mode ? 1 : 0;
+            dev->mode_pub_only       = cfg.mode_pub_only ? 1 : 0;
             ctrl_word = RTPS_CTRL_ENABLE |
                         ((cfg.num_writers & 0x07U) << RTPS_CTRL_NUM_WRITERS_SHIFT) |
-                        RTPS_CTRL_EMU_EN |
+                        (cfg.enable_peer_emu ? RTPS_CTRL_EMU_EN : 0U) |
+                        (cfg.mode_pub_only ? RTPS_CTRL_PUB_ONLY : 0U) |
                         RTPS_CTRL_COMMIT_EDT |
                         (dev->plugin_rx_rtps_mode ? RTPS_CTRL_PLUGIN_RX_RTPS_MODE : 0U);
             iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
@@ -673,6 +688,28 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
 
     dev->pre_read_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
 
+    /*
+     * In asynchronous or decoupled subscriber mode, wait for an incoming packet
+     * if the IP is not already holding a completed sample in S_DONE_IRQ (5) or S_WAIT_EGRESS (6).
+     */
+    if (dev->ip_regs) {
+        u32 initial_status = dev->pre_read_ip_status;
+        u8 initial_state = (initial_status & RTPS_STATUS_STATE_MASK) >> 1;
+        if (initial_state != 5 && initial_state != 6 && !dev->rx_packet_avail) {
+            ret = wait_event_interruptible_timeout(dev->rx_packet_waitq,
+                                                   dev->rx_packet_avail != 0,
+                                                   msecs_to_jiffies(3000));
+            if (ret == 0) {
+                mutex_unlock(&dev->rx_lock);
+                return -ETIMEDOUT;
+            } else if (ret < 0) {
+                mutex_unlock(&dev->rx_lock);
+                return ret;
+            }
+        }
+        dev->rx_packet_avail = 0;
+    }
+
     /* Setup S2MM Buffer Descriptor */
     memset(dev->rx_bd, 0, sizeof(*dev->rx_bd));
     dev->rx_bd->next_desc = (u32)dev->rx_bd_phys;
@@ -903,6 +940,7 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     dev->isr_ack_polls         = 0;
     dev->post_write_ip_status  = 0;
     dev->ip_done               = 0;
+    dev->tx_ip_done            = 0;
     dev->crc_err               = 0;
     dev->no_match_err          = 0;
     dev->rx_timeout_err        = 0;
@@ -959,8 +997,13 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     }
 
     /* Wait for RTPS Fast-Path 3-Fragment Publication + Peer Reassembly & Validation */
-    ret = wait_event_interruptible_timeout(dev->ip_waitq, dev->ip_done != 0,
-                                           msecs_to_jiffies(3000));
+    if (dev->mode_pub_only) {
+        ret = wait_event_interruptible_timeout(dev->tx_ip_waitq, dev->tx_ip_done != 0,
+                                               msecs_to_jiffies(3000));
+    } else {
+        ret = wait_event_interruptible_timeout(dev->ip_waitq, dev->ip_done != 0,
+                                               msecs_to_jiffies(3000));
+    }
     dev->post_write_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
     if (ret == 0) {
         u32 status = dev->post_write_ip_status;
@@ -1073,6 +1116,8 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     init_waitqueue_head(&dmadev->tx_waitq);
     init_waitqueue_head(&dmadev->rx_waitq);
     init_waitqueue_head(&dmadev->ip_waitq);
+    init_waitqueue_head(&dmadev->tx_ip_waitq);
+    init_waitqueue_head(&dmadev->rx_packet_waitq);
 
     res0 = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res0) {

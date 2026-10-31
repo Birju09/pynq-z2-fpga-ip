@@ -8,11 +8,11 @@
 # 1. RMII Reference Clock (50 MHz from LAN8720 Onboard Crystal)
 # PMOD A Pin 4 -> Pin Y17 (Clock-Capable IO_L7N_T1_34 / Bank 35)
 # ------------------------------------------------------------------------------
-set_property PACKAGE_PIN Y17 [get_ports rmii_ref_clk]
-set_property IOSTANDARD LVCMOS33 [get_ports rmii_ref_clk]
+set_property PACKAGE_PIN Y17 [get_ports ref_clk_0]
+set_property IOSTANDARD LVCMOS33 [get_ports ref_clk_0]
 
-# Define 50.0 MHz Clock (20.0 ns Period)
-create_clock -period 20.000 -name rmii_ref_clk -waveform {0.000 10.000} [get_ports rmii_ref_clk]
+# Define 50.0 MHz Clock (20.0 ns Period) on physical port ref_clk_0
+create_clock -period 20.000 -name ref_clk_0 -waveform {0.000 10.000} [get_ports ref_clk_0]
 
 # ------------------------------------------------------------------------------
 # 2. RMII Transmit Signals (FPGA -> PHY)
@@ -69,18 +69,18 @@ set_property IOSTANDARD LVCMOS33 [get_ports mdio_mdc]
 # Input setup: 4 ns, hold: 2 ns
 # ------------------------------------------------------------------------------
 # Receive side (PHY -> FPGA input delays)
-set_input_delay -clock rmii_ref_clk -max 14.000 [get_ports {rmii_rxd[*] rmii_crs_dv}]
-set_input_delay -clock rmii_ref_clk -min 2.000  [get_ports {rmii_rxd[*] rmii_crs_dv}]
+set_input_delay -clock ref_clk_0 -max 14.000 [get_ports {rmii_rxd[*] rmii_crs_dv}]
+set_input_delay -clock ref_clk_0 -min 2.000  [get_ports {rmii_rxd[*] rmii_crs_dv}]
 
 # Transmit side (FPGA -> PHY output delays)
-set_output_delay -clock rmii_ref_clk -max 4.000 [get_ports {rmii_txd[*] rmii_tx_en}]
-set_output_delay -clock rmii_ref_clk -min -2.000 [get_ports {rmii_txd[*] rmii_tx_en}]
+set_output_delay -clock ref_clk_0 -max 4.000 [get_ports {rmii_txd[*] rmii_tx_en}]
+set_output_delay -clock ref_clk_0 -min -2.000 [get_ports {rmii_txd[*] rmii_tx_en}]
 
 # ------------------------------------------------------------------------------
 # 6. Asynchronous Clock Domain Crossing (CDC) Ignore Constraints
 # Isolates the 50 MHz RMII domain from the 25 MHz MII and 100 MHz AXI domains
 # ------------------------------------------------------------------------------
 set_clock_groups -asynchronous \
-    -group [get_clocks -include_generated_clocks rmii_ref_clk] \
+    -group [get_clocks -include_generated_clocks ref_clk_0] \
     -group [get_clocks -include_generated_clocks clk_fpga_0]
 
