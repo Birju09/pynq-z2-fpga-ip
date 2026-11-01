@@ -334,6 +334,7 @@ static inline int FpgaTransport_init_plugin(
     plugin->edt_cfg.local_vendor_id      = 0x0101U;     /* RTI Connext VendorId (0x0101) */
     plugin->edt_cfg.num_writers          = 1;
     plugin->edt_cfg.plugin_rx_rtps_mode  = (uint8_t)plugin->option_b_rtps_rx_mode;
+    plugin->edt_cfg.mode_pub_only        = 1;          /* Default to decoupled asynchronous mode */
     plugin->edt_cfg.local_identity_valid = 1;
     plugin->edt_cfg.writer_context_valid = 1;
     plugin->edt_cfg.enable_peer_emu      = 1;          /* Default to emulator for backwards-compatibility */
@@ -556,6 +557,7 @@ static inline int fpga_fastpath_open(
     fpga->cfg.writer_context_valid = 1;
     fpga->cfg.payload_words        = RTPS_FAST_SAMPLE_WORDS;
     fpga->cfg.type_profile         = RTPS_TYPE_PROFILE_RTI_DEFAULT;
+    fpga->cfg.mode_pub_only        = 1;          /* Default to decoupled asynchronous mode */
 
     /* Push initial configuration to hardware */
     ioctl(fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);

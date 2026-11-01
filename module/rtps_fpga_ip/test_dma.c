@@ -579,8 +579,10 @@ static void* async_subscriber_thread(void* arg) {
     uint64_t rx_seq = 0;
     uint64_t rx_ts  = 0;
 
+    uint32_t fail_count = 0;
     while (ctx->running && ctx->received_count < (uint32_t)ctx->iterations) {
-        if (DDS_DataReader_take(ctx->plugin, &rx_sample, &rx_seq, &rx_ts) == 0) {
+        int rc = DDS_DataReader_take(ctx->plugin, &rx_sample, &rx_seq, &rx_ts);
+        if (rc == 0) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
@@ -593,6 +595,18 @@ static void* async_subscriber_thread(void* arg) {
             }
             ctx->received_count++;
         } else {
+            fail_count++;
+            if (fail_count <= 5 || fail_count % 1000 == 0) {
+                // Read CSRs to see why
+                struct rtps_cycle_diag d;
+                if (ioctl(ctx->fd, AXI_RTPS_IOC_GET_DIAG, &d) == 0) {
+                    fprintf(stderr, "[-] sub take failed (rc=%d, errno=%d): IP Status=0x%08x (State=%u, IRQ_IS_RX=%u), TX=%u, RX=%u, CsumErr=%u, Stale=%u, SkippedSubmsg=%u, LastSrcIP=0x%08x, Ports=0x%04x:0x%04x, CAM=%u\n",
+                            rc, errno, d.status_reg, (d.status_reg >> 1) & 0xF, (d.status_reg >> 10) & 1,
+                            d.stat_tx_samples, d.stat_rx_samples, d.stat_csum_errs, d.stat_stale_drops,
+                            d.stat_skipped_submsg, d.last_rx_src_ip, d.last_rx_src_port, d.last_rx_dst_port,
+                            d.last_rx_cam_idx);
+                }
+            }
             usleep(100);
         }
     }
@@ -666,6 +680,22 @@ static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int
     }
     printf("=================================================================\n\n");
 
+    struct rtps_cycle_diag d;
+    if (ioctl(fd, AXI_RTPS_IOC_GET_DIAG, &d) == 0) {
+        printf("  Hardware RTPS Fast-Path Diagnostics:\n");
+        printf("    - TX / RX Samples    : %u TX / %u RX (Frags/Cycle=%u)\n",
+               d.stat_tx_samples, d.stat_rx_samples, d.completed_frags);
+        printf("    - Latest RX SeqNum   : %llu (Gaps=%u, StaleDrops=%u, CsumErrs=%u)\n",
+               (unsigned long long)d.last_rx_seq_num,
+               d.stat_seq_gaps, d.stat_stale_drops, d.stat_csum_errs);
+        printf("    - Option B RTPS Len  : %u words (%u bytes)\n",
+               d.last_rx_rtps_words, d.last_rx_rtps_words * 4);
+        printf("    - Status Reg         : 0x%08x (State=%u, IRQ_IS_RX=%u)\n",
+               d.status_reg, (d.status_reg >> 1) & 0xF, (d.status_reg >> 10) & 1);
+        printf("    - Wire Cycle Ticks   : %u clocks (%.2f us @ 100 MHz)\n\n",
+               d.last_cycle_ticks, d.last_cycle_ticks * 0.01);
+    }
+
     free(ctx.sub_latencies_us);
     return 0;
 }
@@ -686,7 +716,7 @@ int main(int argc, char* argv[]) {
     uint32_t bypass_crc = 0;
     int option_b_mode = 1; /* Default: Option B NDDS_Transport_Plugin mode (CTRL[7]=1) */
     int fastpath_mode = 0; /* Option 1 dedicated hardware RTPS endpoint mode */
-    int async_mode = 0;    /* 1 = True Asynchronous 1-2 kHz Pub/Sub benchmark */
+    int async_mode = 1;    /* Default: True Asynchronous 1-2 kHz Pub/Sub benchmark */
     int target_rate_hz = 1000; /* Default 1000 Hz (1 kHz) */
     int enable_peer_emu = 1; /* 1 = Internal Hardware Peer Emulator, 0 = Physical Ethernet Wire (LAN8720) */
     uint32_t peer_mac_lo = 0x5E200002U;
@@ -746,6 +776,8 @@ int main(int argc, char* argv[]) {
             enable_peer_emu = 0; /* Route packets out physical LAN8720 RMII port */
         } else if (strcmp(argv[arg_i], "--async") == 0) {
             async_mode = 1;
+        } else if (strcmp(argv[arg_i], "--sync") == 0) {
+            async_mode = 0;
         } else if (strcmp(argv[arg_i], "--rate") == 0 && arg_i + 1 < argc) {
             target_rate_hz = atoi(argv[++arg_i]);
             if (target_rate_hz <= 0) target_rate_hz = 1000;

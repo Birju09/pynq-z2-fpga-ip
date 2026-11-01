@@ -294,7 +294,7 @@ module rtps_fastpath_ip #(
     wire                mode_pub_only = ctrl_reg[8]; // Bit [8]: 1 = Publish-only mode (no RX feedback expected)
     wire                mode_sub_only = ctrl_reg[9]; // Bit [9]: 1 = Subscribe-only mode (unsolicited wire RX from S_IDLE)
 
-    assign s_axis_tready = (state == S_IDLE) && !mode_sub_only;
+    assign s_axis_tready = (state == S_IDLE) && !mode_sub_only && !latest_valid;
     wire   rx_handshake  = s_axis_tvalid && s_axis_tready;
     wire   axis_wr       = rx_handshake && (state == S_IDLE);
 
@@ -449,8 +449,8 @@ module rtps_fastpath_ip #(
             shadow_generation        <= 32'd0;
             type_profile_reg         <= 32'h0007_0101; // [18:16]=3'b111, [19]=0, [15:0]=0x0101
 
-            // Default: global_enable=1, 1 writer, emulator enabled (bit 4), watchdog disabled by default
-            ctrl_reg           <= 32'h0000_0013;
+            // Default: global_enable=1, 1 writer, emulator enabled (bit 4), Option B mode (bit 7), Asynchronous mode (bit 8)
+            ctrl_reg           <= 32'h0000_0193;
             expected_crc       <= 32'd0;
             cfg_pacing_timer   <= 32'd0;
             cfg_payload_words  <= 32'd1024;       // 1,024 words = 4,096 bytes (4 KB FastSample)
@@ -1802,7 +1802,15 @@ module rtps_fastpath_ip #(
                     eng_tx_tvalid <= 1'b0;
                     eng_tx_tlast  <= 1'b0;
 
-                    if (rx_handshake && !mode_sub_only) begin
+                    if (latest_valid && (rx_ptr == 0)) begin
+                        // Asynchronous wire RX: Walker has verified a complete sample from remote publisher!
+                        egress_slot      <= latest_slot;
+                        latest_valid     <= 1'b0;
+                        irq_is_rx        <= 1'b1;
+                        last_cycle_ticks <= 32'd1;
+                        ip_done_irq      <= 1'b1; // Level-High IRQ to PS (IRQ_F2P)
+                        state            <= S_DONE_IRQ;
+                    end else if (rx_handshake && !mode_sub_only) begin
                         if (s_axis_tlast || (rx_ptr == cfg_payload_words - 1)) begin
                             pkt_len <= {1'b0, rx_ptr[ADDR_WIDTH-1:0]} + 1'b1;
                             rx_ptr  <= 0;
@@ -1814,14 +1822,6 @@ module rtps_fastpath_ip #(
                         pkt_len <= cfg_payload_words[ADDR_WIDTH:0];
                         rx_ptr  <= 0;
                         state   <= S_CHECK_CRC;
-                    end else if (latest_valid && (rx_ptr == 0)) begin
-                        // Asynchronous wire RX: Walker has verified a complete sample from remote publisher!
-                        egress_slot      <= latest_slot;
-                        latest_valid     <= 1'b0;
-                        irq_is_rx        <= 1'b1;
-                        last_cycle_ticks <= 32'd1;
-                        ip_done_irq      <= 1'b1; // Level-High IRQ to PS (IRQ_F2P)
-                        state            <= S_DONE_IRQ;
                     end
                 end
 
@@ -1852,7 +1852,9 @@ module rtps_fastpath_ip #(
                         tx_frag_offset_bytes <= 16'd0;
                         tx_ip_id_counter     <= tx_ip_id_counter + 16'd1;
                         writer_seq_num[0]    <= writer_seq_num[0] + 64'd1;
-                        latest_valid         <= 1'b0;
+                        if (!mode_pub_only) begin
+                            latest_valid     <= 1'b0; // Only clear in synchronous mode waiting for dedicated feedback
+                        end
                         state                <= S_TX_FRAG_INIT;
                     end else begin
                         err_crc     <= 1'b1;
@@ -1933,7 +1935,14 @@ module rtps_fastpath_ip #(
                                         if (mode_pub_only) begin
                                             // Publish-only mode: all fragments sent, no RX feedback expected!
                                             last_cycle_ticks <= cycle_tick_cnt + 32'd1;
-                                            irq_is_rx        <= 1'b0;
+                                            if (latest_valid) begin
+                                                // Asynchronous concurrent ingress arrived during TX: immediately service RX
+                                                egress_slot      <= latest_slot;
+                                                latest_valid     <= 1'b0;
+                                                irq_is_rx        <= 1'b1;
+                                            end else begin
+                                                irq_is_rx        <= 1'b0;
+                                            end
                                             ip_done_irq      <= 1'b1;
                                             state            <= S_DONE_IRQ;
                                         end else begin

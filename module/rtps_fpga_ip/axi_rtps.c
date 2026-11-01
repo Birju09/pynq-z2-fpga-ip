@@ -244,6 +244,11 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
             if (ip_status & RTPS_STATUS_IRQ_IS_RX) {
                 dev->rx_packet_avail = 1;
                 wake_up_interruptible(&dev->rx_packet_waitq);
+                /* In asynchronous mode, a completed TX may piggyback on an RX IRQ */
+                if (dev->mode_pub_only) {
+                    dev->tx_ip_done = 1;
+                    wake_up_interruptible(&dev->tx_ip_waitq);
+                }
             } else {
                 dev->tx_ip_done = 1;
                 wake_up_interruptible(&dev->tx_ip_waitq);
@@ -1254,6 +1259,18 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     ret = axi_dma_reset(dmadev);
     if (ret)
         goto err_free_ip_irq;
+
+    /* Default to asynchronous decoupled Pub/Sub mode & Option B RTPS ingress */
+    dmadev->mode_pub_only       = 1;
+    dmadev->plugin_rx_rtps_mode = 1;
+    if (dmadev->ip_regs) {
+        u32 default_ctrl = RTPS_CTRL_ENABLE |
+                           (1U << RTPS_CTRL_NUM_WRITERS_SHIFT) |
+                           RTPS_CTRL_EMU_EN |
+                           RTPS_CTRL_PUB_ONLY |
+                           RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
+        iowrite32(default_ctrl, dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
+    }
 
     platform_set_drvdata(pdev, dmadev);
 
