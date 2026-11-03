@@ -1329,6 +1329,109 @@ module tb_rtps_fastpath;
             end
         end
 
+        // ==================================================================
+        // TEST 17: Ingress Destination IP Filtering (Ambient LAN Dropping)
+        // ==================================================================
+        $display("\n==================================================================");
+        $display("  TEST 17: Ingress Destination IP Filtering (Ambient LAN Dropping)");
+        $display("==================================================================");
+
+        begin : test17_blk
+            reg [31:0] initial_csum_errs, post_csum_errs;
+            axi_read(10'h05C, initial_csum_errs); // STAT_CSUM_ERRS
+
+            // Stream an ambient frame addressed to 192.168.1.55 (mismatched destination IP)
+            for (k = 0; k < 30; k = k + 1) begin
+                @(posedge clk);
+                if (k == 8)
+                    s_axis_wire_tdata <= {rec_wire_data[8][31:16], 16'h5501}; // Mismatched Dst IP 192.168.1.55
+                else
+                    s_axis_wire_tdata <= rec_wire_data[k];
+                s_axis_wire_tlast  <= (k == 29);
+                s_axis_wire_tvalid <= 1'b1;
+                while (!s_axis_wire_tready) @(posedge clk);
+            end
+            @(posedge clk);
+            s_axis_wire_tvalid <= 1'b0;
+            s_axis_wire_tlast  <= 1'b0;
+
+            repeat (10) @(posedge clk);
+            axi_read(10'h05C, post_csum_errs);
+            if (post_csum_errs === initial_csum_errs) begin
+                $display("[+] PASS: Mismatched ambient LAN frame silently dropped with 0 checksum errors!");
+            end else begin
+                $display("[-] FAIL: Ambient frame caused checksum error! init=%0d post=%0d", initial_csum_errs, post_csum_errs);
+                errors = errors + 1;
+            end
+        end
+
+        // ==================================================================
+        // TEST 18: RFC 768 UDP Zero-Checksum Acceptance Verification
+        // ==================================================================
+        $display("\n==================================================================");
+        $display("  TEST 18: RFC 768 UDP Zero-Checksum Acceptance Verification");
+        $display("==================================================================");
+
+        begin : test18_blk
+            reg [31:0] initial_csum_errs, post_csum_errs;
+            axi_read(10'h05C, initial_csum_errs);
+
+            // Commit EDT to reset expected sequence number for new sample verification
+            axi_write(10'h008, 32'h0000_0223);
+            repeat (5) @(posedge clk);
+            axi_write(10'h008, 32'h0000_0203);
+            repeat (5) @(posedge clk);
+
+            // Replay the 3-fragment wire frame with UDP Checksum set to 0x0000
+            for (k = 0; k < rec_wire_cnt; k = k + 1) begin
+                @(posedge clk);
+                if (k == 10)
+                    s_axis_wire_tdata <= {rec_wire_data[10][31:16], 16'h0000}; // Force UDP Checksum = 0x0000
+                else
+                    s_axis_wire_tdata <= rec_wire_data[k];
+                s_axis_wire_tlast  <= rec_wire_last[k];
+                s_axis_wire_tvalid <= 1'b1;
+                while (!s_axis_wire_tready) @(posedge clk);
+            end
+            @(posedge clk);
+            s_axis_wire_tvalid <= 1'b0;
+            s_axis_wire_tlast  <= 1'b0;
+
+            sim_timeout = 0;
+            while (!ip_done_irq && sim_timeout < 5000) begin
+                @(posedge clk);
+                sim_timeout = sim_timeout + 1;
+            end
+            if (sim_timeout >= 5000) begin
+                $display("[-] TIMEOUT waiting for ip_done_irq in TEST 18!");
+                errors = errors + 1;
+            end
+
+            axi_read(10'h004, status_val);
+            axi_read(10'h05C, post_csum_errs);
+
+            if (status_val[4:1] === 4'd5 && post_csum_errs === initial_csum_errs) begin
+                $display("[+] PASS: RFC 768 Zero-Checksum frame validated cleanly with 0 checksum errors!");
+            end else begin
+                $display("[-] FAIL: Zero-checksum frame rejected! status=0x%08X csum_errs=%0d", status_val, post_csum_errs);
+                errors = errors + 1;
+            end
+
+            // Drain egress to return FSM cleanly to S_IDLE
+            axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+            repeat (2) @(posedge clk);
+            axi_write(10'h004, 32'h0000_0002); // Kick S2MM egress
+            m_axis_tready = 1'b1;
+            sim_timeout = 0;
+            while (!m_axis_tlast && sim_timeout < 5000) begin
+                @(posedge clk);
+                sim_timeout = sim_timeout + 1;
+            end
+            @(posedge clk);
+            m_axis_tready = 1'b0;
+            repeat (5) @(posedge clk);
+        end
+
         $display("\n==================================================================");
         if (errors == 0)
             $display("  ALL RTPS FAST-PATH SIMULATION TESTS PASSED SUCCESSFULLY!");

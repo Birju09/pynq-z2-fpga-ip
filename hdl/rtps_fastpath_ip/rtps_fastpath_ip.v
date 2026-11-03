@@ -879,6 +879,18 @@ module rtps_fastpath_ip #(
     reg        rx_active_valid;
     reg [15:0] rx_flags_frag;
     reg [15:0] rx_hdr_csum_accum;
+    reg [31:0] rx_hdr_word;
+    reg        rx_hdr_add, rx_hdr_init;
+
+    // Header checksum accumulates one cycle after the beat is captured; tlast cannot occur before beat 9 for a valid UDP frame.
+    always @(posedge clk) begin
+        if (!rst_n)
+            rx_hdr_csum_accum <= 16'd0;
+        else if (rx_hdr_init)
+            rx_hdr_csum_accum <= csum_add32(16'h0000, rx_hdr_word);
+        else if (rx_hdr_add)
+            rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, rx_hdr_word);
+    end
     reg        rx_is_ipv4_udp;
     reg [31:0] rx_src_ip;
     reg [31:0] rx_dst_ip;
@@ -888,9 +900,12 @@ module rtps_fastpath_ip #(
     reg [15:0] rx_bytes_total;
     reg        rx_saw_last;
     reg [15:0] rx_udp_csum_accum;
+    reg        rx_csum_clr;
     reg [15:0] rx_udp_len_bytes;
     reg [15:0] rx_udp_src_port;
     reg [15:0] rx_udp_dst_port;
+    reg [15:0] rx_udp_hdr_csum;
+    reg        rx_dst_match;
 
     // Fragment Coverage Bitmap per Reassembly Slot (Section 6)
     localparam integer REASM_MAX_BYTES   = REASM_DEPTH * 4; // 1536 * 4 = 6144 bytes
@@ -932,16 +947,30 @@ module rtps_fastpath_ip #(
         end
     end
 
+    // Accumulates one cycle after the RAM write; R_REASM_CHECK gives the last word time to land before R_CHECK_UDP.
+    always @(posedge clk) begin
+        if (!rst_n || rx_csum_clr)
+            rx_udp_csum_accum <= 16'd0;
+        else if (reasm_wr_en)
+            rx_udp_csum_accum <= csum_add32(rx_udp_csum_accum, reasm_wr_data);
+    end
+
     // UDP Checksum validation fold evaluated in R_CHECK_UDP:
     // Combines accumulated payload checksum and pre-folded pseudo-header checksum.
+    // RFC 768: A transmitted checksum of 0x0000 indicates the sender omitted checksum calculation.
     wire [16:0] rx_chk_fold1 = {1'b0, rx_udp_csum_accum} + {1'b0, rx_pseudo_csum};
     wire [15:0] rx_chk_final = rx_chk_fold1[15:0] + {15'd0, rx_chk_fold1[16]};
-    wire        rx_chk_valid = (&rx_chk_fold1[15:1]) && (rx_chk_fold1[0] ^ rx_chk_fold1[16]);
+    wire        rx_chk_valid = (rx_udp_hdr_csum == 16'h0000) ||
+                               ((&rx_chk_fold1[15:1]) && (rx_chk_fold1[0] ^ rx_chk_fold1[16]));
 
     wire [12:0] rx_frag_off_8b  = rx_flags_frag[12:0];
     wire        rx_frag_mf      = rx_flags_frag[13];
     wire [15:0] rx_ip_pay_bytes = rx_ip_len - 16'd20;
     wire [11:0] rx_frag_w_start = {rx_frag_off_8b[10:0], 1'b0};
+
+    // Header fields are stable several beats before payload; register the sum to shorten the write-enable path.
+    reg [11:0] rx_wr_end;
+    always @(posedge clk) rx_wr_end <= rx_frag_w_start + rx_ip_pay_bytes[13:2];
 
     assign eng_rx_tready = (rx_state == R_IDLE);
     wire   eng_rx_fire   = eng_rx_tvalid && eng_rx_tready;
@@ -1107,9 +1136,9 @@ module rtps_fastpath_ip #(
                                {8'd0, local_guid_prefix[63:48]} + {8'd0, local_guid_prefix[47:32]} +
                                {8'd0, local_guid_prefix[31:16]} + {8'd0, local_guid_prefix[15:0]};
 
-    // Stage 3: Sum remaining fields (INFO_TS, timestamp, DATA header, writer/reader IDs, seqNum, CDR_LE)
-    wire [23:0] ucs_stg2_sum = ucs_tree_1 +
-                               {8'd0, 16'h0901} + {8'd0, 16'h0800} +
+    // Stage 3a: terms that do not depend on tree_1, summed in parallel with stage 2 to shorten stage 3.
+    reg [23:0] ucs_pre;
+    wire [23:0] ucs_pre_sum = {8'd0, 16'h0901} + {8'd0, 16'h0800} +
                                {8'd0, latched_tx_ts[39:32], latched_tx_ts[47:40]} +
                                {8'd0, latched_tx_ts[55:48], latched_tx_ts[63:56]} +
                                {8'd0, latched_tx_ts[7:0],   latched_tx_ts[15:8]}  +
@@ -1123,6 +1152,10 @@ module rtps_fastpath_ip #(
                                {8'd0, cur_tx_seq[7:0],   cur_tx_seq[15:8]}  +
                                {8'd0, cur_tx_seq[23:16], cur_tx_seq[31:24]} +
                                {8'd0, 16'h0001};
+    always @(posedge clk) ucs_pre <= ucs_pre_sum;
+
+    // Stage 3: combine tree_1 with the pre-summed terms
+    wire [23:0] ucs_stg2_sum = ucs_tree_1 + ucs_pre;
 
     // Final Stage 4: 1's complement carry-fold of the 24-bit binary sum into 16 bits
     wire [19:0] ucs_fold_tmp1 = {4'd0, ucs_tree_2[15:0]} + {12'd0, ucs_tree_2[23:16]};
@@ -1268,6 +1301,7 @@ module rtps_fastpath_ip #(
             egress_slot             <= 2'd2;
             latest_valid            <= 1'b0;
             reasm_wr_en             <= 1'b0;
+            rx_csum_clr             <= 1'b0;
             reasm_wr_addr           <= 12'd0;
             reasm_wr_data           <= 32'd0;
             walker_rd_addr          <= 12'd0;
@@ -1280,6 +1314,9 @@ module rtps_fastpath_ip #(
             rx_active_valid         <= 1'b0;
             rx_flags_frag           <= 16'd0;
             rx_hdr_csum_accum       <= 16'd0;
+            rx_hdr_word             <= 32'd0;
+            rx_hdr_add              <= 1'b0;
+            rx_hdr_init             <= 1'b0;
             rx_src_ip               <= 32'd0;
             rx_dst_ip               <= 32'd0;
             rx_prev_half            <= 16'd0;
@@ -1287,10 +1324,11 @@ module rtps_fastpath_ip #(
             rx_bytes_rcvd           <= 16'd0;
             rx_bytes_total          <= 16'd0;
             rx_saw_last             <= 1'b0;
-            rx_udp_csum_accum       <= 16'd0;
             rx_udp_len_bytes        <= 16'd0;
             rx_udp_src_port         <= 16'd0;
             rx_udp_dst_port         <= 16'd0;
+            rx_udp_hdr_csum         <= 16'hFFFF;
+            rx_dst_match            <= 1'b0;
             last_rx_src_ip          <= 32'd0;
             last_rx_src_port        <= 16'd0;
             last_rx_dst_port        <= 16'd0;
@@ -1344,6 +1382,9 @@ module rtps_fastpath_ip #(
         end else begin
             // Default single-cycle pulse deassertions
             reasm_wr_en <= 1'b0;
+            rx_csum_clr <= 1'b0;
+            rx_hdr_add  <= 1'b0;
+            rx_hdr_init <= 1'b0;
 
             // Atomic synchronization pulse on commit (Section 2)
             if (edt_commit_applied) begin
@@ -1388,21 +1429,25 @@ module rtps_fastpath_ip #(
                             end
                             12'd3: begin
                                 // Beat 3: {EtherType(0x0800), VerIHL_TOS(0x4500)}
-                                rx_hdr_csum_accum <= csum_add32(16'h0000, {16'h0000, eng_rx_tdata[15:0]});
+                                rx_hdr_word       <= {16'h0000, eng_rx_tdata[15:0]};
+                                rx_hdr_init       <= 1'b1;
                                 rx_is_ipv4_udp    <= (eng_rx_tdata[31:16] == 16'h0800) && (eng_rx_tdata[15:8] == 8'h45);
+                                rx_dst_match      <= 1'b0;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                             end
                             12'd4: begin
                                 // Beat 4: {IPv4_TotalLen, IPv4_ID}
                                 rx_ip_len         <= eng_rx_tdata[31:16];
                                 rx_ip_id          <= eng_rx_tdata[15:0];
-                                rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, eng_rx_tdata);
+                                rx_hdr_word       <= eng_rx_tdata;
+                                rx_hdr_add        <= 1'b1;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                             end
                             12'd5: begin
                                 // Beat 5: {IPv4_FlagsFrag, TTL_Proto}
                                 rx_flags_frag     <= eng_rx_tdata[31:16];
-                                rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, eng_rx_tdata);
+                                rx_hdr_word       <= eng_rx_tdata;
+                                rx_hdr_add        <= 1'b1;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                                 rx_is_ipv4_udp    <= rx_is_ipv4_udp && (eng_rx_tdata[7:0] == 8'h11);
 
@@ -1415,7 +1460,8 @@ module rtps_fastpath_ip #(
                                     rx_bytes_rcvd                  <= 16'd0;
                                     rx_bytes_total                 <= 16'd0;
                                     rx_saw_last                    <= 1'b0;
-                                    rx_udp_csum_accum              <= 16'd0;
+                                    rx_csum_clr                    <= 1'b1;
+                                    rx_udp_hdr_csum                <= 16'hFFFF;
                                     reasm_coverage       <= {REASM_BLOCKS{1'b0}};
                                     reasm_blocks_covered <= 10'd0;
                                     reasm_total_bytes    <= 16'd0;
@@ -1425,37 +1471,45 @@ module rtps_fastpath_ip #(
                             12'd6: begin
                                 // Beat 6: {IPv4_HdrCsum, SrcIP[31:16]}
                                 rx_src_ip[31:16]  <= eng_rx_tdata[15:0];
-                                rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, eng_rx_tdata);
+                                rx_hdr_word       <= eng_rx_tdata;
+                                rx_hdr_add        <= 1'b1;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                             end
                             12'd7: begin
                                 // Beat 7: {SrcIP[15:0], DstIP[31:16]}
                                 rx_src_ip[15:0]   <= eng_rx_tdata[31:16];
                                 rx_dst_ip[31:16]  <= eng_rx_tdata[15:0];
-                                rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, eng_rx_tdata);
+                                rx_hdr_word       <= eng_rx_tdata;
+                                rx_hdr_add        <= 1'b1;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                             end
                             12'd8: begin
                                 // Beat 8: {DstIP[15:0], IP_Payload_Half0}
                                 rx_dst_ip[15:0]   <= eng_rx_tdata[31:16];
-                                rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, {eng_rx_tdata[31:16], 16'h0000});
+                                rx_hdr_word       <= {eng_rx_tdata[31:16], 16'h0000};
+                                rx_hdr_add        <= 1'b1;
                                 rx_prev_half      <= eng_rx_tdata[15:0];
                                 rx_wr_ptr         <= rx_frag_w_start;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
+                                rx_dst_match      <= ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == local_src_ip) ||
+                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hC0A8_010A) || // Primary IP 192.168.1.10
+                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hC0A8_01C9) || // Secondary IP 192.168.1.201
+                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hC0A8_01FF) || // Subnet Broadcast
+                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hFFFF_FFFF);   // Global Broadcast
                             end
                             default: begin
                                 // Store reassembled 32-bit word into fill_slot at rx_wr_ptr
-                                if (rx_is_ipv4_udp && rx_wr_ptr < (rx_frag_w_start + rx_ip_pay_bytes[13:2])) begin
+                                if (rx_is_ipv4_udp && rx_wr_ptr < rx_wr_end) begin
                                     reasm_wr_en       <= 1'b1;
                                     reasm_wr_addr     <= rx_wr_ptr;
                                     reasm_wr_data     <= {rx_prev_half, eng_rx_tdata[31:16]};
-                                    rx_udp_csum_accum <= csum_add32(rx_udp_csum_accum, {rx_prev_half, eng_rx_tdata[31:16]});
                                     if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd0) begin
                                         rx_udp_src_port <= rx_prev_half;
                                         rx_udp_dst_port <= eng_rx_tdata[31:16];
                                     end
                                     if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd1) begin
                                         rx_udp_len_bytes <= rx_prev_half;
+                                        rx_udp_hdr_csum  <= eng_rx_tdata[31:16];
                                     end
                                     rx_wr_ptr <= rx_wr_ptr + 12'd1;
 
@@ -1470,8 +1524,9 @@ module rtps_fastpath_ip #(
 
                                 if (eng_rx_tlast) begin
                                     rx_wire_beat <= 12'd0;
-                                    // Non-IPv4/UDP frames (ARP, IPv6, mDNS) are dropped without a checksum error
-                                    if (!rx_is_ipv4_udp) begin
+                                    // Non-IPv4/UDP frames or ambient packets not matching our IP are dropped without a checksum error
+                                    if (!rx_is_ipv4_udp || !rx_dst_match) begin
+                                        rx_active_valid <= 1'b0;
                                     end else if (rx_hdr_csum_accum != 16'hFFFF) begin
                                         err_csum        <= 1'b1;
                                         stat_csum_errs  <= stat_csum_errs + 32'd1;
@@ -1499,7 +1554,7 @@ module rtps_fastpath_ip #(
 
                 // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
                 R_REASM_CHECK: begin
-                    if (reasm_last_seen &&
+                    if (reasm_last_seen && rx_dst_match &&
                         (reasm_total_bytes > 16'd0) &&
                         (reasm_blocks_covered == ((reasm_total_bytes + 16'd7) >> 3))) begin
                         rx_active_valid <= 1'b0;
@@ -1508,6 +1563,8 @@ module rtps_fastpath_ip #(
                         walker_rd_addr  <= 12'd2; // Prime Word 2 ("RTPS")
                         rx_state        <= R_CHECK_UDP;
                     end else begin
+                        if (!rx_dst_match)
+                            rx_active_valid <= 1'b0;
                         rx_state        <= R_IDLE;
                     end
                 end
