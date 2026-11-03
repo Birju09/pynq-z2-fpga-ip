@@ -65,6 +65,20 @@ static void print_detailed_diag(FILE* out, const struct rtps_cycle_diag* diag) {
     fprintf(out, "      - Latest RX SeqNum     : %llu (Gaps=%u, StaleDrops=%u, CsumErrs=%u, SkippedSubmsg=%u)\n",
             (unsigned long long)diag->last_rx_seq_num,
             diag->stat_seq_gaps, diag->stat_stale_drops, diag->stat_csum_errs, diag->stat_skipped_submsg);
+    fprintf(out, "      - Peer Wire Identity   : IP=%u.%u.%u.%u:%u (Reader CAM Slot %u)\n",
+            (diag->last_rx_src_ip >> 24) & 0xFF,
+            (diag->last_rx_src_ip >> 16) & 0xFF,
+            (diag->last_rx_src_ip >> 8) & 0xFF,
+            diag->last_rx_src_ip & 0xFF,
+            diag->last_rx_src_port,
+            diag->last_rx_cam_idx);
+    fprintf(out, "      - Learned MAC Addresses: Ingress MAC=%02X:%02X:%02X:%02X:%02X:%02X | ARP MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
+            diag->last_rx_src_mac[0], diag->last_rx_src_mac[1],
+            diag->last_rx_src_mac[2], diag->last_rx_src_mac[3],
+            diag->last_rx_src_mac[4], diag->last_rx_src_mac[5],
+            diag->arp_remote_client_mac[0], diag->arp_remote_client_mac[1],
+            diag->arp_remote_client_mac[2], diag->arp_remote_client_mac[3],
+            diag->arp_remote_client_mac[4], diag->arp_remote_client_mac[5]);
     fprintf(out, "    Driver & FSM State Transition Timeline:\n");
     fprintf(out, "      1. Pre-Write IP Status : 0x%08X -> State %u [%s]\n",
             diag->pre_write_ip_status, pre_wr_state, rtps_state_name(pre_wr_state));
@@ -1122,6 +1136,20 @@ int main(int argc, char* argv[]) {
                diag.stat_seq_gaps, diag.stat_stale_drops, diag.stat_csum_errs);
         printf("    - Option B RTPS Len  : %u words (%u bytes)\n",
                diag.last_rx_rtps_words, diag.last_rx_rtps_words * 4);
+        printf("    - Peer Wire Identity : IP=%u.%u.%u.%u:%u (Reader CAM Slot %u)\n",
+               (diag.last_rx_src_ip >> 24) & 0xFF,
+               (diag.last_rx_src_ip >> 16) & 0xFF,
+               (diag.last_rx_src_ip >> 8) & 0xFF,
+               diag.last_rx_src_ip & 0xFF,
+               diag.last_rx_src_port,
+               diag.last_rx_cam_idx);
+        printf("    - Learned MACs       : Ingress=%02X:%02X:%02X:%02X:%02X:%02X | ARP=%02X:%02X:%02X:%02X:%02X:%02X\n",
+               diag.last_rx_src_mac[0], diag.last_rx_src_mac[1],
+               diag.last_rx_src_mac[2], diag.last_rx_src_mac[3],
+               diag.last_rx_src_mac[4], diag.last_rx_src_mac[5],
+               diag.arp_remote_client_mac[0], diag.arp_remote_client_mac[1],
+               diag.arp_remote_client_mac[2], diag.arp_remote_client_mac[3],
+               diag.arp_remote_client_mac[4], diag.arp_remote_client_mac[5]);
         printf("    - Wire Cycle Ticks   : %u clocks (%.2f us @ 100 MHz)\n\n",
                diag.last_cycle_ticks, diag.last_cycle_ticks * 0.01);
     }

@@ -101,6 +101,10 @@ struct axi_rtps_dev {
     u32 irq_cnt_rx;
     u32 irq_cnt_ip;
 
+    /* Learned Peer MAC Addresses */
+    u8 last_logged_ingress_mac[6];
+    u8 last_logged_arp_mac[6];
+
     /* Mapped Linux Virtual IRQs */
     int tx_virq;
     int rx_virq;
@@ -395,6 +399,26 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                 diag.last_rx_dst_port= (u16)(ports_word & 0xFFFFU);
                 diag.last_rx_cam_idx = meta_word & 0x03U;
             }
+            {
+                u32 rx_mac_lo  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_LO_OFFSET);
+                u32 rx_mac_hi  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_HI_OFFSET);
+                u32 arp_mac_lo = ioread32(dev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_LO_OFFSET);
+                u32 arp_mac_hi = ioread32(dev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_HI_OFFSET);
+
+                diag.last_rx_src_mac[0] = (u8)(rx_mac_hi >> 8);
+                diag.last_rx_src_mac[1] = (u8)(rx_mac_hi & 0xFF);
+                diag.last_rx_src_mac[2] = (u8)(rx_mac_lo >> 24);
+                diag.last_rx_src_mac[3] = (u8)(rx_mac_lo >> 16);
+                diag.last_rx_src_mac[4] = (u8)(rx_mac_lo >> 8);
+                diag.last_rx_src_mac[5] = (u8)(rx_mac_lo & 0xFF);
+
+                diag.arp_remote_client_mac[0] = (u8)(arp_mac_hi >> 8);
+                diag.arp_remote_client_mac[1] = (u8)(arp_mac_hi & 0xFF);
+                diag.arp_remote_client_mac[2] = (u8)(arp_mac_lo >> 24);
+                diag.arp_remote_client_mac[3] = (u8)(arp_mac_lo >> 16);
+                diag.arp_remote_client_mac[4] = (u8)(arp_mac_lo >> 8);
+                diag.arp_remote_client_mac[5] = (u8)(arp_mac_lo & 0xFF);
+            }
             diag.active_generation   = ioread32(dev->ip_regs + RTPS_IP_COMMIT_STATUS_OFFSET);
             diag.commit_status       = diag.active_generation;
             diag.type_profile        = ioread32(dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
@@ -657,6 +681,55 @@ static void axi_rtps_snapshot_s2mm_and_rxbuf(struct axi_rtps_dev* dev,
     dev->rx_buf_last_mod_idx  = last_idx;
 }
 
+static void axi_rtps_check_learned_macs(struct axi_rtps_dev* dev) {
+    u32 rx_mac_lo, rx_mac_hi, arp_mac_lo, arp_mac_hi;
+    u32 src_ip, ports;
+    u8 rx_mac[6], arp_mac[6];
+    bool rx_changed = false, arp_changed = false;
+
+    if (!dev->ip_regs)
+        return;
+
+    rx_mac_lo  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_LO_OFFSET);
+    rx_mac_hi  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_HI_OFFSET);
+    arp_mac_lo = ioread32(dev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_LO_OFFSET);
+    arp_mac_hi = ioread32(dev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_HI_OFFSET);
+
+    rx_mac[0] = (u8)(rx_mac_hi >> 8);
+    rx_mac[1] = (u8)(rx_mac_hi & 0xFF);
+    rx_mac[2] = (u8)(rx_mac_lo >> 24);
+    rx_mac[3] = (u8)(rx_mac_lo >> 16);
+    rx_mac[4] = (u8)(rx_mac_lo >> 8);
+    rx_mac[5] = (u8)(rx_mac_lo & 0xFF);
+
+    arp_mac[0] = (u8)(arp_mac_hi >> 8);
+    arp_mac[1] = (u8)(arp_mac_hi & 0xFF);
+    arp_mac[2] = (u8)(arp_mac_lo >> 24);
+    arp_mac[3] = (u8)(arp_mac_lo >> 16);
+    arp_mac[4] = (u8)(arp_mac_lo >> 8);
+    arp_mac[5] = (u8)(arp_mac_lo & 0xFF);
+
+    if ((rx_mac_lo != 0 || rx_mac_hi != 0) &&
+        memcmp(rx_mac, dev->last_logged_ingress_mac, 6) != 0) {
+        memcpy(dev->last_logged_ingress_mac, rx_mac, 6);
+        rx_changed = true;
+    }
+
+    if ((arp_mac_lo != 0 || arp_mac_hi != 0) &&
+        memcmp(arp_mac, dev->last_logged_arp_mac, 6) != 0) {
+        memcpy(dev->last_logged_arp_mac, arp_mac, 6);
+        arp_changed = true;
+    }
+
+    if (rx_changed || arp_changed) {
+        src_ip = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_IP_OFFSET);
+        ports  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_PORTS_OFFSET);
+        pr_info("axi_rtps: [Peer Discovery] Ingress MAC: %pM, ARP MAC: %pM (Peer IP: %pI4:%u)\n",
+                dev->last_logged_ingress_mac, dev->last_logged_arp_mac,
+                &src_ip, (u16)(ports >> 16));
+    }
+}
+
 /*
  * S2MM Egress Transfer:
  *   - In Option A (raw FastSample mode): streams 4,096 B (1,024 words) from latest_slot.
@@ -845,6 +918,23 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                live_ip_status, (live_ip_status & RTPS_STATUS_STATE_MASK) >> 1);
         pr_err("axi_rtps: [IP CSRs ] CTRL=0x%08x, TX_Samples=%u, RX_Samples=%u, Latest_RTPS_Words=%u\n",
                live_ip_ctrl, tx_samples, rx_samples, rtps_words);
+        if (dev->ip_regs) {
+            u32 rx_mac_lo = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_LO_OFFSET);
+            u32 rx_mac_hi = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_HI_OFFSET);
+            u32 arp_mac_lo = ioread32(dev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_LO_OFFSET);
+            u32 arp_mac_hi = ioread32(dev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_HI_OFFSET);
+            u32 last_src_ip = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_IP_OFFSET);
+            u32 last_ports  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_PORTS_OFFSET);
+            u8 rx_mac[6], arp_mac[6];
+            rx_mac[0] = (u8)(rx_mac_hi >> 8);  rx_mac[1] = (u8)(rx_mac_hi & 0xFF);
+            rx_mac[2] = (u8)(rx_mac_lo >> 24); rx_mac[3] = (u8)(rx_mac_lo >> 16);
+            rx_mac[4] = (u8)(rx_mac_lo >> 8);  rx_mac[5] = (u8)(rx_mac_lo & 0xFF);
+            arp_mac[0] = (u8)(arp_mac_hi >> 8);  arp_mac[1] = (u8)(arp_mac_hi & 0xFF);
+            arp_mac[2] = (u8)(arp_mac_lo >> 24); arp_mac[3] = (u8)(arp_mac_lo >> 16);
+            arp_mac[4] = (u8)(arp_mac_lo >> 8);  arp_mac[5] = (u8)(arp_mac_lo & 0xFF);
+            pr_err("axi_rtps: [Peer Info] Ingress MAC: %pM, ARP MAC: %pM, Peer IP: %pI4:%u\n",
+                   rx_mac, arp_mac, &last_src_ip, (u16)(last_ports >> 16));
+        }
         pr_err("axi_rtps: [S2MM DMA] DMACR=0x%08x, DMASR=0x%08x (50us: 0x%08x), CURDESC=0x%08x, TAILDESC=0x%08x (bd_phys=0x%08x)\n",
                dev->last_s2mm_dmacr, dev->last_s2mm_dmasr, dev->post_50us_s2mm_dmasr,
                dev->last_s2mm_curdesc, dev->last_s2mm_taildesc, (u32)dev->rx_bd_phys);
@@ -878,6 +968,9 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     rx_bytes = dev->rx_bd->status & XAXIDMA_BD_STS_ACTUAL_LEN_MASK;
     if (rx_bytes == 0)
         rx_bytes = transfer_len;
+
+    /* Check and log learned MACs if updated from peer */
+    axi_rtps_check_learned_macs(dev);
 
     /* Rule 2b: Zero-Copy check: bypass copy_to_user() if user pointer is inside mmap'd VMA */
     if (buf != NULL && !(dev->rx_user_addr &&
@@ -1107,6 +1200,46 @@ static ssize_t option_b_mode_store(struct device* dev, struct device_attribute* 
 }
 static DEVICE_ATTR_RW(option_b_mode);
 
+/* Sysfs attribute: /sys/class/axi_dma/axi_dma_dev/learned_macs */
+static ssize_t learned_macs_show(struct device* dev, struct device_attribute* attr, char* buf) {
+    struct axi_rtps_dev* dmadev = dev_get_drvdata(dev->parent);
+    u32 rx_mac_lo, rx_mac_hi, arp_mac_lo, arp_mac_hi;
+    u32 src_ip, ports, meta;
+    u8 rx_mac[6], arp_mac[6];
+
+    if (!dmadev || !dmadev->ip_regs)
+        return -ENODEV;
+
+    rx_mac_lo  = ioread32(dmadev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_LO_OFFSET);
+    rx_mac_hi  = ioread32(dmadev->ip_regs + RTPS_IP_LAST_RX_SRC_MAC_HI_OFFSET);
+    arp_mac_lo = ioread32(dmadev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_LO_OFFSET);
+    arp_mac_hi = ioread32(dmadev->ip_regs + RTPS_IP_ARP_CLIENT_MAC_HI_OFFSET);
+    src_ip     = ioread32(dmadev->ip_regs + RTPS_IP_LAST_RX_SRC_IP_OFFSET);
+    ports      = ioread32(dmadev->ip_regs + RTPS_IP_LAST_RX_PORTS_OFFSET);
+    meta       = ioread32(dmadev->ip_regs + RTPS_IP_LAST_RX_META_OFFSET);
+
+    rx_mac[0] = (u8)(rx_mac_hi >> 8);
+    rx_mac[1] = (u8)(rx_mac_hi & 0xFF);
+    rx_mac[2] = (u8)(rx_mac_lo >> 24);
+    rx_mac[3] = (u8)(rx_mac_lo >> 16);
+    rx_mac[4] = (u8)(rx_mac_lo >> 8);
+    rx_mac[5] = (u8)(rx_mac_lo & 0xFF);
+
+    arp_mac[0] = (u8)(arp_mac_hi >> 8);
+    arp_mac[1] = (u8)(arp_mac_hi & 0xFF);
+    arp_mac[2] = (u8)(arp_mac_lo >> 24);
+    arp_mac[3] = (u8)(arp_mac_lo >> 16);
+    arp_mac[4] = (u8)(arp_mac_lo >> 8);
+    arp_mac[5] = (u8)(arp_mac_lo & 0xFF);
+
+    return scnprintf(buf, PAGE_SIZE,
+                     "Ingress Learned MAC: %pM\n"
+                     "ARP Learned MAC:     %pM\n"
+                     "Last RX Peer IP:     %pI4:%u (Reader CAM Slot %u)\n",
+                     rx_mac, arp_mac, &src_ip, (u16)(ports >> 16), meta & 0x03U);
+}
+static DEVICE_ATTR_RO(learned_macs);
+
 static int axi_rtps_probe(struct platform_device* pdev) {
     struct device* dev = &pdev->dev;
     struct axi_rtps_dev* dmadev = &rtps_device;
@@ -1237,6 +1370,9 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     if (device_create_file(dmadev->device, &dev_attr_option_b_mode))
         dev_warn(dev, "failed to create option_b_mode sysfs attribute\n");
 
+    if (device_create_file(dmadev->device, &dev_attr_learned_macs))
+        dev_warn(dev, "failed to create learned_macs sysfs attribute\n");
+
     ret = request_irq(dmadev->rx_virq, axi_rtps_isr, IRQF_SHARED, "axi_rtps_rx",
                       dmadev);
     if (ret)
@@ -1287,6 +1423,7 @@ err_free_rx_irq:
         free_irq(dmadev->tx_virq, dmadev);
     free_irq(dmadev->rx_virq, dmadev);
 err_device_destroy:
+    device_remove_file(dmadev->device, &dev_attr_learned_macs);
     device_remove_file(dmadev->device, &dev_attr_option_b_mode);
     device_destroy(dmadev->class, dmadev->dev_num);
 err_class_destroy:
@@ -1327,6 +1464,7 @@ static int axi_rtps_remove(struct platform_device* pdev) {
     if (dmadev->rx_virq > 0)
         free_irq(dmadev->rx_virq, dmadev);
 
+    device_remove_file(dmadev->device, &dev_attr_learned_macs);
     device_remove_file(dmadev->device, &dev_attr_option_b_mode);
     device_destroy(dmadev->class, dmadev->dev_num);
     class_destroy(dmadev->class);

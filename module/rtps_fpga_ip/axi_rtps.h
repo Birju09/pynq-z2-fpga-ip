@@ -322,6 +322,9 @@ struct rtps_cycle_diag {
     __u8  err_rx_timeout;
     __u8  err_csum;
     __u8  reserved[3];
+    __u8  last_rx_src_mac[6];       /* Ingress wire-learned remote client MAC */
+    __u8  arp_remote_client_mac[6]; /* ARP-learned remote client MAC */
+    __u8  reserved2[4];             /* 32-bit alignment padding */
 
     /* Extended Driver & AXI DMA Hardware Phase Diagnostics */
     __u32 pre_write_ip_status;
