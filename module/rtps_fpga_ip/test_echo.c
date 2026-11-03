@@ -67,6 +67,14 @@ static void *rx_thread(void *arg) {
             echo_seq++;
             put_le32(b + 48, 0);
             put_le32(b + 52, echo_seq);
+
+            if (echo_seq == 1) {
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &ring[i].peer.sin_addr, ip_str, sizeof(ip_str));
+                printf("[+] Received first sample from %s (%d B) -> Echoing to %s:7411 (Seq 1)\n",
+                       ip_str, (int)n, ip_str);
+                fflush(stdout);
+            }
         }
         ring[i].len = (uint16_t)n;
 
@@ -107,6 +115,23 @@ int main(void) {
 
     int one = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+
+    int buf_sz = 8 * 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof buf_sz);
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof buf_sz);
+
+    /*
+     * CRITICAL: Hardware PL RMII PHY does NOT implement the ARP protocol.
+     * Ensure the OS kernel has a permanent static ARP neighbor entry mapping
+     * 192.168.1.10 and 192.168.1.201 to the FPGA PL RMII MAC 02:00:5e:10:00:01.
+     * Without this, the host OS kernel drops 99.9% of echoed UDP packets
+     * while waiting for ARP replies that the FPGA hardware never generates!
+     */
+    printf("[+] Ensuring static ARP entries for FPGA RMII PHY (02:00:5e:10:00:01)...\n");
+    system("ip neigh replace 192.168.1.10 lladdr 02:00:5e:10:00:01 nud permanent 2>/dev/null || "
+           "arp -s 192.168.1.10 02:00:5e:10:00:01 2>/dev/null");
+    system("ip neigh replace 192.168.1.201 lladdr 02:00:5e:10:00:01 nud permanent 2>/dev/null || "
+           "arp -s 192.168.1.201 02:00:5e:10:00:01 2>/dev/null");
 
     struct sockaddr_in local = {0};
     local.sin_family = AF_INET;
