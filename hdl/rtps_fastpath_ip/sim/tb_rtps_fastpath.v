@@ -82,6 +82,13 @@ module tb_rtps_fastpath;
 
     wire                      ip_done_irq;
 
+    // ARP & MAC Resolution Interface
+    wire [31:0]               arp_reply_ip;
+    wire [47:0]               arp_reply_mac;
+    wire [31:0]               remote_client_ip;
+    reg  [47:0]               remote_client_mac;
+    wire [47:0]               ingress_remote_client_mac;
+
     // Instantiate DUT
     rtps_fastpath_ip #(
         .DATA_WIDTH     (DATA_WIDTH),
@@ -129,7 +136,12 @@ module tb_rtps_fastpath;
         .s_axis_wire_tvalid (s_axis_wire_tvalid),
         .s_axis_wire_tready (s_axis_wire_tready),
         .s_axis_wire_tlast  (s_axis_wire_tlast),
-        .ip_done_irq        (ip_done_irq)
+        .ip_done_irq        (ip_done_irq),
+        .arp_reply_ip       (arp_reply_ip),
+        .arp_reply_mac      (arp_reply_mac),
+        .remote_client_ip   (remote_client_ip),
+        .remote_client_mac  (remote_client_mac),
+        .ingress_remote_client_mac (ingress_remote_client_mac)
     );
 
     // 100 MHz clock (10 ns period)
@@ -266,6 +278,7 @@ module tb_rtps_fastpath;
         s_axis_wire_tdata  = 32'd0;
         s_axis_wire_tvalid = 1'b0;
         s_axis_wire_tlast  = 1'b0;
+        remote_client_mac  = 48'd0;
 
         repeat (10) @(posedge clk);
         rst_n = 1'b1;
@@ -1259,6 +1272,61 @@ module tb_rtps_fastpath;
             errors = errors + 1;
         end else begin
             $display("[+] PASS: Egress drained and FSM returned cleanly to S_IDLE!");
+        end
+
+        // ==================================================================
+        // TEST 16: ARP Resolution & Ingress MAC Learning Interface Verification
+        // ==================================================================
+        $display("\n==================================================================");
+        $display("  TEST 16: ARP Interface & Ingress MAC Learning Verification");
+        $display("==================================================================");
+
+        // 1. Verify exposed arp_reply_ip and arp_reply_mac ports
+        if (arp_reply_ip === 32'hC0A8_01C9 && arp_reply_mac === 48'h0200_5E10_0001) begin
+            $display("[+] PASS: arp_reply_ip (192.168.1.201) and arp_reply_mac (02:00:5E:10:00:01) ports verified!");
+        end else begin
+            $display("[-] FAIL: Port mismatch! arp_reply_ip=0x%08X arp_reply_mac=0x%012X", arp_reply_ip, arp_reply_mac);
+            errors = errors + 1;
+        end
+
+        // 2. Verify exposed remote_client_ip port
+        if (remote_client_ip === 32'hC0A8_0164) begin
+            $display("[+] PASS: remote_client_ip port verified (192.168.1.100)!");
+        end else begin
+            $display("[-] FAIL: remote_client_ip port mismatch! got 0x%08X", remote_client_ip);
+            errors = errors + 1;
+        end
+
+        // 3. Verify ingress learned MAC port and CSRs (0x198, 0x19C)
+        if (ingress_remote_client_mac === 48'h0200_5E20_0002) begin
+            $display("[+] PASS: ingress_remote_client_mac port correctly learned peer MAC (02:00:5E:20:00:02)!");
+        end else begin
+            $display("[-] FAIL: ingress_remote_client_mac port = 0x%012X", ingress_remote_client_mac);
+            errors = errors + 1;
+        end
+
+        begin : test16_blk
+            reg [31:0] mac_lo, mac_hi;
+            axi_read(10'h198, mac_lo);
+            axi_read(10'h19C, mac_hi);
+            if (mac_lo === 32'h5E20_0002 && mac_hi[15:0] === 16'h0200) begin
+                $display("[+] PASS: AXI-Lite LAST_RX_SRC_MAC_LO/HI (0x198/0x19C) read back ingress learned MAC!");
+            end else begin
+                $display("[-] FAIL: CSR LAST_RX_SRC_MAC mismatch! LO=0x%08X HI=0x%08X", mac_lo, mac_hi);
+                errors = errors + 1;
+            end
+
+            // 4. Drive remote_client_mac and read back via ARP_CLIENT_MAC_LO/HI (0x1A0/0x1A4)
+            remote_client_mac <= 48'h000C_29AB_CDEF;
+            repeat (2) @(posedge clk);
+            axi_read(10'h1A0, mac_lo);
+            axi_read(10'h1A4, mac_hi);
+            if (mac_lo === 32'h29AB_CDEF && mac_hi[15:0] === 16'h000C) begin
+                $display("[+] PASS: AXI-Lite ARP_CLIENT_MAC_LO/HI (0x1A0/0x1A4) read back ARP learned MAC (00:0C:29:AB:CD:EF)!");
+            end else begin
+                $display("[-] FAIL: CSR ARP_CLIENT_MAC mismatch! LO=0x%08X HI=0x%08X", mac_lo, mac_hi);
+                errors = errors + 1;
+            end
         end
 
         $display("\n==================================================================");

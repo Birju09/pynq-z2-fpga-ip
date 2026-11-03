@@ -61,6 +61,10 @@
 #define RTPS_IP_LAST_RX_SRC_IP_OFFSET    0x18C /* Word 99: Last accepted RX source IPv4 */
 #define RTPS_IP_LAST_RX_PORTS_OFFSET     0x190 /* Word 100: Last accepted RX {src_port[15:0], dst_port[15:0]} */
 #define RTPS_IP_LAST_RX_META_OFFSET      0x194 /* Word 101: Last accepted RX {24'd0, 6'd0, reader_slot[1:0]} */
+#define RTPS_IP_LAST_RX_SRC_MAC_LO_OFFSET 0x198 /* Word 102: Ingress learned remote client MAC[31:0] */
+#define RTPS_IP_LAST_RX_SRC_MAC_HI_OFFSET 0x19C /* Word 103: {16'd0, Ingress learned remote client MAC[47:32]} */
+#define RTPS_IP_ARP_CLIENT_MAC_LO_OFFSET  0x1A0 /* Word 104: ARP learned remote client MAC[31:0] */
+#define RTPS_IP_ARP_CLIENT_MAC_HI_OFFSET  0x1A4 /* Word 105: {16'd0, ARP learned remote client MAC[47:32]} */
 
 /* =========================================================================
  * Option 1 Hardware RTPS Endpoint Lifecycle States (plan.txt Section 4)

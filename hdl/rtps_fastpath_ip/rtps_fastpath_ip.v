@@ -113,7 +113,16 @@ module rtps_fastpath_ip #(
     // -------------------------------------------------------------------------
     // 5. Dedicated Level-High Interrupt Wire to PS GIC (IRQ_F2P[2])
     // -------------------------------------------------------------------------
-    output reg                       ip_done_irq
+    output reg                       ip_done_irq,
+
+    // -------------------------------------------------------------------------
+    // 6. ARP Offload & Peer MAC Resolution Interface
+    // -------------------------------------------------------------------------
+    output wire [31:0]               arp_reply_ip,
+    output wire [47:0]               arp_reply_mac,
+    output wire [31:0]               remote_client_ip,
+    input  wire [47:0]               remote_client_mac,
+    output wire [47:0]               ingress_remote_client_mac
 );
 
     // =========================================================================
@@ -157,7 +166,11 @@ module rtps_fastpath_ip #(
         TYPE_PROFILE_ADDR   = 8'h62, // 0x188: Type profile & strict payload contract
         LAST_RX_SRC_IP_ADDR = 8'h63, // 0x18C: Last accepted RX source IPv4
         LAST_RX_PORTS_ADDR  = 8'h64, // 0x190: Last accepted RX {src_port[15:0], dst_port[15:0]}
-        LAST_RX_META_ADDR   = 8'h65; // 0x194: Last accepted RX {24'd0, 6'd0, reader_slot[1:0]}
+        LAST_RX_META_ADDR   = 8'h65, // 0x194: Last accepted RX {24'd0, 6'd0, reader_slot[1:0]}
+        LAST_RX_SRC_MAC_LO  = 8'h66, // 0x198: Ingress learned Remote Client MAC [31:0]
+        LAST_RX_SRC_MAC_HI  = 8'h67, // 0x19C: {16'd0, Ingress learned Remote Client MAC [47:32]}
+        ARP_CLIENT_MAC_LO   = 8'h68, // 0x1A0: ARP learned Remote Client MAC [31:0]
+        ARP_CLIENT_MAC_HI   = 8'h69; // 0x1A4: {16'd0, ARP learned Remote Client MAC [47:32]}
 
     // =========================================================================
     // Endpoint Descriptor Table (EDT): Shadow & Active Banks
@@ -239,6 +252,10 @@ module rtps_fastpath_ip #(
     reg [15:0] last_rx_src_port;
     reg [15:0] last_rx_dst_port;
     reg [1:0]  last_rx_cam_idx;
+    reg [47:0] rx_wire_src_mac;
+    reg [47:0] rx_active_src_mac;
+    reg [47:0] last_rx_src_mac;
+    reg        latest_valid;
 
     reg        status_write_pulse;
     reg [31:0] status_write_data;
@@ -297,6 +314,11 @@ module rtps_fastpath_ip #(
     assign s_axis_tready = (state == S_IDLE) && !mode_sub_only && !latest_valid;
     wire   rx_handshake  = s_axis_tvalid && s_axis_tready;
     wire   axis_wr       = rx_handshake && (state == S_IDLE);
+
+    // ARP Offload & Peer MAC Resolution Drive Signals
+    assign arp_reply_ip              = local_src_ip;
+    assign arp_reply_mac             = local_mac;
+    assign ingress_remote_client_mac = last_rx_src_mac;
 
     reg  [ADDR_WIDTH-1:0] tx_sample_rd_addr;
     reg  [DATA_WIDTH-1:0] tx_sample_dout;
@@ -653,9 +675,12 @@ module rtps_fastpath_ip #(
     wire [2:0] wr0_lifecycle_state = active_wr_edt[0][0][3:1];
     wire wr0_lifecycle_active      = (wr0_lifecycle_state == 3'd2);
     wire [31:0] wr0_dst_ip     = active_wr_edt[0][1];
+    assign remote_client_ip    = wr0_dst_ip;
     wire [15:0] wr0_dst_port   = active_wr_edt[0][2][15:0];
-    wire [47:0] wr0_dst_mac    = {active_wr_edt[0][4][15:0], active_wr_edt[0][3]};
-    wire wr0_route_valid           = (wr0_dst_ip != 32'd0) && (wr0_dst_port != 16'd0) && (wr0_dst_mac != 48'd0);
+    wire [47:0] wr0_configured_dst_mac = {active_wr_edt[0][4][15:0], active_wr_edt[0][3]};
+    wire [47:0] wr0_learned_dst_mac    = (remote_client_mac != 48'd0) ? remote_client_mac : last_rx_src_mac;
+    wire [47:0] wr0_dst_mac            = (wr0_configured_dst_mac != 48'd0) ? wr0_configured_dst_mac : wr0_learned_dst_mac;
+    wire wr0_route_valid               = (wr0_dst_ip != 32'd0) && (wr0_dst_port != 16'd0) && (wr0_dst_mac != 48'd0);
     wire generation_match          = (shadow_generation == 32'd0) || (active_generation == shadow_generation);
 
     wire lifecycle_ok     = ctrl_reg[0] &&
@@ -737,6 +762,10 @@ module rtps_fastpath_ip #(
                         LAST_RX_SRC_IP_ADDR: s_axi_rdata <= last_rx_src_ip;
                         LAST_RX_PORTS_ADDR:  s_axi_rdata <= {last_rx_src_port, last_rx_dst_port};
                         LAST_RX_META_ADDR:   s_axi_rdata <= {24'd0, 6'd0, last_rx_cam_idx};
+                        LAST_RX_SRC_MAC_LO:  s_axi_rdata <= last_rx_src_mac[31:0];
+                        LAST_RX_SRC_MAC_HI:  s_axi_rdata <= {16'd0, last_rx_src_mac[47:32]};
+                        ARP_CLIENT_MAC_LO:   s_axi_rdata <= remote_client_mac[31:0];
+                        ARP_CLIENT_MAC_HI:   s_axi_rdata <= {16'd0, remote_client_mac[47:32]};
                         default:             s_axi_rdata <= 32'd0;
                     endcase
                 end
@@ -765,7 +794,7 @@ module rtps_fastpath_ip #(
     reg [1:0]  fill_slot;         // Slot currently used by RX reassembly (0, 1, 2)
     reg [1:0]  latest_slot;       // Slot holding the newest validated sample
     reg [1:0]  egress_slot;       // Slot locked during S_WAIT_EGRESS / S_TX_RUN
-    reg        latest_valid;      // 1 = a new valid feedback sample is ready
+    // latest_valid declared above
 
     reg        reasm_wr_en;
     reg [11:0] reasm_wr_addr;
@@ -1266,6 +1295,9 @@ module rtps_fastpath_ip #(
             last_rx_src_port        <= 16'd0;
             last_rx_dst_port        <= 16'd0;
             last_rx_cam_idx         <= 2'd0;
+            rx_wire_src_mac         <= 48'd0;
+            rx_active_src_mac       <= 48'd0;
+            last_rx_src_mac         <= 48'd0;
 
             walk_guid_prefix        <= 96'd0;
             walk_cam_idx            <= 2'd0;
@@ -1343,8 +1375,16 @@ module rtps_fastpath_ip #(
                 R_IDLE: begin
                     if (eng_rx_fire) begin
                         case (rx_wire_beat)
-                            12'd0, 12'd1, 12'd2: begin
+                            12'd0: begin
                                 rx_wire_beat <= rx_wire_beat + 12'd1;
+                            end
+                            12'd1: begin
+                                rx_wire_src_mac[47:32] <= eng_rx_tdata[15:0];
+                                rx_wire_beat           <= rx_wire_beat + 12'd1;
+                            end
+                            12'd2: begin
+                                rx_wire_src_mac[31:0]  <= eng_rx_tdata[31:0];
+                                rx_wire_beat           <= rx_wire_beat + 12'd1;
                             end
                             12'd3: begin
                                 // Beat 3: {EtherType(0x0800), VerIHL_TOS(0x4500)}
@@ -1370,6 +1410,7 @@ module rtps_fastpath_ip #(
                                 if (rx_is_ipv4_udp && (eng_rx_tdata[7:0] == 8'h11) &&
                                     (!rx_active_valid || (rx_active_ip_id != rx_ip_id))) begin
                                     rx_active_ip_id                <= rx_ip_id;
+                                    rx_active_src_mac              <= rx_wire_src_mac;
                                     rx_active_valid                <= 1'b1;
                                     rx_bytes_rcvd                  <= 16'd0;
                                     rx_bytes_total                 <= 16'd0;
@@ -1725,6 +1766,7 @@ module rtps_fastpath_ip #(
                         last_rx_src_port                     <= rx_udp_src_port;
                         last_rx_dst_port                     <= rx_udp_dst_port;
                         last_rx_cam_idx                      <= walk_cam_idx;
+                        last_rx_src_mac                      <= rx_active_src_mac;
                         stat_rx_samples                      <= stat_rx_samples + 32'd1;
                         rd_match_count[walk_cam_idx]         <= rd_match_count[walk_cam_idx] + 32'd1;
                         latest_payload_word_off              <= walk_cur_word + 12'd7; // Skip 4B encapsulation word (+6)
@@ -1764,6 +1806,7 @@ module rtps_fastpath_ip #(
                             last_rx_src_port                     <= rx_udp_src_port;
                             last_rx_dst_port                     <= rx_udp_dst_port;
                             last_rx_cam_idx                      <= walk_cam_idx;
+                            last_rx_src_mac                      <= rx_active_src_mac;
                             stat_rx_samples                      <= stat_rx_samples + 32'd1;
                             rd_match_count[walk_cam_idx]         <= rd_match_count[walk_cam_idx] + 32'd1;
                             latest_payload_word_off              <= walk_cur_word + 12'd2;
