@@ -1313,7 +1313,6 @@ module rtps_fastpath_ip #(
             rx_active_ip_id         <= 16'd0;
             rx_active_valid         <= 1'b0;
             rx_flags_frag           <= 16'd0;
-            rx_hdr_csum_accum       <= 16'd0;
             rx_hdr_word             <= 32'd0;
             rx_hdr_add              <= 1'b0;
             rx_hdr_init             <= 1'b0;
@@ -1499,7 +1498,7 @@ module rtps_fastpath_ip #(
                             end
                             default: begin
                                 // Store reassembled 32-bit word into fill_slot at rx_wr_ptr
-                                if (rx_is_ipv4_udp && rx_wr_ptr < rx_wr_end) begin
+                                if (rx_is_ipv4_udp && rx_dst_match && rx_wr_ptr < rx_wr_end) begin
                                     reasm_wr_en       <= 1'b1;
                                     reasm_wr_addr     <= rx_wr_ptr;
                                     reasm_wr_data     <= {rx_prev_half, eng_rx_tdata[31:16]};

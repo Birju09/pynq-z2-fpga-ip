@@ -735,6 +735,7 @@ int main(int argc, char* argv[]) {
     int enable_peer_emu = 1; /* 1 = Internal Hardware Peer Emulator, 0 = Physical Ethernet Wire (LAN8720) */
     uint32_t peer_mac_lo = 0x5E200002U;
     uint16_t peer_mac_hi = 0x0002U;
+    int peer_mac_explicit = 0;
     int verbose = 0;
     const char* pcap_filename = NULL;
     int pcap_wire_frags = 0;
@@ -802,6 +803,7 @@ int main(int argc, char* argv[]) {
                 peer_mac_lo = ((uint32_t)m[2] << 24) | ((uint32_t)m[3] << 16) |
                               ((uint32_t)m[4] << 8)  | (uint32_t)m[5];
                 peer_mac_hi = (uint16_t)(((uint32_t)m[0] << 8) | (uint32_t)m[1]);
+                peer_mac_explicit = 1;
             }
         } else if (strcmp(argv[arg_i], "--emulation") == 0) {
             enable_peer_emu = 1;
@@ -821,6 +823,13 @@ int main(int argc, char* argv[]) {
     }
     if (iterations <= 0)
         iterations = DEFAULT_ITERATIONS;
+
+    /* In physical wire mode, if --peer-mac was not explicitly provided, pass 00:00:00:00:00:00
+     * so the FPGA hardware automatically uses its ARP-learned or Ingress-learned Peer MAC. */
+    if (!enable_peer_emu && !peer_mac_explicit) {
+        peer_mac_lo = 0;
+        peer_mac_hi = 0;
+    }
 
     if (fastpath_mode) {
         return run_fastpath_endpoint_test(iterations, verbose, enable_peer_emu, peer_mac_lo, peer_mac_hi);
