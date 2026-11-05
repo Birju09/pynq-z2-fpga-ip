@@ -724,7 +724,7 @@ static void axi_rtps_check_learned_macs(struct axi_rtps_dev* dev) {
     if (rx_changed || arp_changed) {
         src_ip = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_IP_OFFSET);
         ports  = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_PORTS_OFFSET);
-        pr_info("axi_rtps: [Peer Discovery] Ingress MAC: %pM, ARP MAC: %pM (Peer IP: %pI4:%u)\n",
+        pr_info("axi_rtps: [Peer Discovery] Ingress MAC: %pM, ARP MAC: %pM (Peer IP: %pI4h:%u)\n",
                 dev->last_logged_ingress_mac, dev->last_logged_arp_mac,
                 &src_ip, (u16)(ports >> 16));
     }
@@ -932,7 +932,7 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
             arp_mac[0] = (u8)(arp_mac_hi >> 8);  arp_mac[1] = (u8)(arp_mac_hi & 0xFF);
             arp_mac[2] = (u8)(arp_mac_lo >> 24); arp_mac[3] = (u8)(arp_mac_lo >> 16);
             arp_mac[4] = (u8)(arp_mac_lo >> 8);  arp_mac[5] = (u8)(arp_mac_lo & 0xFF);
-            pr_err("axi_rtps: [Peer Info] Ingress MAC: %pM, ARP MAC: %pM, Peer IP: %pI4:%u\n",
+            pr_err("axi_rtps: [Peer Info] Ingress MAC: %pM, ARP MAC: %pM, Peer IP: %pI4h:%u\n",
                    rx_mac, arp_mac, &last_src_ip, (u16)(last_ports >> 16));
         }
         pr_err("axi_rtps: [S2MM DMA] DMACR=0x%08x, DMASR=0x%08x (50us: 0x%08x), CURDESC=0x%08x, TAILDESC=0x%08x (bd_phys=0x%08x)\n",
@@ -1235,7 +1235,7 @@ static ssize_t learned_macs_show(struct device* dev, struct device_attribute* at
     return scnprintf(buf, PAGE_SIZE,
                      "Ingress Learned MAC: %pM\n"
                      "ARP Learned MAC:     %pM\n"
-                     "Last RX Peer IP:     %pI4:%u (Reader CAM Slot %u)\n",
+                     "Last RX Peer IP:     %pI4h:%u (Reader CAM Slot %u)\n",
                      rx_mac, arp_mac, &src_ip, (u16)(ports >> 16), meta & 0x03U);
 }
 static DEVICE_ATTR_RO(learned_macs);

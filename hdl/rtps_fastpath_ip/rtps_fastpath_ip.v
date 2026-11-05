@@ -311,7 +311,7 @@ module rtps_fastpath_ip #(
     wire                mode_pub_only = ctrl_reg[8]; // Bit [8]: 1 = Publish-only mode (no RX feedback expected)
     wire                mode_sub_only = ctrl_reg[9]; // Bit [9]: 1 = Subscribe-only mode (unsolicited wire RX from S_IDLE)
 
-    assign s_axis_tready = (state == S_IDLE) && !mode_sub_only && !latest_valid;
+    assign s_axis_tready = (state == S_IDLE) && !mode_sub_only && (!latest_valid || (rx_ptr > 0));
     wire   rx_handshake  = s_axis_tvalid && s_axis_tready;
     wire   axis_wr       = rx_handshake && (state == S_IDLE);
 

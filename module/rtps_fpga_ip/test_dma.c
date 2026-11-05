@@ -580,8 +580,12 @@ static void* async_publisher_thread(void* arg) {
         }
 
         /* Asynchronous fire-and-forget DMA write */
-        if (DDS_DataWriter_write(ctx->plugin, &tx_sample) == 0) {
+        int rc = DDS_DataWriter_write(ctx->plugin, &tx_sample);
+        if (rc == 0) {
             ctx->published_count++;
+        } else {
+            fprintf(stderr, "[-] pub write failed at iter %d (rc=%d, errno=%d)\n", iter, rc, errno);
+            break;
         }
     }
     return NULL;
