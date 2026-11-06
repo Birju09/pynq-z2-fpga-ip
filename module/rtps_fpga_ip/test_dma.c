@@ -160,7 +160,201 @@ static double get_percentile(const double* sorted, int n, double pct) {
     return sorted[low] * (1.0 - weight) + sorted[high] * weight;
 }
 
-static int run_fastpath_endpoint_test(int iterations, int verbose, int enable_peer_emu, uint32_t peer_mac_lo, uint16_t peer_mac_hi) {
+struct async_fastpath_ctx {
+    struct fpga_fastpath* fpga;
+    int                   rate_hz;
+    int                   iterations;
+    volatile int          running;
+    uint32_t              published_count;
+    uint32_t              received_count;
+    double*               sub_latencies_us;
+};
+
+static void* async_fastpath_publisher_thread(void* arg) {
+    struct async_fastpath_ctx* ctx = (struct async_fastpath_ctx*)arg;
+    struct FastSample tx_sample;
+    memset(&tx_sample, 0, sizeof(tx_sample));
+
+    long period_ns = 1000000000L / (ctx->rate_hz > 0 ? ctx->rate_hz : 1000);
+    struct timespec next_tick;
+    clock_gettime(CLOCK_MONOTONIC, &next_tick);
+
+    for (int iter = 1; iter <= ctx->iterations && ctx->running; iter++) {
+        /* High-precision timer cadence */
+        next_tick.tv_nsec += period_ns;
+        while (next_tick.tv_nsec >= 1000000000L) {
+            next_tick.tv_sec++;
+            next_tick.tv_nsec -= 1000000000L;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
+
+        /* Pet watchdog every 64 cycles */
+        if ((iter & 0x3F) == 1) {
+            uint32_t pet = 1;
+            ioctl(ctx->fpga->fd, AXI_RTPS_IOC_PET_WATCHDOG, &pet);
+        }
+
+        /* Dynamically populate FastSample */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        tx_sample.cycle_id        = (uint32_t)iter;
+        tx_sample.flags           = 0x000000A5U ^ (uint32_t)iter;
+        tx_sample.tx_timestamp_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+        for (int i = 0; i < 1020; i++) {
+            tx_sample.payload[i] = (uint32_t)((iter << 16) ^ (0x5A000000U + ((i + 4) * 0x010103U)));
+        }
+
+        /* Asynchronous fire-and-forget DMA write */
+        int rc = fpga_fastpath_publish(ctx->fpga, 0, &tx_sample, sizeof(tx_sample), tx_sample.tx_timestamp_ns, 5000000);
+        if (rc == 0) {
+            ctx->published_count++;
+        } else {
+            fprintf(stderr, "[-] fastpath pub write failed at iter %d (rc=%d, errno=%d)\n", iter, rc, errno);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void* async_fastpath_subscriber_thread(void* arg) {
+    struct async_fastpath_ctx* ctx = (struct async_fastpath_ctx*)arg;
+    const void* rx_payload = NULL;
+    size_t rx_len = 0;
+    struct fpga_rx_metadata meta;
+
+    uint32_t fail_count = 0;
+    while (ctx->running && ctx->received_count < (uint32_t)ctx->iterations) {
+        memset(&meta, 0, sizeof(meta));
+        int rc = fpga_fastpath_take(ctx->fpga, 0, &rx_payload, &rx_len, &meta, 5000000);
+        if (rc == 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+
+            const struct FastSample* fs = (const struct FastSample*)rx_payload;
+            if (fs && fs->tx_timestamp_ns > 0 && now_ns >= fs->tx_timestamp_ns) {
+                double rtt_us = (double)(now_ns - fs->tx_timestamp_ns) / 1000.0;
+                if (ctx->received_count < (uint32_t)ctx->iterations) {
+                    ctx->sub_latencies_us[ctx->received_count] = rtt_us;
+                }
+            }
+            fpga_fastpath_release(ctx->fpga, rx_payload);
+            ctx->received_count++;
+            if (ctx->received_count % 200 == 0 || ctx->received_count == (uint32_t)ctx->iterations) {
+                printf("  Progress: [%u/%d] (%.1f%%)\n",
+                       ctx->received_count, ctx->iterations,
+                       ((double)ctx->received_count / ctx->iterations) * 100.0);
+                fflush(stdout);
+            }
+            if (ctx->received_count % 200 == 0 || ctx->received_count == (uint32_t)ctx->iterations) {
+                printf("  Progress: [%u/%d] (%.1f%%)\n",
+                       ctx->received_count, ctx->iterations,
+                       ((double)ctx->received_count / ctx->iterations) * 100.0);
+                fflush(stdout);
+            }
+        } else {
+            fail_count++;
+            if (fail_count <= 5 || fail_count % 1000 == 0) {
+                struct rtps_cycle_diag d;
+                if (ioctl(ctx->fpga->fd, AXI_RTPS_IOC_GET_DIAG, &d) == 0) {
+                    fprintf(stderr, "[-] fastpath sub take failed (rc=%d, errno=%d): IP Status=0x%08x (State=%u, IRQ_IS_RX=%u), TX=%u, RX=%u, CsumErr=%u, Stale=%u\n",
+                            rc, errno, d.status_reg, (d.status_reg >> 1) & 0xF, (d.status_reg >> 10) & 1,
+                            d.stat_tx_samples, d.stat_rx_samples, d.stat_csum_errs, d.stat_stale_drops);
+                }
+            }
+            usleep(100);
+        }
+    }
+    return NULL;
+}
+
+static int run_fastpath_async_pubsub_benchmark(struct fpga_fastpath* fpga, int iterations, int rate_hz) {
+    printf("=================================================================\n");
+    printf("     Option 1 Fast-Path Asynchronous Pub/Sub Benchmark \n");
+    printf("=================================================================\n");
+    printf("  Target Rate          : %d Hz (Period: %.1f us)\n", rate_hz, 1000000.0 / rate_hz);
+    printf("  Total Iterations     : %d\n", iterations);
+    printf("  Hardware Mode        : Asynchronous Stream Pipeline (CTRL[8]=1)\n");
+    printf("  Payload Size         : 4096 bytes TX / 4096 bytes RX (FastSample)\n");
+    printf("  Threads              : Dedicated Publisher Thread + Dedicated Subscriber Thread\n");
+    printf("=================================================================\n\n");
+
+    struct async_fastpath_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fpga            = fpga;
+    ctx.rate_hz         = rate_hz;
+    ctx.iterations      = iterations;
+    ctx.running         = 1;
+    ctx.sub_latencies_us= (double*)malloc(iterations * sizeof(double));
+    if (!ctx.sub_latencies_us) return 1;
+
+    pthread_t pub_tid, sub_tid;
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    pthread_create(&sub_tid, NULL, async_fastpath_subscriber_thread, &ctx);
+    pthread_create(&pub_tid, NULL, async_fastpath_publisher_thread, &ctx);
+
+    pthread_join(pub_tid, NULL);
+    /* Allow up to 1 second for remaining wire inflight frames to drain */
+    for (int drain = 0; drain < 100 && ctx.received_count < (uint32_t)iterations; drain++) {
+        usleep(10000);
+    }
+    ctx.running = 0;
+    pthread_join(sub_tid, NULL);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double total_sec = timespec_to_us(&t_start, &t_end) / 1e6;
+
+    printf("\n=================================================================\n");
+    printf("          OPTION 1 ASYNCHRONOUS BENCHMARK RESULTS                \n");
+    printf("=================================================================\n");
+    printf("  Elapsed Time         : %.3f s\n", total_sec);
+    printf("  Messages Published   : %u / %d  (Rate: %.1f Hz)\n",
+           ctx.published_count, iterations, (double)ctx.published_count / total_sec);
+    printf("  Messages Received    : %u / %d  (Rate: %.1f Hz)\n",
+           ctx.received_count, iterations, (double)ctx.received_count / total_sec);
+    printf("  Throughput           : %.2f MB/s TX / %.2f MB/s RX\n",
+           ((double)ctx.published_count * 4096.0) / (total_sec * 1e6),
+           ((double)ctx.received_count * 4096.0) / (total_sec * 1e6));
+
+    if (ctx.received_count > 0) {
+        qsort(ctx.sub_latencies_us, ctx.received_count, sizeof(double), compare_doubles);
+        double min_l = ctx.sub_latencies_us[0];
+        double max_l = ctx.sub_latencies_us[ctx.received_count - 1];
+        double p50_l = get_percentile(ctx.sub_latencies_us, ctx.received_count, 50.0);
+        double p95_l = get_percentile(ctx.sub_latencies_us, ctx.received_count, 95.0);
+        double p99_l = get_percentile(ctx.sub_latencies_us, ctx.received_count, 99.0);
+
+        printf("-----------------------------------------------------------------\n");
+        printf("  Asynchronous One-Way / Roundtrip Inflight Latencies:\n");
+        printf("    - Min Latency      : %8.2f us\n", min_l);
+        printf("    - p50 (Median)     : %8.2f us\n", p50_l);
+        printf("    - p95 Latency      : %8.2f us\n", p95_l);
+        printf("    - p99 Latency      : %8.2f us\n", p99_l);
+        printf("    - Max Latency      : %8.2f us\n", max_l);
+    }
+    printf("=================================================================\n");
+
+    struct rtps_cycle_diag d;
+    if (ioctl(fpga->fd, AXI_RTPS_IOC_GET_DIAG, &d) == 0) {
+        printf("\n  Hardware RTPS Fast-Path Diagnostics:\n");
+        printf("    - TX / RX Samples    : %u TX / %u RX (Frags/Cycle=3)\n",
+               d.stat_tx_samples, d.stat_rx_samples);
+        printf("    - Latest RX SeqNum   : %llu (Gaps=%u, StaleDrops=%u, CsumErrs=%u)\n",
+               (unsigned long long)d.last_rx_seq_num, d.stat_seq_gaps, d.stat_stale_drops, d.stat_csum_errs);
+        printf("    - Status Reg         : 0x%08x (State=%u, IRQ_IS_RX=%u)\n",
+               d.status_reg, (d.status_reg >> 1) & 0xF, (d.status_reg >> 10) & 1);
+        printf("    - Wire Cycle Ticks   : %u clocks (%.2f us @ 100 MHz)\n",
+               d.last_cycle_ticks, (double)d.last_cycle_ticks * 0.01);
+    }
+    printf("\n");
+
+    free(ctx.sub_latencies_us);
+    return 0;
+}
+
+static int run_fastpath_endpoint_test(int iterations, int verbose, int enable_peer_emu, uint32_t peer_mac_lo, uint16_t peer_mac_hi, int async_mode, int target_rate_hz) {
     printf("=================================================================\n");
     printf("  Option 1 Dedicated Hardware RTPS Endpoint API Verification\n");
     printf("=================================================================\n");
@@ -246,7 +440,9 @@ static int run_fastpath_endpoint_test(int iterations, int verbose, int enable_pe
            reader_ep.expected_dst_port, reader_ep.expected_remote_src_ip);
 
     /* Step 4: Atomic Commit */
-    fpga->cfg.enable_peer_emu = enable_peer_emu ? 1 : 0;
+    fpga->cfg.enable_peer_emu     = enable_peer_emu ? 1 : 0;
+    fpga->cfg.mode_pub_only       = async_mode ? 1 : 0;
+    fpga->cfg.plugin_rx_rtps_mode = 0; /* Option 1 FastSample direct mode */
     rc = fpga_commit_endpoints(fpga, 1);
     if (rc < 0) {
         fprintf(stderr, "[-] fpga_commit_endpoints failed: %s (%d)\n", strerror(-rc), rc);
@@ -254,6 +450,12 @@ static int run_fastpath_endpoint_test(int iterations, int verbose, int enable_pe
         return 1;
     }
     printf("[+] Step 4: fpga_commit_endpoints() atomically committed Generation 1\n\n");
+
+    if (async_mode) {
+        int ret = run_fastpath_async_pubsub_benchmark(fpga, iterations, target_rate_hz);
+        fpga_fastpath_close(fpga);
+        return ret;
+    }
 
     /* Step 5: Benchmark Loop */
     printf("[+] Step 5: Executing %d Cyclic Fast-Path Publish / Take Iterations...\n", iterations);
@@ -612,6 +814,12 @@ static void* async_subscriber_thread(void* arg) {
                 }
             }
             ctx->received_count++;
+            if (ctx->received_count % 200 == 0 || ctx->received_count == (uint32_t)ctx->iterations) {
+                printf("  Progress: [%u/%d] (%.1f%%)\n",
+                       ctx->received_count, ctx->iterations,
+                       ((double)ctx->received_count / ctx->iterations) * 100.0);
+                fflush(stdout);
+            }
         } else {
             fail_count++;
             if (fail_count <= 5 || fail_count % 1000 == 0) {
@@ -836,7 +1044,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (fastpath_mode) {
-        return run_fastpath_endpoint_test(iterations, verbose, enable_peer_emu, peer_mac_lo, peer_mac_hi);
+        return run_fastpath_endpoint_test(iterations, verbose, enable_peer_emu, peer_mac_lo, peer_mac_hi, async_mode, target_rate_hz);
     }
 
     latencies_roundtrip = (double*)malloc(iterations * sizeof(double));

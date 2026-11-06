@@ -148,6 +148,32 @@ static int map_gic_spi(int irq_val) {
     return irq_create_of_mapping(&oirq);
 }
 
+static int axi_dma_reset_mm2s(struct axi_rtps_dev* dev) {
+    int timeout = 1000;
+    dma_write(dev, XAXIDMA_MM2S_DMACR_OFFSET, XAXIDMA_CR_RESET_MASK);
+    while (timeout--) {
+        u32 mm2s_cr = dma_read(dev, XAXIDMA_MM2S_DMACR_OFFSET);
+        if (!(mm2s_cr & XAXIDMA_CR_RESET_MASK))
+            return 0;
+        udelay(1);
+    }
+    pr_err("axi_rtps: MM2S reset timeout\n");
+    return -ETIMEDOUT;
+}
+
+static int axi_dma_reset_s2mm(struct axi_rtps_dev* dev) {
+    int timeout = 1000;
+    dma_write(dev, XAXIDMA_S2MM_DMACR_OFFSET, XAXIDMA_CR_RESET_MASK);
+    while (timeout--) {
+        u32 s2mm_cr = dma_read(dev, XAXIDMA_S2MM_DMACR_OFFSET);
+        if (!(s2mm_cr & XAXIDMA_CR_RESET_MASK))
+            return 0;
+        udelay(1);
+    }
+    pr_err("axi_rtps: S2MM reset timeout\n");
+    return -ETIMEDOUT;
+}
+
 static int axi_dma_reset(struct axi_rtps_dev* dev) {
     int timeout = 10000;
 
@@ -616,7 +642,25 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 }
 
 static int axi_rtps_open(struct inode* inode, struct file* file) {
-    file->private_data = &rtps_device;
+    struct axi_rtps_dev* dev = &rtps_device;
+    file->private_data = dev;
+    dev->crc_err        = 0;
+    dev->no_match_err   = 0;
+    dev->rx_timeout_err = 0;
+    dev->csum_err       = 0;
+    dev->tx_err         = 0;
+    dev->rx_err         = 0;
+    dev->rx_packet_avail= 0;
+
+    if (dev->ip_regs) {
+        u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+        u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+        if (cur_state != 0) {
+            /* Clear any stranded hardware state from prior aborted runs */
+            iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+            iowrite32(0, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+        }
+    }
     return 0;
 }
 
@@ -625,6 +669,16 @@ static int axi_rtps_release(struct inode* inode, struct file* file) {
     if (dev) {
         dev->tx_user_addr = 0;
         dev->rx_user_addr = 0;
+        if (dev->ip_regs) {
+            u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+            if (cur_state != 0) {
+                iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+                iowrite32(0, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+            }
+        }
+        axi_dma_reset_mm2s(dev);
+        axi_dma_reset_s2mm(dev);
     }
     return 0;
 }
@@ -773,7 +827,10 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     if (dev->ip_regs) {
         u32 initial_status = dev->pre_read_ip_status;
         u8 initial_state = (initial_status & RTPS_STATUS_STATE_MASK) >> 1;
-        if (initial_state != 5 && initial_state != 6 && !dev->rx_packet_avail) {
+        bool sample_ready = dev->rx_packet_avail ||
+                            (initial_state == 6) ||
+                            ((initial_state == 5) && (initial_status & RTPS_STATUS_IRQ_IS_RX));
+        if (!sample_ready) {
             ret = wait_event_interruptible_timeout(dev->rx_packet_waitq,
                                                    dev->rx_packet_avail != 0,
                                                    msecs_to_jiffies(3000));
@@ -824,9 +881,9 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
         int poll_us;
         u32 live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         u8 cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
-        if (cur_state == 5) {
+        if (cur_state == 5 && (live_status & RTPS_STATUS_IRQ_IS_RX)) {
             int ack_wait;
-            /* If IP is still holding S_DONE_IRQ, ACK IRQ first to transition to S_WAIT_EGRESS */
+            /* If IP is still holding S_DONE_IRQ for RX sample, ACK IRQ first to transition to S_WAIT_EGRESS */
             iowrite32(RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
             for (ack_wait = 0; ack_wait < 32; ack_wait++) {
                 live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
@@ -846,7 +903,7 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
         /*
          * Poll for S2MM completion (up to 2000 us in 1 us steps; 1039 words @ 100MHz = 10.4 us).
          * If m_axis_tlast is not wired to s_axis_s2mm_tlast in the Vivado Block Design,
-         * AXI DMA S2MM bursts all 1,039 words into dev->rx_buf in DDR memory and the IP
+         * AXI DMA S2MM bursts all words into dev->rx_buf in DDR memory and the IP
          * FSM returns from S_TX_RUN to S_IDLE (State 0), while S2MM SG awaits TLAST before
          * setting BD_STS.CMPLT or firing S2MM IOC_Irq. We detect both normal BD completion
          * and TLAST-unwired DDR completion cleanly.
@@ -867,6 +924,7 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
             udelay(1);
         }
 
+        live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         dev->post_50us_ip_status  = live_status;
         dev->post_50us_s2mm_dmasr = dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET);
         dev->post_50us_bd_status  = dev->rx_bd->status;
@@ -876,16 +934,18 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                 (dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_IOC_MASK)) {
                 dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
                           dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_ALL_MASK);
-                axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
                 dev->rx_done = 1;
             } else if (((live_status & RTPS_STATUS_STATE_MASK) >> 1) == 0) {
-                axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
-                axi_dma_reset(dev);
+                /*
+                 * TLAST-unwired fallback: IP has completed egress streaming to DDR.
+                 * Reset ONLY S2MM channel so S2MM BD engine is cleared for the next transfer.
+                 * MM2S is NEVER touched so concurrent asynchronous publish continues cleanly!
+                 */
+                axi_dma_reset_s2mm(dev);
                 dev->rx_done = 1;
             }
-        } else {
-            axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
         }
+        axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
     }
 
     /* Wait for S2MM completion interrupt if not already completed above */
@@ -950,7 +1010,7 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                dev->rx_buf_sample_words[6]);
         pr_err("axi_rtps: =============================================================\n");
 
-        axi_dma_reset(dev);
+        axi_dma_reset_s2mm(dev);
         mutex_unlock(&dev->rx_lock);
         return -ETIMEDOUT;
     } else if (ret < 0) {
@@ -1080,8 +1140,7 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     if (ret == 0) {
         pr_err("axi_rtps: MM2S TX DMA timed out (DMASR: 0x%08x, BD STS: 0x%08x)\n",
                dma_read(dev, XAXIDMA_MM2S_DMASR_OFFSET), dev->tx_bd->status);
-        axi_dma_reset(dev);
-        mutex_unlock(&dev->tx_lock);
+        axi_dma_reset_mm2s(dev);
         return -ETIMEDOUT;
     } else if (ret < 0) {
         mutex_unlock(&dev->tx_lock);

@@ -436,7 +436,7 @@ module tb_rtps_fastpath;
         $display("==================================================================");
         axi_write(10'h048, 32'h0000_0002); // FAULT_INJECT bit 1 = swap Frag #0 and Frag #1
         axi_write(10'h00C, 32'h0000_0000); // Bypass ingress CRC for manual trigger
-        axi_write(10'h004, 32'h0000_0001); // Trigger cycle manually
+        axi_write(10'h004, 32'h0000_0004); // Trigger cycle manually (Bit 2: MANUAL_TRIG)
 
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
@@ -489,7 +489,7 @@ module tb_rtps_fastpath;
         $display("  TEST 3: Stale SequenceNumber Rejection (seqNum does not advance)");
         $display("==================================================================");
         axi_write(10'h048, 32'h0000_0008); // FAULT_INJECT bit 3 = repeat stale seqNum
-        axi_write(10'h004, 32'h0000_0001); // Trigger cycle
+        axi_write(10'h004, 32'h0000_0004); // Trigger cycle (Bit 2: MANUAL_TRIG)
 
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
@@ -513,7 +513,7 @@ module tb_rtps_fastpath;
         $display("  TEST 4: Corrupted UDP Checksum Detection (FAULT_INJECT bit 2)");
         $display("==================================================================");
         axi_write(10'h048, 32'h0000_0004); // FAULT_INJECT bit 2 = corrupt UDP checksum
-        axi_write(10'h004, 32'h0000_0001); // Trigger cycle
+        axi_write(10'h004, 32'h0000_0004); // Trigger cycle (Bit 2: MANUAL_TRIG)
 
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
@@ -542,7 +542,7 @@ module tb_rtps_fastpath;
         axi_write(10'h008, 32'h0000_0053); // Enable watchdog (bit 6 = 1)
         repeat (80) @(posedge clk);        // Wait for watchdog to expire
 
-        axi_write(10'h004, 32'h0000_0001); // Attempt cycle kick while watchdog expired
+        axi_write(10'h004, 32'h0000_0004); // Attempt cycle kick while watchdog expired (Bit 2: MANUAL_TRIG)
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
         $display("[+] Watchdog Expired STATUS=0x%08X (WDOG_EXPIRED=%b, ERR_NO_MATCH=%b)",
@@ -1006,7 +1006,7 @@ module tb_rtps_fastpath;
         $display("==================================================================");
         // Subtest A: Invalidate local_identity_valid
         axi_write(10'h07C, 32'h0000_0002); // writer_context_valid=1, local_identity_valid=0
-        axi_write(10'h004, 32'h0000_0001); // Attempt cycle kick
+        axi_write(10'h004, 32'h0000_0004); // Attempt cycle kick (Bit 2: MANUAL_TRIG)
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
         if (status_val[6] !== 1'b1) begin // ERR_NO_MATCH
@@ -1021,7 +1021,7 @@ module tb_rtps_fastpath;
         // Subtest B: Restore identity, but invalidate type profile contract (e.g. bit 19 keyed=1)
         axi_write(10'h07C, 32'h0000_0003); // local_identity_valid=1, writer_context_valid=1
         axi_write(10'h188, 32'h000F_0101); // Bit 19 = 1 (keyed topic unsupported in v1)
-        axi_write(10'h004, 32'h0000_0001); // Attempt cycle kick
+        axi_write(10'h004, 32'h0000_0004); // Attempt cycle kick (Bit 2: MANUAL_TRIG)
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
         if (status_val[6] !== 1'b1) begin // ERR_NO_MATCH
@@ -1079,7 +1079,7 @@ module tb_rtps_fastpath;
         end
 
         // Attempt cycle kick while DRAINING -> must assert ERR_NO_MATCH
-        axi_write(10'h004, 32'h0000_0001);
+        axi_write(10'h004, 32'h0000_0004); // Attempt cycle kick (Bit 2: MANUAL_TRIG)
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
         if (status_val[6] !== 1'b1) begin
@@ -1105,7 +1105,7 @@ module tb_rtps_fastpath;
         end
 
         // Attempt cycle kick while DISABLED -> must assert ERR_NO_MATCH
-        axi_write(10'h004, 32'h0000_0001);
+        axi_write(10'h004, 32'h0000_0004); // Attempt cycle kick (Bit 2: MANUAL_TRIG)
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
         if (status_val[6] !== 1'b1) begin

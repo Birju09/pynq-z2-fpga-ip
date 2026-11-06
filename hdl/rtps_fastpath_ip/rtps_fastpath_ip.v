@@ -691,6 +691,10 @@ module rtps_fastpath_ip #(
                             (mode_sub_only ? any_reader_valid :
                                               (wr0_valid && wr0_lifecycle_active && wr0_route_valid && writer_context_valid));
 
+    // Config-only inputs; one cycle of staleness is harmless and keeps this cone off the FSM CE paths.
+    reg lifecycle_ok_q;
+    always @(posedge clk) lifecycle_ok_q <= lifecycle_ok;
+
     always @(posedge clk) begin
         if (!rst_n) begin
             s_axi_arready <= 1'b0;
@@ -869,7 +873,8 @@ module rtps_fastpath_ip #(
         R_INFO_DST_1      = 5'd21, // Latch INFO_DST GuidPrefix[63:32]
         R_INFO_DST_2      = 5'd22, // Latch INFO_DST GuidPrefix[31:0]
         R_DATA_READER_ID  = 5'd23, // Check DATA readerEntityId against local reader / ENTITYID_UNKNOWN
-        R_REASM_CHECK     = 5'd24; // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
+        R_REASM_CHECK     = 5'd24, // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
+        R_CAM_MATCH       = 5'd25; // Reader CAM compare on fully registered GuidPrefix (breaks BRAM-to-compare critical path)
 
     reg [4:0]  rx_state;
     reg [11:0] rx_wire_beat;
@@ -998,7 +1003,6 @@ module rtps_fastpath_ip #(
                                         (walk_dst_guid_prefix == local_guid_prefix);
 
     // 4-Entry Reader CAM Match on GuidPrefix, Lifecycle, Expected Port & Expected Source IP
-    // Optimization: walker_dout[31:0] is the last word of the RTPS header (GuidPrefix[31:0]), so we can compare all 3 words in a single cycle instead of waiting for 1 cycle to populate the 3rd word of walk_guid_prefix.
     wire rd0_active = active_rd_edt[0][0][0] && (active_rd_edt[0][0][3:1] == 3'd2);
     wire rd1_active = active_rd_edt[1][0][0] && (active_rd_edt[1][0][3:1] == 3'd2);
     wire rd2_active = active_rd_edt[2][0][0] && (active_rd_edt[2][0][3:1] == 3'd2);
@@ -1014,10 +1018,10 @@ module rtps_fastpath_ip #(
     wire rd2_ip_ok   = (active_rd_edt[2][6] == 32'd0) || (rx_src_ip == active_rd_edt[2][6]);
     wire rd3_ip_ok   = (active_rd_edt[3][6] == 32'd0) || (rx_src_ip == active_rd_edt[3][6]);
 
-    wire cam_hit_0 = rd0_active && rd0_port_ok && rd0_ip_ok && ({active_rd_edt[0][1], active_rd_edt[0][2], active_rd_edt[0][3]} == {walk_guid_prefix[95:32], walker_dout});
-    wire cam_hit_1 = rd1_active && rd1_port_ok && rd1_ip_ok && ({active_rd_edt[1][1], active_rd_edt[1][2], active_rd_edt[1][3]} == {walk_guid_prefix[95:32], walker_dout});
-    wire cam_hit_2 = rd2_active && rd2_port_ok && rd2_ip_ok && ({active_rd_edt[2][1], active_rd_edt[2][2], active_rd_edt[2][3]} == {walk_guid_prefix[95:32], walker_dout});
-    wire cam_hit_3 = rd3_active && rd3_port_ok && rd3_ip_ok && ({active_rd_edt[3][1], active_rd_edt[3][2], active_rd_edt[3][3]} == {walk_guid_prefix[95:32], walker_dout});
+    wire cam_hit_0 = rd0_active && rd0_port_ok && rd0_ip_ok && ({active_rd_edt[0][1], active_rd_edt[0][2], active_rd_edt[0][3]} == walk_guid_prefix);
+    wire cam_hit_1 = rd1_active && rd1_port_ok && rd1_ip_ok && ({active_rd_edt[1][1], active_rd_edt[1][2], active_rd_edt[1][3]} == walk_guid_prefix);
+    wire cam_hit_2 = rd2_active && rd2_port_ok && rd2_ip_ok && ({active_rd_edt[2][1], active_rd_edt[2][2], active_rd_edt[2][3]} == walk_guid_prefix);
+    wire cam_hit_3 = rd3_active && rd3_port_ok && rd3_ip_ok && ({active_rd_edt[3][1], active_rd_edt[3][2], active_rd_edt[3][3]} == walk_guid_prefix);
 
     // Helper for endian-aware 16-bit extraction
     wire        submsg_e_flag = walker_dout[16]; // Bit 0 of flags byte (walker_dout[23:16])
@@ -1232,7 +1236,8 @@ module rtps_fastpath_ip #(
 
     wire                  plugin_rx_rtps_mode = ctrl_reg[7];
     wire [11:0]           egress_start_word   = plugin_rx_rtps_mode ? 12'd2 : latest_payload_word_off;
-    wire [ADDR_WIDTH:0]   egress_total_words  = plugin_rx_rtps_mode ? latest_rtps_words : pkt_len;
+    wire [ADDR_WIDTH:0]   egress_total_words  = plugin_rx_rtps_mode ? latest_rtps_words :
+                                                ((pkt_len > 0) ? pkt_len : cfg_payload_words[ADDR_WIDTH:0]);
 
     assign m_axis_tkeep = {(DATA_WIDTH/8){1'b1}};
     wire   tx_handshake = m_axis_tvalid && m_axis_tready;
@@ -1618,6 +1623,11 @@ module rtps_fastpath_ip #(
                 R_RTPS_GUID_2: begin
                     walk_guid_prefix[31:0] <= walker_dout;
                     walk_cur_word          <= 12'd7;
+                    rx_state               <= R_CAM_MATCH;
+                end
+
+                // walker_rd_addr still points at Word 7, so walker_dout holds the first submessage header on exit
+                R_CAM_MATCH: begin
                     if (cam_hit_0) begin
                         walk_cam_hit <= 1'b1;
                         walk_cam_idx <= 2'd0;
@@ -1917,7 +1927,7 @@ module rtps_fastpath_ip #(
                         end else begin
                             rx_ptr  <= rx_ptr + 1'b1;
                         end
-                    end else if ((trigger_detected || (status_write_pulse && (status_write_data[2] || status_write_data[0]))) && !mode_sub_only) begin
+                    end else if ((trigger_detected || (status_write_pulse && status_write_data[2])) && !mode_sub_only) begin
                         pkt_len <= cfg_payload_words[ADDR_WIDTH:0];
                         rx_ptr  <= 0;
                         state   <= S_CHECK_CRC;
@@ -1932,7 +1942,7 @@ module rtps_fastpath_ip #(
                     cur_tx_seq     <= writer_seq_num[0];
                     cycle_tick_cnt <= 32'd0;
 
-                    if (!lifecycle_ok) begin
+                    if (!lifecycle_ok_q) begin
                         // Q22: Disabled / watchdog expired / no valid writer match -> immediate ERR_NO_MATCH
                         err_no_match   <= 1'b1;
                         err_crc        <= 1'b0;
