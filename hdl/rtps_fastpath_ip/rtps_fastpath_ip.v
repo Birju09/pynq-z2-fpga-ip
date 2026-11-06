@@ -2134,9 +2134,12 @@ module rtps_fastpath_ip #(
                     if (status_write_pulse && status_write_data[0]) begin
                         ip_done_irq <= 1'b0;
                         if (err_crc || err_no_match || err_rx_timeout || (!irq_is_rx && mode_pub_only)) begin
-                            irq_is_rx <= 1'b0;
-                            rx_ptr    <= 0;
-                            state     <= S_IDLE;
+                            err_crc        <= 1'b0;
+                            err_no_match   <= 1'b0;
+                            err_rx_timeout <= 1'b0;
+                            irq_is_rx      <= 1'b0;
+                            rx_ptr         <= 0;
+                            state          <= S_IDLE;
                         end else begin
                             state     <= S_WAIT_EGRESS;
                         end

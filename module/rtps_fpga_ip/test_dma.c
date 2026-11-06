@@ -188,8 +188,8 @@ static void* async_fastpath_publisher_thread(void* arg) {
         }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
 
-        /* Pet watchdog every 64 cycles */
-        if ((iter & 0x3F) == 1) {
+        /* Pet watchdog every 16 cycles (<= 53 ms @ >= 300 Hz to prevent 100 ms hardware expiry) */
+        if ((iter & 0x0F) == 1) {
             uint32_t pet = 1;
             ioctl(ctx->fpga->fd, AXI_RTPS_IOC_PET_WATCHDOG, &pet);
         }
@@ -246,13 +246,9 @@ static void* async_fastpath_subscriber_thread(void* arg) {
                        ((double)ctx->received_count / ctx->iterations) * 100.0);
                 fflush(stdout);
             }
-            if (ctx->received_count % 200 == 0 || ctx->received_count == (uint32_t)ctx->iterations) {
-                printf("  Progress: [%u/%d] (%.1f%%)\n",
-                       ctx->received_count, ctx->iterations,
-                       ((double)ctx->received_count / ctx->iterations) * 100.0);
-                fflush(stdout);
-            }
         } else {
+            if (!ctx->running)
+                break;
             fail_count++;
             if (fail_count <= 5 || fail_count % 1000 == 0) {
                 struct rtps_cycle_diag d;
@@ -765,8 +761,8 @@ static void* async_publisher_thread(void* arg) {
         }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, NULL);
 
-        /* Pet watchdog every 64 cycles */
-        if ((iter & 0x3F) == 1) {
+        /* Pet watchdog every 16 cycles (<= 53 ms @ >= 300 Hz to prevent 100 ms hardware expiry) */
+        if ((iter & 0x0F) == 1) {
             uint32_t pet = 1;
             ioctl(ctx->fd, AXI_RTPS_IOC_PET_WATCHDOG, &pet);
         }
@@ -821,6 +817,8 @@ static void* async_subscriber_thread(void* arg) {
                 fflush(stdout);
             }
         } else {
+            if (!ctx->running)
+                break;
             fail_count++;
             if (fail_count <= 5 || fail_count % 1000 == 0) {
                 // Read CSRs to see why

@@ -366,6 +366,9 @@ static inline int FpgaTransport_init_plugin(
             return -ENOMEM;
     }
 
+    uint32_t bypass_crc = 1;
+    ioctl(fd, AXI_RTPS_IOC_SET_CRC_BYPASS, &bypass_crc);
+
     return 0;
 }
 
@@ -408,6 +411,14 @@ static inline int DDS_DataWriter_write(
     if (!plugin || !sample)
         return -EINVAL;
 
+    const char* tx_ptr = (const char*)sample;
+    if (plugin->use_mmap && plugin->tx_mmap_buf) {
+        if ((uint32_t*)sample != plugin->tx_mmap_buf) {
+            memcpy(plugin->tx_mmap_buf, sample, sizeof(struct FastSample));
+        }
+        tx_ptr = (const char*)plugin->tx_mmap_buf;
+    }
+
     uint32_t dummy_rtps_hdr[RTPS_WIRE_HEADER_WORDS];
     NDDS_Transport_Buffer_t iov[2];
     NDDS_Transport_SendResource_t sr = (NDDS_Transport_SendResource_t)plugin;
@@ -416,7 +427,7 @@ static inline int DDS_DataWriter_write(
 
     iov[0].pointer = (char*)dummy_rtps_hdr;
     iov[0].length  = RTPS_WIRE_HEADER_BYTES; /* 60B stripped by Option B plugin->send() */
-    iov[1].pointer = (char*)sample;
+    iov[1].pointer = (char*)tx_ptr;
     iov[1].length  = sizeof(struct FastSample); /* 4,096B DMA'd directly to FPGA */
 
     int32_t ok = plugin->send(plugin, &sr, &dst_addr, 7410, 0, iov, 2, NULL);
