@@ -120,19 +120,6 @@ int main(void) {
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof buf_sz);
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof buf_sz);
 
-    /*
-     * CRITICAL: Hardware PL RMII PHY does NOT implement the ARP protocol.
-     * Ensure the OS kernel has a permanent static ARP neighbor entry mapping
-     * 192.168.1.10 and 192.168.1.201 to the FPGA PL RMII MAC 02:00:5e:10:00:01.
-     * Without this, the host OS kernel drops 99.9% of echoed UDP packets
-     * while waiting for ARP replies that the FPGA hardware never generates!
-     */
-    printf("[+] Ensuring static ARP entries for FPGA RMII PHY (02:00:5e:10:00:01)...\n");
-    system("ip neigh replace 192.168.1.10 lladdr 02:00:5e:10:00:01 nud permanent 2>/dev/null || "
-           "arp -s 192.168.1.10 02:00:5e:10:00:01 2>/dev/null");
-    system("ip neigh replace 192.168.1.201 lladdr 02:00:5e:10:00:01 nud permanent 2>/dev/null || "
-           "arp -s 192.168.1.201 02:00:5e:10:00:01 2>/dev/null");
-
     struct sockaddr_in local = {0};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(INADDR_ANY);
