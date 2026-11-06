@@ -56,12 +56,14 @@ struct axi_rtps_dev {
     /* Synchronization & Diagnostics */
     struct mutex tx_lock;
     struct mutex rx_lock;
+    struct mutex dma_hw_lock;
     wait_queue_head_t tx_waitq;
     wait_queue_head_t rx_waitq;
     wait_queue_head_t ip_waitq;
     wait_queue_head_t tx_ip_waitq;
     wait_queue_head_t rx_packet_waitq;
     u32 mode_pub_only;
+    volatile int tx_in_flight;
     int tx_done;
     int rx_done;
     int ip_done;
@@ -166,8 +168,32 @@ static int axi_dma_reset_s2mm(struct axi_rtps_dev* dev) {
     dma_write(dev, XAXIDMA_S2MM_DMACR_OFFSET, XAXIDMA_CR_RESET_MASK);
     while (timeout--) {
         u32 s2mm_cr = dma_read(dev, XAXIDMA_S2MM_DMACR_OFFSET);
-        if (!(s2mm_cr & XAXIDMA_CR_RESET_MASK))
+        if (!(s2mm_cr & XAXIDMA_CR_RESET_MASK)) {
+            /*
+             * In Xilinx AXI DMA (PG021), S2MM_DMACR.Reset is a shared core reset
+             * that also resets the MM2S channel. If an MM2S transfer was armed
+             * and waiting on s_axis_tready (tx_in_flight == 1), re-arm MM2S
+             * immediately so the publisher transfer seamlessly resumes!
+             */
+            rmb();
+            if (dev->tx_in_flight && !dev->tx_done) {
+                if (dev->tx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK) {
+                    dev->tx_done = 1;
+                    dev->tx_in_flight = 0;
+                    wake_up_interruptible(&dev->tx_waitq);
+                } else {
+                    wmb();
+                    dma_write(dev, XAXIDMA_MM2S_DMASR_OFFSET, XAXIDMA_SR_IRQ_ALL_MASK);
+                    dma_write(dev, XAXIDMA_MM2S_CURDESC_OFFSET, (u32)dev->tx_bd_phys);
+                    dma_write(dev, XAXIDMA_MM2S_DMACR_OFFSET,
+                              XAXIDMA_CR_RUNSTOP_MASK | XAXIDMA_CR_IRQ_IOC_MASK |
+                                  XAXIDMA_CR_IRQ_ERR_MASK);
+                    wmb();
+                    dma_write(dev, XAXIDMA_MM2S_TAILDESC_OFFSET, (u32)dev->tx_bd_phys);
+                }
+            }
             return 0;
+        }
         udelay(1);
     }
     pr_err("axi_rtps: S2MM reset timeout\n");
@@ -262,8 +288,6 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
                 dev->crc_err = 1;
                 pr_err("axi_rtps: DMA0 ingress CRC-32 mismatch! Calc: 0x%08x, Status: 0x%08x\n",
                        calc_crc, ip_status);
-                iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
-                iowrite32(0, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
             } else {
                 dev->crc_err = 0;
             }
@@ -378,6 +402,15 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                 iowrite32(cfg.readers[i].writer_entity_id,  dev->ip_regs + RTPS_RD_WRITER_ID(i));
                 iowrite32(cfg.readers[i].reader_entity_id,  dev->ip_regs + RTPS_RD_READER_ID(i));
                 iowrite32(cfg.readers[i].expected_src_ip,   dev->ip_regs + RTPS_RD_SRC_IP(i));
+            }
+
+            /* Ensure watchdog is freshly petted and FSM is in S_IDLE before EDT commit */
+            iowrite32(1, dev->ip_regs + RTPS_IP_WDOG_HEARTBEAT_OFFSET);
+            {
+                u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+                u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+                if (cur_state != 0)
+                    iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
             }
 
             /* Atomically commit Shadow -> Active EDT at S_IDLE boundary */
@@ -623,8 +656,16 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             if ((val & 0x000F0000U) == 0)
                 iowrite32(RTPS_TYPE_PROFILE_RTI_DEFAULT, dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
 
+            iowrite32(1, dev->ip_regs + RTPS_IP_WDOG_HEARTBEAT_OFFSET);
+            {
+                u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+                u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+                if (cur_state != 0)
+                    iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+            }
+
             ctrl_word = ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET);
-            ctrl_word |= RTPS_CTRL_ENABLE | RTPS_CTRL_EMU_EN | RTPS_CTRL_COMMIT_EDT;
+            ctrl_word |= RTPS_CTRL_ENABLE | RTPS_CTRL_COMMIT_EDT;
             iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
 
             if (gen > 0) {
@@ -652,15 +693,16 @@ static int axi_rtps_open(struct inode* inode, struct file* file) {
     dev->tx_err         = 0;
     dev->rx_err         = 0;
     dev->rx_packet_avail= 0;
+    dev->tx_in_flight   = 0;
     dev->bypass_crc     = 1;
 
     if (dev->ip_regs) {
         u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+        iowrite32(1, dev->ip_regs + RTPS_IP_WDOG_HEARTBEAT_OFFSET);
         if (cur_state != 0) {
-            /* Clear any stranded hardware state from prior aborted runs */
+            /* Single write to TRIGGER_OFFSET resets non-IDLE FSM back to S_IDLE */
             iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
-            iowrite32(0, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
         }
     }
     return 0;
@@ -671,16 +713,17 @@ static int axi_rtps_release(struct inode* inode, struct file* file) {
     if (dev) {
         dev->tx_user_addr = 0;
         dev->rx_user_addr = 0;
+        dev->tx_in_flight = 0;
         if (dev->ip_regs) {
             u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
             u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
             if (cur_state != 0) {
                 iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
-                iowrite32(0, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
             }
         }
-        axi_dma_reset_mm2s(dev);
-        axi_dma_reset_s2mm(dev);
+        mutex_lock(&dev->dma_hw_lock);
+        axi_dma_reset(dev);
+        mutex_unlock(&dev->dma_hw_lock);
     }
     return 0;
 }
@@ -851,6 +894,13 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
         dev->rx_packet_avail = 0;
     }
 
+    /*
+     * Acquire dma_hw_lock around the ~10.4 us S2MM hardware burst and reset
+     * so that XAXIDMA_CR_RESET_MASK (which resets both channels in Xilinx AXI DMA)
+     * never collides with an active MM2S transfer in axi_rtps_write().
+     */
+    mutex_lock(&dev->dma_hw_lock);
+
     /* Setup S2MM Buffer Descriptor */
     memset(dev->rx_bd, 0, sizeof(*dev->rx_bd));
     dev->rx_bd->next_desc = (u32)dev->rx_bd_phys;
@@ -954,9 +1004,24 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
             } else if (cur_state != 7) {
                 /*
                  * TLAST-unwired fallback: IP has completed egress streaming to DDR.
-                 * Reset ONLY S2MM channel so S2MM BD engine is cleared for the next transfer.
-                 * MM2S is NEVER touched so concurrent asynchronous publish continues cleanly!
+                 * If an MM2S transfer was waiting at s_axis_tready while S_WAIT_EGRESS / S_TX_RUN
+                 * was active, it begins its 10.2 us burst the instant S_TX_RUN transitions to S_IDLE.
+                 * Wait for any in-flight MM2S burst to complete before issuing XAXIDMA_CR_RESET_MASK
+                 * (which is a global dual-channel reset in Xilinx AXI DMA hardware).
                  */
+                if (dev->tx_in_flight) {
+                    int tx_wait_us;
+                    for (tx_wait_us = 0; tx_wait_us < 100; tx_wait_us++) {
+                        rmb();
+                        if (dev->tx_done || (dev->tx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK)) {
+                            dev->tx_done = 1;
+                            dev->tx_in_flight = 0;
+                            wake_up_interruptible(&dev->tx_waitq);
+                            break;
+                        }
+                        udelay(1);
+                    }
+                }
                 axi_dma_reset_s2mm(dev);
                 dev->rx_done = 1;
             }
@@ -967,6 +1032,9 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
         }
         axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
     }
+
+    mutex_unlock(&dev->dma_hw_lock);
+    wake_up_interruptible(&dev->tx_ip_waitq);
 
     /* Wait for S2MM completion interrupt if not already completed above */
     if (!dev->rx_done) {
@@ -1111,6 +1179,28 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         crc = 0;
     }
 
+    /*
+     * If the IP is currently holding an RX sample in S_DONE_IRQ (5), S_WAIT_EGRESS (6),
+     * or S_TX_RUN (7), wait briefly for the subscriber thread in axi_rtps_read() to drain
+     * egress and return the IP to S_IDLE (0) before arming MM2S.
+     */
+    {
+        int egress_wait;
+        for (egress_wait = 0; egress_wait < 5000; egress_wait++) {
+            u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            u8 cur_st = (st & RTPS_STATUS_STATE_MASK) >> 1;
+            if (cur_st != 5 && cur_st != 6 && cur_st != 7)
+                break;
+            if (cur_st == 6 || (cur_st == 5 && (st & RTPS_STATUS_IRQ_IS_RX))) {
+                dev->rx_packet_avail = 1;
+                wake_up_interruptible(&dev->rx_packet_waitq);
+            }
+            udelay(2);
+        }
+    }
+
+    mutex_lock(&dev->dma_hw_lock);
+
     dev->last_ip_status        = 0;
     dev->pre_write_ip_status   = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
     dev->isr_pre_ack_ip_status = 0;
@@ -1125,6 +1215,7 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     dev->csum_err              = 0;
     dev->tx_done               = 0;
     dev->tx_err                = 0;
+    dev->tx_in_flight          = 1;
 
     /* Rule 1a: Program expected CRC into IP (does NOT leave S_IDLE) */
     iowrite32(crc, dev->ip_regs + RTPS_IP_CRC_OFFSET);
@@ -1154,13 +1245,57 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     wmb();
     dma_write(dev, XAXIDMA_MM2S_TAILDESC_OFFSET, (u32)dev->tx_bd_phys);
 
-    /* Wait for MM2S DMA transfer completion */
-    ret = wait_event_interruptible_timeout(dev->tx_waitq, dev->tx_done != 0,
-                                           msecs_to_jiffies(3000));
+    /*
+     * Poll up to 50 us for the 10.2 us MM2S burst (1,024 words @ 100 MHz) to complete
+     * while holding dma_hw_lock. If an RX wire packet entered S_DONE_IRQ (5) or
+     * S_WAIT_EGRESS (6) in the nanosecond window before s_axis_tvalid, release
+     * dma_hw_lock so axi_rtps_read() can drain the RX packet first.
+     */
+    {
+        int poll_us;
+        for (poll_us = 0; poll_us < 50; poll_us++) {
+            u32 st;
+            u8 cur_st;
+            rmb();
+            if (dev->tx_done || (dev->tx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK)) {
+                dev->tx_done = 1;
+                dev->tx_in_flight = 0;
+                break;
+            }
+            st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            cur_st = (st & RTPS_STATUS_STATE_MASK) >> 1;
+            if (cur_st == 5 || cur_st == 6 || cur_st == 7) {
+                if (cur_st == 6 || (cur_st == 5 && (st & RTPS_STATUS_IRQ_IS_RX))) {
+                    dev->rx_packet_avail = 1;
+                    wake_up_interruptible(&dev->rx_packet_waitq);
+                }
+                break;
+            }
+            udelay(1);
+        }
+    }
+
+    mutex_unlock(&dev->dma_hw_lock);
+
+    /* Wait for MM2S DMA transfer completion if not already finished above */
+    if (!dev->tx_done) {
+        ret = wait_event_interruptible_timeout(
+            dev->tx_waitq,
+            dev->tx_done != 0 || (dev->tx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK),
+            msecs_to_jiffies(3000));
+        if (dev->tx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK)
+            ret = 1;
+    } else {
+        ret = 1;
+    }
+    dev->tx_in_flight = 0;
+
     if (ret == 0) {
         pr_err("axi_rtps: MM2S TX DMA timed out (DMASR: 0x%08x, BD STS: 0x%08x)\n",
                dma_read(dev, XAXIDMA_MM2S_DMASR_OFFSET), dev->tx_bd->status);
+        mutex_lock(&dev->dma_hw_lock);
         axi_dma_reset_mm2s(dev);
+        mutex_unlock(&dev->dma_hw_lock);
         mutex_unlock(&dev->tx_lock);
         return -ETIMEDOUT;
     } else if (ret < 0) {
@@ -1195,9 +1330,11 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     dev->post_write_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
     if (ret == 0) {
         u32 status = dev->post_write_ip_status;
+        u8 cur_st = (status & RTPS_STATUS_STATE_MASK) >> 1;
         pr_err("axi_rtps: RTPS cycle wait timed out (status: 0x%08x [State %u], pre_write: 0x%08x)\n",
-               status, (status & RTPS_STATUS_STATE_MASK) >> 1, dev->pre_write_ip_status);
-        iowrite32(0, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+               status, cur_st, dev->pre_write_ip_status);
+        if (cur_st != 0)
+            iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
         mutex_unlock(&dev->tx_lock);
         return -ETIMEDOUT;
     } else if (ret < 0) {
@@ -1341,6 +1478,7 @@ static int axi_rtps_probe(struct platform_device* pdev) {
 
     mutex_init(&dmadev->tx_lock);
     mutex_init(&dmadev->rx_lock);
+    mutex_init(&dmadev->dma_hw_lock);
     init_waitqueue_head(&dmadev->tx_waitq);
     init_waitqueue_head(&dmadev->rx_waitq);
     init_waitqueue_head(&dmadev->ip_waitq);
