@@ -35,12 +35,12 @@ if [ "$TARGET" = "clean" ]; then
     exit 0
 fi
 
-echo "===> [1/2] Running Icarus Verilog Hardware Simulation (4 KB RTPS v2.x Fast-Path & Option B Plugin)..."
+echo "===> [1/2] Running Icarus Verilog Hardware Simulations (Protocol Selector + ICMP & 4 KB RTPS Fast-Path)..."
 docker run --rm \
     -v "${RTPS_HDL_DIR}:/rtps" \
     -w "/rtps/sim" \
     "${IMAGE_NAME}" \
-    bash -c "iverilog -o sim_rtps.vvp ../rtps_peer_emulator.v ../rtps_fastpath_ip.v tb_rtps_fastpath.v && vvp sim_rtps.vvp && rm -f sim_rtps.vvp"
+    bash -c "iverilog -g2012 -o sim_arp.vvp ../icmp_engine.v ../arp_reply_generator.v tb_arp_reply_generator.v && vvp sim_arp.vvp && rm -f sim_arp.vvp && iverilog -g2012 -o sim_rtps.vvp ../rtps_peer_emulator.v ../rtps_fastpath_ip.v tb_rtps_fastpath.v && vvp sim_rtps.vvp && rm -f sim_rtps.vvp"
 
 echo "===> [2/2] Running ARM Kernel Module & Option B Transport Plugin Cross-Compilation..."
 docker run --rm \

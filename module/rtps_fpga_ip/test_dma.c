@@ -79,6 +79,25 @@ static void print_detailed_diag(FILE* out, const struct rtps_cycle_diag* diag) {
             diag->arp_remote_client_mac[0], diag->arp_remote_client_mac[1],
             diag->arp_remote_client_mac[2], diag->arp_remote_client_mac[3],
             diag->arp_remote_client_mac[4], diag->arp_remote_client_mac[5]);
+    fprintf(out, "      - ICMP Telemetry       : Echo Replies=%u, ICMP Errors=%u\n",
+            diag->stat_icmp_echo_replies, diag->stat_icmp_errors);
+    if (diag->err_icmp || diag->last_icmp_type != 0) {
+        const char* type_str = (diag->last_icmp_type == 3) ? "Destination Unreachable" :
+                               (diag->last_icmp_type == 11) ? "Time Exceeded" : "Other";
+        const char* code_str = (diag->last_icmp_type == 3 && diag->last_icmp_code == 3) ? "Port Unreachable" :
+                               (diag->last_icmp_type == 3 && diag->last_icmp_code == 1) ? "Host Unreachable" :
+                               (diag->last_icmp_type == 11 && diag->last_icmp_code == 1) ? "Fragment Reassembly Timeout" : "";
+        fprintf(out, "      - Last ICMP Error      : Type=%u [%s], Code=%u [%s], NextHopMTU=%u\n",
+                diag->last_icmp_type, type_str, diag->last_icmp_code, code_str, diag->last_icmp_next_hop_mtu);
+        fprintf(out, "        Offending Packet     : Dst IP=%u.%u.%u.%u, Ports=%u->%u, IP_ID=0x%04X\n",
+                (diag->last_icmp_offending_dst_ip >> 24) & 0xFF,
+                (diag->last_icmp_offending_dst_ip >> 16) & 0xFF,
+                (diag->last_icmp_offending_dst_ip >> 8) & 0xFF,
+                diag->last_icmp_offending_dst_ip & 0xFF,
+                diag->last_icmp_offending_src_port,
+                diag->last_icmp_offending_dst_port,
+                diag->last_icmp_offending_ip_id);
+    }
     fprintf(out, "    Driver & FSM State Transition Timeline:\n");
     fprintf(out, "      1. Pre-Write IP Status : 0x%08X -> State %u [%s]\n",
             diag->pre_write_ip_status, pre_wr_state, rtps_state_name(pre_wr_state));

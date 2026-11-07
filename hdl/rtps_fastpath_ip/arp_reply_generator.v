@@ -4,29 +4,39 @@
 // Module: arp_reply_generator
 //
 // Description:
-//   Hardware ARP (Address Resolution Protocol - RFC 826) Reply Generator and
-//   L2 Ethernet Shim for the RTPS Fast-Path Hardware Accelerator.
+//   Zero-Stall L2/L3 Protocol Selector, Hardware ARP Engine (RFC 826),
+//   Hardware ICMP Engine (RFC 792), and 3-Way Atomic Packet TX Arbiter
+//   for the RTPS Fast-Path Hardware Accelerator.
 //
 // Functionality:
-//   1. Shim Multiplexer between Downstream Network Port (Ethernet MAC / Wire)
-//      and Upstream Accelerator (rtps_fastpath_ip / PS DMA):
-//      - Wire RX (s_arp_rx): Inspects incoming Ethernet frames.
-//        * If ARP Request targeting our IP (arp_reply_ip or ARP_REPLY_IP_2):
-//          Filters and absorbs the ARP frame so it never leaks into RTPS.
-//          Learns the remote peer's MAC (remote_client_mac) and triggers
-//          an authentic RFC 826 ARP Reply.
-//        * If Non-ARP Traffic (e.g. IPv4 UDP RTPS frames):
-//          Streams through to m_rtps_tx with full AXI-Stream backpressure.
-//      - Wire TX (m_arp_tx): Arbitrates between outgoing RTPS accelerator
-//        traffic (s_rtps_rx) and generated ARP replies with atomic packet
-//        framing (no interleaving, zero frame truncation).
-//   2. Protocol Alignment & Endianness:
-//      - Configurable AXIS_BYTE_SWAP parameter:
-//        * 1 (default): external wire is standard AXI-Stream little-endian byte
-//          order (tdata[7:0] is wire byte 0).
-//        * 0: external wire is big-endian / network order (tdata[31:24] is wire byte 0).
-//      - Generates standard IEEE 802.3 60-byte minimum padded ARP reply frames
-//        (15 32-bit words), preventing runt frame drops by Ethernet PHYs and switches.
+//   1. Zero-Stall Ingress Protocol Selector (s_arp_rx):
+//      - Buffers up to 6 beats (60 ns @ 100 MHz) in an elastic lookahead FIFO.
+//      - Beat 3:
+//        * If EtherType == 0x0806 (ARP):
+//          Filters and absorbs the ARP frame into the RFC 826 ARP engine.
+//          Flushes the RTPS lookahead FIFO so ARP never perturbs RTPS.
+//        * If EtherType == 0x0800 (IPv4):
+//          Proceeds to Beat 5 inspection.
+//        * Other EtherTypes:
+//          Immediately marks pass-through to m_rtps_tx.
+//      - Beat 5:
+//        * If IPv4 Protocol == 0x01 (ICMP):
+//          Filters and absorbs into u_icmp_engine (hardware ping echo reply and
+//          ICMP error parsing). Flushes the RTPS lookahead FIFO so ICMP never
+//          perturbs RTPS.
+//        * If IPv4 Protocol == 0x11 (UDP) or other:
+//          Marks pass-through (rx_passing_pkt <= 1), draining the lookahead FIFO
+//          to m_rtps_tx (RTPS accelerator) with full AXI-Stream flow control.
+//
+//   2. 3-Way Atomic Packet TX Arbiter (m_arp_tx):
+//      - Arbitrates between:
+//        * Priority 0: RFC 826 ARP Replies (generated locally)
+//        * Priority 1: RFC 792 ICMP Echo Replies (from u_icmp_engine)
+//        * Priority 2: RTPS FastPath Egress Frames (from s_rtps_rx)
+//      - Enforces strict atomic packet framing (zero interleaving, zero truncation).
+//
+//   3. Bidirectional MAC Resolution & Passive Client Learning:
+//      - Learns remote client MAC from both incoming ARP requests and ICMP pings/errors.
 // =============================================================================
 
 module arp_reply_generator #(
@@ -40,7 +50,7 @@ module arp_reply_generator #(
     // -------------------------------------------------------------------------
     // 1. Connection with Upstream IP (RTPS FastPath / PS DMA)
     // -------------------------------------------------------------------------
-    // Forwarded non-ARP ingress traffic to RTPS IP (connects to RTPS s_axis_wire)
+    // Forwarded non-ARP, non-ICMP ingress traffic to RTPS IP (connects to RTPS s_axis_wire)
     output wire [DATA_WIDTH-1:0]     m_rtps_tx_tdata,
     output wire                      m_rtps_tx_tvalid,
     input  wire                      m_rtps_tx_tready,
@@ -64,21 +74,27 @@ module arp_reply_generator #(
     // Incoming ingress traffic from Ethernet MAC RX
     input  wire [DATA_WIDTH-1:0]     s_arp_rx_tdata,
     input  wire                      s_arp_rx_tvalid,
-    output wire                     s_arp_rx_tready,
+    output wire                      s_arp_rx_tready,
     input  wire                      s_arp_rx_tlast,
 
     // -------------------------------------------------------------------------
     // 3. Network Configuration & Client Learning
     // -------------------------------------------------------------------------
-    // Local FPGA IP and MAC address
     input  wire [31:0]               arp_reply_ip,
     input  wire [47:0]               arp_reply_mac,
-
-    // Expected remote client IP (e.g. laptop). If 0, learns from any valid client
     input  wire [31:0]               remote_client_ip,
+    output reg  [47:0]               remote_client_mac,
 
-    // Dynamically learned MAC address of the connected remote client
-    output reg  [47:0]               remote_client_mac
+    // -------------------------------------------------------------------------
+    // 4. ICMP Telemetry & Error Reporting
+    // -------------------------------------------------------------------------
+    output wire [31:0]               stat_icmp_echo_replies,
+    output wire [31:0]               stat_icmp_errors,
+    output wire                      icmp_err_stb,
+    output wire [31:0]               icmp_err_info,
+    output wire [31:0]               icmp_err_dst_ip,
+    output wire [31:0]               icmp_err_ports,
+    output wire [15:0]               icmp_err_ip_id
 );
 
     // =========================================================================
@@ -92,14 +108,15 @@ module arp_reply_generator #(
     endfunction
 
     // =========================================================================
-    // Part 1: Incoming Ethernet Frame Parsing & ARP Request Detection
+    // Part 1: Incoming Ethernet Frame Parsing & Protocol Demux
     // =========================================================================
-    wire [31:0] rx_net_word = AXIS_BYTE_SWAP ? byte_swap32(s_arp_rx_tdata) : s_arp_rx_tdata;
+    wire [31:0] rx_net_word  = AXIS_BYTE_SWAP ? byte_swap32(s_arp_rx_tdata) : s_arp_rx_tdata;
     wire        rx_handshake = s_arp_rx_tvalid && s_arp_rx_tready;
 
     reg [3:0]  rx_wire_beat;
     reg        rx_is_arp_frame;
     reg        rx_is_arp_req;
+    reg        rx_is_ipv4_frame;
     reg        rx_target_ip_match;
     reg [47:0] rx_sha_mac;
     reg [31:0] rx_spa_ip;
@@ -111,15 +128,21 @@ module arp_reply_generator #(
     reg [31:0] latched_reply_dst_ip;
     reg [31:0] latched_reply_spa_ip;
 
-    // Filter flag: set when the current incoming frame is confirmed to be ARP
+    // Filter flags: set when the current incoming frame is filtered out of RTPS
     reg rx_filtering_arp;
+    reg rx_filtering_icmp;
     reg rx_drop_fifo;
+
+    // Passive learning from ICMP engine
+    wire        icmp_learn_mac_stb;
+    wire [47:0] icmp_learned_client_mac;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rx_wire_beat          <= 4'd0;
             rx_is_arp_frame       <= 1'b0;
             rx_is_arp_req         <= 1'b0;
+            rx_is_ipv4_frame      <= 1'b0;
             rx_target_ip_match    <= 1'b0;
             rx_sha_mac            <= 48'd0;
             rx_spa_ip             <= 32'd0;
@@ -131,10 +154,16 @@ module arp_reply_generator #(
             latched_reply_dst_ip  <= 32'd0;
             latched_reply_spa_ip  <= 32'd0;
             rx_filtering_arp      <= 1'b0;
+            rx_filtering_icmp     <= 1'b0;
             rx_drop_fifo          <= 1'b0;
         end else begin
             arp_reply_trigger <= 1'b0;
             rx_drop_fifo      <= 1'b0;
+
+            // Passive MAC learning from ICMP Engine
+            if (icmp_learn_mac_stb) begin
+                remote_client_mac <= icmp_learned_client_mac;
+            end
 
             if (rx_handshake) begin
                 case (rx_wire_beat)
@@ -142,25 +171,30 @@ module arp_reply_generator #(
                         // Beat 0: Ethernet Dst MAC [47:16]
                         rx_is_arp_frame    <= 1'b0;
                         rx_is_arp_req      <= 1'b0;
+                        rx_is_ipv4_frame   <= 1'b0;
                         rx_target_ip_match <= 1'b0;
                         rx_filtering_arp   <= 1'b0;
+                        rx_filtering_icmp  <= 1'b0;
                     end
 
                     4'd1: begin
-                        // Beat 1: Dst MAC [15:0] (bits [31:16]) + Ethernet Src MAC [47:32] (bits [15:0])
+                        // Beat 1: Dst MAC [15:0] + Src MAC [47:32]
                     end
 
                     4'd2: begin
-                        // Beat 2: Ethernet Src MAC [31:0]
+                        // Beat 2: Src MAC [31:0]
                     end
 
                     4'd3: begin
-                        // Beat 3: EtherType (bits [31:16]) + Hardware Type HTYPE (bits [15:0])
-                        // ARP EtherType = 0x0806, Ethernet HTYPE = 0x0001
+                        // Beat 3: EtherType (bits [31:16])
                         if (rx_net_word[31:16] == 16'h0806 && rx_net_word[15:0] == 16'h0001) begin
+                            // ARP Request/Reply (0x0806 / HTYPE 0x0001)
                             rx_is_arp_frame  <= 1'b1;
                             rx_filtering_arp <= 1'b1;
-                            rx_drop_fifo     <= 1'b1; // Flush pre-buffered beats from RTPS egress FIFO
+                            rx_drop_fifo     <= 1'b1; // Flush pre-buffered beats from RTPS FIFO
+                        end else if (rx_net_word[31:16] == 16'h0800) begin
+                            // IPv4 Packet (0x0800)
+                            rx_is_ipv4_frame <= 1'b1;
                         end else begin
                             rx_is_arp_frame  <= 1'b0;
                             rx_filtering_arp <= 1'b0;
@@ -168,27 +202,33 @@ module arp_reply_generator #(
                     end
 
                     4'd4: begin
-                        // Beat 4: Protocol Type PTYPE (bits [31:16]) + HLEN (bits [15:8]) + PLEN (bits [7:0])
-                        // IPv4 = 0x0800, HLEN = 6 (MAC len), PLEN = 4 (IPv4 len)
+                        // Beat 4: ARP PTYPE/HLEN/PLEN or IPv4 TotalLen/IP_ID
                         if (rx_is_arp_frame &&
                             rx_net_word[31:16] == 16'h0800 &&
                             rx_net_word[15:8]  == 8'h06    &&
                             rx_net_word[7:0]   == 8'h04) begin
-                            // Header valid
-                        end else begin
+                            // ARP parameters valid
+                        end else if (rx_is_arp_frame) begin
                             rx_is_arp_frame <= 1'b0;
                         end
                     end
 
                     4'd5: begin
-                        // Beat 5: Operation OPER (bits [31:16]) + SHA [47:32] (bits [15:0])
-                        // OPER: 0x0001 = ARP Request, 0x0002 = ARP Reply
+                        // Beat 5:
+                        // For ARP:  OPER (bits [31:16]) + SHA [47:32] (bits [15:0])
+                        // For IPv4: Flags/Offset [31:16] + TTL [15:8] + Protocol [7:0]
                         if (rx_is_arp_frame && rx_net_word[31:16] == 16'h0001) begin
                             rx_is_arp_req     <= 1'b1;
                             rx_sha_mac[47:32] <= rx_net_word[15:0];
-                        end else begin
+                        end else if (rx_is_arp_frame) begin
                             rx_is_arp_frame <= 1'b0;
                             rx_is_arp_req   <= 1'b0;
+                        end
+
+                        if (rx_is_ipv4_frame && rx_net_word[7:0] == 8'h01) begin
+                            // IPv4 Protocol 0x01: ICMP!
+                            rx_filtering_icmp <= 1'b1;
+                            rx_drop_fifo      <= 1'b1; // Flush pre-buffered beats from RTPS FIFO
                         end
                     end
 
@@ -233,15 +273,17 @@ module arp_reply_generator #(
                     end
 
                     default: begin
-                        // Beats 11..15: Frame padding (RFC 826 / IEEE 802.3 60-byte Ethernet padding)
+                        // Beats 11..15: Frame padding
                     end
                 endcase
 
                 if (s_arp_rx_tlast) begin
-                    rx_wire_beat     <= 4'd0;
-                    rx_filtering_arp <= 1'b0;
+                    rx_wire_beat      <= 4'd0;
+                    rx_filtering_arp  <= 1'b0;
+                    rx_filtering_icmp <= 1'b0;
+                    rx_is_ipv4_frame  <= 1'b0;
 
-                    // Evaluate match on end of frame (supports both unpadded and padded ARP frames)
+                    // Evaluate ARP reply trigger on end of frame
                     if (rx_is_arp_req &&
                         ((rx_wire_beat >= 4'd10 && rx_target_ip_match) ||
                          (rx_wire_beat == 4'd10 && ({rx_tpa_hi, rx_net_word[31:16]} == arp_reply_ip ||
@@ -253,8 +295,6 @@ module arp_reply_generator #(
                                                   ARP_REPLY_IP_2 :
                                                  (rx_target_ip_match ? matched_spa_ip : arp_reply_ip);
 
-                        // Learn remote client MAC: if remote_client_ip == 0, learn from any sender;
-                        // otherwise learn only when sender IP matches remote_client_ip
                         if (remote_client_ip == 32'd0 || rx_spa_ip == remote_client_ip) begin
                             remote_client_mac <= rx_sha_mac;
                         end
@@ -271,12 +311,12 @@ module arp_reply_generator #(
     end
 
     // =========================================================================
-    // Part 2: Elastic Ingress Buffer (Passes Non-ARP traffic to RTPS IP)
+    // Part 2: Elastic Ingress Buffer (Passes Non-ARP, Non-ICMP traffic to RTPS)
     // =========================================================================
-    // A 16-word circular FIFO buffers the first 4 beats of each incoming frame.
-    // If beat 3 reveals EtherType == 0x0806 (ARP), the buffer is flushed
-    // immediately without emitting any beats to m_rtps_tx.
-    // If EtherType != 0x0806 (e.g. UDP/IPv4), the FIFO drains to m_rtps_tx.
+    // Buffers Beats 0..5 in an elastic circular FIFO.
+    // If Beat 3 is ARP: flushed immediately.
+    // If Beat 5 is ICMP: flushed immediately.
+    // Otherwise (e.g. UDP RTPS): drains directly to m_rtps_tx.
     localparam FIFO_DEPTH = 16;
     reg [DATA_WIDTH-1:0] fifo_data [0:FIFO_DEPTH-1];
     reg                  fifo_last [0:FIFO_DEPTH-1];
@@ -285,11 +325,11 @@ module arp_reply_generator #(
     reg [4:0]            fifo_count;
     reg                  rx_passing_pkt;
 
-    wire fifo_push = s_arp_rx_tvalid && s_arp_rx_tready && !rx_filtering_arp && !rx_drop_fifo;
+    wire fifo_push = s_arp_rx_tvalid && s_arp_rx_tready && !rx_filtering_arp && !rx_filtering_icmp && !rx_drop_fifo;
     wire fifo_pop  = m_rtps_tx_tvalid && m_rtps_tx_tready;
 
-    // Upstream ready: absorb line-rate ARP immediately; otherwise backpressure when FIFO fills
-    assign s_arp_rx_tready = rx_filtering_arp ? 1'b1 : (fifo_count < (FIFO_DEPTH - 2));
+    // Absorb line-rate ARP/ICMP without backpressure; otherwise backpressure when FIFO fills
+    assign s_arp_rx_tready = (rx_filtering_arp || rx_filtering_icmp) ? 1'b1 : (fifo_count < (FIFO_DEPTH - 2));
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -315,16 +355,20 @@ module arp_reply_generator #(
 
             // 3. FIFO Level Tracking & Dropping
             if (rx_drop_fifo) begin
-                // ARP frame detected: erase pre-buffered beats from FIFO
                 fifo_wr_ptr    <= fifo_rd_ptr;
                 fifo_count     <= 5'd0;
                 rx_passing_pkt <= 1'b0;
             end else begin
-                // Activate pass-through once confirmed non-ARP or on early short frame termination
+                // Activate pass-through once confirmed non-ARP and non-ICMP
                 if (rx_handshake) begin
-                    if (rx_wire_beat == 4'd3 && (rx_net_word[31:16] != 16'h0806 || rx_net_word[15:0] != 16'h0001)) begin
+                    if (rx_wire_beat == 4'd3 && rx_net_word[31:16] != 16'h0806 && rx_net_word[31:16] != 16'h0800) begin
+                        // Non-ARP, non-IPv4 frame (e.g. raw Ethernet)
                         rx_passing_pkt <= 1'b1;
-                    end else if (s_arp_rx_tlast && rx_wire_beat < 4'd3) begin
+                    end else if (rx_wire_beat == 4'd5 && rx_is_ipv4_frame && rx_net_word[7:0] != 8'h01) begin
+                        // IPv4 frame that is NOT ICMP (e.g. UDP RTPS!)
+                        rx_passing_pkt <= 1'b1;
+                    end else if (s_arp_rx_tlast && !rx_is_arp_frame && (!rx_is_ipv4_frame || rx_wire_beat < 4'd5)) begin
+                        // Early short frame termination
                         rx_passing_pkt <= 1'b1;
                     end
                 end
@@ -345,15 +389,11 @@ module arp_reply_generator #(
     // =========================================================================
     // Part 3: RFC 826 ARP Reply Frame Generator
     // =========================================================================
-    // Layout in Network Big-Endian order (60-byte IEEE 802.3 standard Ethernet frame):
-    // Words 0..3:  Ethernet Header (14 bytes) + HTYPE (2 bytes)
-    // Words 4..10: ARP Payload (26 bytes)
-    // Words 11..14:Zero Padding (16 bytes) -> Total 60 bytes (15 beats)
-    reg [3:0]  tx_beat;
+    reg [3:0]  tx_arp_beat;
     reg [31:0] arp_reply_word;
 
     always @(*) begin
-        case (tx_beat)
+        case (tx_arp_beat)
             // Ethernet Destination MAC [47:16]
             4'd0: arp_reply_word = latched_reply_dst_mac[47:16];
 
@@ -398,40 +438,78 @@ module arp_reply_generator #(
     end
 
     // =========================================================================
-    // Part 4: Wire TX Multiplexer & Arbiter (RTPS Egress vs ARP Reply)
+    // Part 4: Hardware ICMPv4 Engine Instance (RFC 792)
+    // =========================================================================
+    wire [31:0] icmp_tx_tdata;
+    wire        icmp_tx_tvalid;
+    reg         icmp_tx_tready;
+    wire        icmp_tx_tlast;
+
+    icmp_engine #(
+        .SECONDARY_IP (ARP_REPLY_IP_2)
+    ) u_icmp_engine (
+        .clk                    (clk),
+        .rst_n                  (rst_n),
+        .s_axis_rx_tdata        (rx_net_word),
+        .s_axis_rx_tvalid       (s_arp_rx_tvalid),
+        .s_axis_rx_tready       (), // Always ready in S_RX_COLLECT
+        .s_axis_rx_tlast        (s_arp_rx_tlast),
+        .m_axis_tx_tdata        (icmp_tx_tdata),
+        .m_axis_tx_tvalid       (icmp_tx_tvalid),
+        .m_axis_tx_tready       (icmp_tx_tready),
+        .m_axis_tx_tlast        (icmp_tx_tlast),
+        .local_ip               (arp_reply_ip),
+        .local_mac              (arp_reply_mac),
+        .remote_client_ip       (remote_client_ip),
+        .learn_mac_stb          (icmp_learn_mac_stb),
+        .learned_client_mac     (icmp_learned_client_mac),
+        .stat_icmp_echo_replies (stat_icmp_echo_replies),
+        .stat_icmp_errors       (stat_icmp_errors),
+        .icmp_err_stb           (icmp_err_stb),
+        .icmp_err_info          (icmp_err_info),
+        .icmp_err_dst_ip        (icmp_err_dst_ip),
+        .icmp_err_ports         (icmp_err_ports),
+        .icmp_err_ip_id         (icmp_err_ip_id)
+    );
+
+    // =========================================================================
+    // Part 5: 3-Way Atomic Packet TX Arbiter (ARP > ICMP > RTPS)
     // =========================================================================
     localparam [1:0]
-        TX_IDLE     = 2'd0,
-        TX_ARP_RESP = 2'd1,
-        TX_RTPS_FWD = 2'd2;
+        TX_IDLE      = 2'd0,
+        TX_ARP_RESP  = 2'd1,
+        TX_ICMP_RESP = 2'd2,
+        TX_RTPS_FWD  = 2'd3;
 
     reg [1:0] tx_state;
     reg       arp_reply_pending;
 
-    // Track pending reply requests
+    // Track pending ARP replies
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             arp_reply_pending <= 1'b0;
         end else begin
             if (arp_reply_trigger) begin
                 arp_reply_pending <= 1'b1;
-            end else if (tx_state == TX_ARP_RESP && m_arp_tx_tready && (tx_beat == 4'd14)) begin
+            end else if (tx_state == TX_ARP_RESP && m_arp_tx_tready && (tx_arp_beat == 4'd14)) begin
                 arp_reply_pending <= 1'b0;
             end
         end
     end
 
-    // Arbiter FSM
+    // 3-Way Atomic Arbiter FSM
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            tx_state <= TX_IDLE;
-            tx_beat  <= 4'd0;
+            tx_state    <= TX_IDLE;
+            tx_arp_beat <= 4'd0;
         end else begin
             case (tx_state)
                 TX_IDLE: begin
                     if (arp_reply_pending) begin
-                        tx_state <= TX_ARP_RESP;
-                        tx_beat  <= 4'd0;
+                        tx_state    <= TX_ARP_RESP;
+                        tx_arp_beat <= 4'd0;
+                    end else if (icmp_tx_tvalid) begin
+                        tx_state    <= TX_ICMP_RESP;
                     end else if (s_rtps_rx_tvalid) begin
                         if (m_arp_tx_tready && s_rtps_rx_tlast) begin
                             tx_state <= TX_IDLE;
@@ -443,12 +521,18 @@ module arp_reply_generator #(
 
                 TX_ARP_RESP: begin
                     if (m_arp_tx_tready) begin
-                        if (tx_beat == 4'd14) begin
-                            tx_beat  <= 4'd0;
-                            tx_state <= TX_IDLE;
+                        if (tx_arp_beat == 4'd14) begin
+                            tx_arp_beat <= 4'd0;
+                            tx_state    <= TX_IDLE;
                         end else begin
-                            tx_beat <= tx_beat + 4'd1;
+                            tx_arp_beat <= tx_arp_beat + 4'd1;
                         end
+                    end
+                end
+
+                TX_ICMP_RESP: begin
+                    if (icmp_tx_tvalid && m_arp_tx_tready && icmp_tx_tlast) begin
+                        tx_state <= TX_IDLE;
                     end
                 end
 
@@ -470,18 +554,31 @@ module arp_reply_generator #(
     reg                  mux_rtps_rx_tready;
 
     always @(*) begin
+        icmp_tx_tready     = 1'b0;
+        mux_rtps_rx_tready = 1'b0;
+
         case (tx_state)
             TX_ARP_RESP: begin
                 mux_arp_tx_tvalid  = 1'b1;
                 mux_arp_tx_tdata   = AXIS_BYTE_SWAP ? byte_swap32(arp_reply_word) : arp_reply_word;
-                mux_arp_tx_tlast   = (tx_beat == 4'd14);
-                mux_rtps_rx_tready = 1'b0; // Backpressure RTPS while transmitting ARP reply
+                mux_arp_tx_tlast   = (tx_arp_beat == 4'd14);
+                icmp_tx_tready     = 1'b0;
+                mux_rtps_rx_tready = 1'b0;
+            end
+
+            TX_ICMP_RESP: begin
+                mux_arp_tx_tvalid  = icmp_tx_tvalid;
+                mux_arp_tx_tdata   = AXIS_BYTE_SWAP ? byte_swap32(icmp_tx_tdata) : icmp_tx_tdata;
+                mux_arp_tx_tlast   = icmp_tx_tlast;
+                icmp_tx_tready     = m_arp_tx_tready;
+                mux_rtps_rx_tready = 1'b0;
             end
 
             TX_RTPS_FWD: begin
                 mux_arp_tx_tvalid  = s_rtps_rx_tvalid;
                 mux_arp_tx_tdata   = s_rtps_rx_tdata;
                 mux_arp_tx_tlast   = s_rtps_rx_tlast;
+                icmp_tx_tready     = 1'b0;
                 mux_rtps_rx_tready = m_arp_tx_tready;
             end
 
@@ -490,11 +587,19 @@ module arp_reply_generator #(
                     mux_arp_tx_tvalid  = 1'b0;
                     mux_arp_tx_tdata   = 32'd0;
                     mux_arp_tx_tlast   = 1'b0;
+                    icmp_tx_tready     = 1'b0;
+                    mux_rtps_rx_tready = 1'b0;
+                end else if (icmp_tx_tvalid) begin
+                    mux_arp_tx_tvalid  = 1'b0;
+                    mux_arp_tx_tdata   = 32'd0;
+                    mux_arp_tx_tlast   = 1'b0;
+                    icmp_tx_tready     = 1'b0;
                     mux_rtps_rx_tready = 1'b0;
                 end else begin
                     mux_arp_tx_tvalid  = s_rtps_rx_tvalid;
                     mux_arp_tx_tdata   = s_rtps_rx_tdata;
                     mux_arp_tx_tlast   = s_rtps_rx_tlast;
+                    icmp_tx_tready     = 1'b0;
                     mux_rtps_rx_tready = m_arp_tx_tready;
                 end
             end

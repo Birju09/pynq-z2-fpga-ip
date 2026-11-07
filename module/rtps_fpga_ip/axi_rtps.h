@@ -65,6 +65,12 @@
 #define RTPS_IP_LAST_RX_SRC_MAC_HI_OFFSET 0x19C /* Word 103: {16'd0, Ingress learned remote client MAC[47:32]} */
 #define RTPS_IP_ARP_CLIENT_MAC_LO_OFFSET  0x1A0 /* Word 104: ARP learned remote client MAC[31:0] */
 #define RTPS_IP_ARP_CLIENT_MAC_HI_OFFSET  0x1A4 /* Word 105: {16'd0, ARP learned remote client MAC[47:32]} */
+#define RTPS_IP_STAT_ICMP_ECHO_REPLIES_OFFSET 0x1A8 /* Word 106: Total hardware ICMP Echo Replies sent */
+#define RTPS_IP_STAT_ICMP_ERRORS_OFFSET       0x1AC /* Word 107: Total ICMP errors received */
+#define RTPS_IP_LAST_ICMP_ERR_INFO_OFFSET     0x1B0 /* Word 108: {icmp_type[7:0], icmp_code[7:0], next_hop_mtu[15:0]} */
+#define RTPS_IP_LAST_ICMP_ERR_DST_IP_OFFSET   0x1B4 /* Word 109: Offending IPv4 destination IP */
+#define RTPS_IP_LAST_ICMP_ERR_PORTS_OFFSET    0x1B8 /* Word 110: Offending UDP {src_port[15:0], dst_port[15:0]} */
+#define RTPS_IP_LAST_ICMP_ERR_IP_ID_OFFSET    0x1BC /* Word 111: {16'd0, offending IPv4 Identification} */
 
 /* =========================================================================
  * Option 1 Hardware RTPS Endpoint Lifecycle States (plan.txt Section 4)
@@ -321,10 +327,18 @@ struct rtps_cycle_diag {
     __u8  err_no_match;
     __u8  err_rx_timeout;
     __u8  err_csum;
-    __u8  reserved[3];
+    __u8  err_icmp;
+    __u8  last_icmp_type;
+    __u8  last_icmp_code;
     __u8  last_rx_src_mac[6];       /* Ingress wire-learned remote client MAC */
     __u8  arp_remote_client_mac[6]; /* ARP-learned remote client MAC */
-    __u8  reserved2[4];             /* 32-bit alignment padding */
+    __u16 last_icmp_next_hop_mtu;
+    __u16 last_icmp_offending_ip_id;
+    __u32 last_icmp_offending_dst_ip;
+    __u16 last_icmp_offending_src_port;
+    __u16 last_icmp_offending_dst_port;
+    __u32 stat_icmp_echo_replies;
+    __u32 stat_icmp_errors;
 
     /* Extended Driver & AXI DMA Hardware Phase Diagnostics */
     __u32 pre_write_ip_status;

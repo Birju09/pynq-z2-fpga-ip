@@ -489,6 +489,20 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             diag.err_no_match        = (diag.status_reg & RTPS_STATUS_ERR_NO_MATCH) ? 1 : 0;
             diag.err_rx_timeout      = (diag.status_reg & RTPS_STATUS_ERR_RX_TIMEOUT) ? 1 : 0;
             diag.err_csum            = (diag.status_reg & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
+            {
+                u32 icmp_info  = ioread32(dev->ip_regs + RTPS_IP_LAST_ICMP_ERR_INFO_OFFSET);
+                u32 icmp_ports = ioread32(dev->ip_regs + RTPS_IP_LAST_ICMP_ERR_PORTS_OFFSET);
+                diag.last_icmp_type               = (u8)(icmp_info >> 24);
+                diag.last_icmp_code               = (u8)((icmp_info >> 16) & 0xFF);
+                diag.last_icmp_next_hop_mtu       = (u16)(icmp_info & 0xFFFF);
+                diag.last_icmp_offending_dst_ip   = ioread32(dev->ip_regs + RTPS_IP_LAST_ICMP_ERR_DST_IP_OFFSET);
+                diag.last_icmp_offending_src_port = (u16)(icmp_ports >> 16);
+                diag.last_icmp_offending_dst_port = (u16)(icmp_ports & 0xFFFF);
+                diag.last_icmp_offending_ip_id    = (u16)ioread32(dev->ip_regs + RTPS_IP_LAST_ICMP_ERR_IP_ID_OFFSET);
+                diag.stat_icmp_echo_replies       = ioread32(dev->ip_regs + RTPS_IP_STAT_ICMP_ECHO_REPLIES_OFFSET);
+                diag.stat_icmp_errors             = ioread32(dev->ip_regs + RTPS_IP_STAT_ICMP_ERRORS_OFFSET);
+                diag.err_icmp                     = (diag.stat_icmp_errors > 0 || diag.last_icmp_type != 0) ? 1 : 0;
+            }
 
             /* Populate Extended Phase & DMA Hardware Diagnostics */
             diag.pre_write_ip_status    = dev->pre_write_ip_status;

@@ -141,7 +141,14 @@ module tb_rtps_fastpath;
         .arp_reply_mac      (arp_reply_mac),
         .remote_client_ip   (remote_client_ip),
         .remote_client_mac  (remote_client_mac),
-        .ingress_remote_client_mac (ingress_remote_client_mac)
+        .ingress_remote_client_mac (ingress_remote_client_mac),
+        .stat_icmp_echo_replies (32'd0),
+        .stat_icmp_errors       (32'd0),
+        .icmp_err_stb           (1'b0),
+        .icmp_err_info          (32'd0),
+        .icmp_err_dst_ip        (32'd0),
+        .icmp_err_ports         (32'd0),
+        .icmp_err_ip_id         (16'd0)
     );
 
     // 100 MHz clock (10 ns period)

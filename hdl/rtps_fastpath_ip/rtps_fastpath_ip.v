@@ -122,7 +122,18 @@ module rtps_fastpath_ip #(
     output wire [47:0]               arp_reply_mac,
     output wire [31:0]               remote_client_ip,
     input  wire [47:0]               remote_client_mac,
-    output wire [47:0]               ingress_remote_client_mac
+    output wire [47:0]               ingress_remote_client_mac,
+
+    // -------------------------------------------------------------------------
+    // 7. ICMP Engine Telemetry & Error Reporting Interface
+    // -------------------------------------------------------------------------
+    input  wire [31:0]               stat_icmp_echo_replies,
+    input  wire [31:0]               stat_icmp_errors,
+    input  wire                      icmp_err_stb,
+    input  wire [31:0]               icmp_err_info,
+    input  wire [31:0]               icmp_err_dst_ip,
+    input  wire [31:0]               icmp_err_ports,
+    input  wire [15:0]               icmp_err_ip_id
 );
 
     // =========================================================================
@@ -169,8 +180,14 @@ module rtps_fastpath_ip #(
         LAST_RX_META_ADDR   = 8'h65, // 0x194: Last accepted RX {24'd0, 6'd0, reader_slot[1:0]}
         LAST_RX_SRC_MAC_LO  = 8'h66, // 0x198: Ingress learned Remote Client MAC [31:0]
         LAST_RX_SRC_MAC_HI  = 8'h67, // 0x19C: {16'd0, Ingress learned Remote Client MAC [47:32]}
-        ARP_CLIENT_MAC_LO   = 8'h68, // 0x1A0: ARP learned Remote Client MAC [31:0]
-        ARP_CLIENT_MAC_HI   = 8'h69; // 0x1A4: {16'd0, ARP learned Remote Client MAC [47:32]}
+        ARP_CLIENT_MAC_LO           = 8'h68, // 0x1A0: ARP learned Remote Client MAC [31:0]
+        ARP_CLIENT_MAC_HI           = 8'h69, // 0x1A4: {16'd0, ARP learned Remote Client MAC [47:32]}
+        STAT_ICMP_ECHO_REPLIES_ADDR = 8'h6A, // 0x1A8: Total ICMP Echo Replies sent
+        STAT_ICMP_ERRORS_ADDR       = 8'h6B, // 0x1AC: Total ICMP Errors received
+        LAST_ICMP_ERR_INFO_ADDR     = 8'h6C, // 0x1B0: {icmp_type[7:0], icmp_code[7:0], next_hop_mtu[15:0]}
+        LAST_ICMP_ERR_DST_IP_ADDR   = 8'h6D, // 0x1B4: Offending IPv4 destination IP
+        LAST_ICMP_ERR_PORTS_ADDR    = 8'h6E, // 0x1B8: Offending UDP {src_port[15:0], dst_port[15:0]}
+        LAST_ICMP_ERR_IP_ID_ADDR    = 8'h6F; // 0x1BC: {16'd0, offending IPv4 Identification}
 
     // =========================================================================
     // Endpoint Descriptor Table (EDT): Shadow & Active Banks
@@ -284,6 +301,7 @@ module rtps_fastpath_ip #(
     reg err_rx_timeout; // Bit [7]: RX feedback sample did not arrive within rx_timeout_limit
     reg err_csum;       // Bit [8]: RX IPv4 or UDP checksum mismatch detected
     reg irq_is_rx;      // Bit [10]: 1 = ip_done_irq is for RX sample ready in BRAM, 0 = TX done / err
+    reg err_icmp;       // Bit [16]: Inbound ICMP Error detected
 
     // =========================================================================
     // 1's Complement Checksum & IEEE 802.3 CRC-32 Functions
@@ -768,8 +786,14 @@ module rtps_fastpath_ip #(
                         LAST_RX_META_ADDR:   s_axi_rdata <= {24'd0, 6'd0, last_rx_cam_idx};
                         LAST_RX_SRC_MAC_LO:  s_axi_rdata <= last_rx_src_mac[31:0];
                         LAST_RX_SRC_MAC_HI:  s_axi_rdata <= {16'd0, last_rx_src_mac[47:32]};
-                        ARP_CLIENT_MAC_LO:   s_axi_rdata <= remote_client_mac[31:0];
-                        ARP_CLIENT_MAC_HI:   s_axi_rdata <= {16'd0, remote_client_mac[47:32]};
+                        ARP_CLIENT_MAC_LO:           s_axi_rdata <= remote_client_mac[31:0];
+                        ARP_CLIENT_MAC_HI:           s_axi_rdata <= {16'd0, remote_client_mac[47:32]};
+                        STAT_ICMP_ECHO_REPLIES_ADDR: s_axi_rdata <= stat_icmp_echo_replies;
+                        STAT_ICMP_ERRORS_ADDR:       s_axi_rdata <= stat_icmp_errors;
+                        LAST_ICMP_ERR_INFO_ADDR:     s_axi_rdata <= icmp_err_info;
+                        LAST_ICMP_ERR_DST_IP_ADDR:   s_axi_rdata <= icmp_err_dst_ip;
+                        LAST_ICMP_ERR_PORTS_ADDR:    s_axi_rdata <= icmp_err_ports;
+                        LAST_ICMP_ERR_IP_ID_ADDR:    s_axi_rdata <= {16'd0, icmp_err_ip_id};
                         default:             s_axi_rdata <= 32'd0;
                     endcase
                 end
@@ -1268,6 +1292,7 @@ module rtps_fastpath_ip #(
             err_no_match            <= 1'b0;
             err_rx_timeout          <= 1'b0;
             err_csum                <= 1'b0;
+            err_icmp                <= 1'b0;
             irq_is_rx               <= 1'b0;
             completed_frags         <= 4'd0;
 
@@ -2111,6 +2136,13 @@ module rtps_fastpath_ip #(
                         last_cycle_ticks <= cycle_tick_cnt + 32'd1;
                         ip_done_irq      <= 1'b1; // Assert Level-High IRQ to PS!
                         state            <= S_DONE_IRQ;
+                    end else if (icmp_err_stb && (icmp_err_info[31:24] == 8'd3 || icmp_err_info[31:24] == 8'd11)) begin
+                        err_icmp         <= 1'b1;
+                        err_rx_timeout   <= 1'b1;
+                        irq_is_rx        <= 1'b0;
+                        last_cycle_ticks <= cycle_tick_cnt + 32'd1;
+                        ip_done_irq      <= 1'b1; // Wake PS with ICMP error
+                        state            <= S_DONE_IRQ;
                     end else if (rx_wait_cnt >= rx_timeout_limit) begin
                         err_rx_timeout   <= 1'b1;
                         irq_is_rx        <= 1'b0;
@@ -2133,10 +2165,11 @@ module rtps_fastpath_ip #(
                     end
                     if (status_write_pulse && status_write_data[0]) begin
                         ip_done_irq <= 1'b0;
-                        if (err_crc || err_no_match || err_rx_timeout || (!irq_is_rx && mode_pub_only)) begin
+                        if (err_crc || err_no_match || err_rx_timeout || err_icmp || (!irq_is_rx && mode_pub_only)) begin
                             err_crc        <= 1'b0;
                             err_no_match   <= 1'b0;
                             err_rx_timeout <= 1'b0;
+                            err_icmp       <= 1'b0;
                             irq_is_rx      <= 1'b0;
                             rx_ptr         <= 0;
                             state          <= S_IDLE;
@@ -2148,6 +2181,7 @@ module rtps_fastpath_ip #(
                         err_crc        <= 1'b0;
                         err_no_match   <= 1'b0;
                         err_rx_timeout <= 1'b0;
+                        err_icmp       <= 1'b0;
                         irq_is_rx      <= 1'b0;
                         rx_ptr         <= 0;
                         state          <= S_IDLE;

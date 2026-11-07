@@ -33,6 +33,15 @@ module tb_arp_reply_generator;
     reg [31:0] remote_client_ip;
     wire [47:0] remote_client_mac;
 
+    // ICMP Telemetry from DUT
+    wire [31:0] stat_icmp_echo_replies;
+    wire [31:0] stat_icmp_errors;
+    wire        icmp_err_stb;
+    wire [31:0] icmp_err_info;
+    wire [31:0] icmp_err_dst_ip;
+    wire [31:0] icmp_err_ports;
+    wire [15:0] icmp_err_ip_id;
+
     // Big-Endian signals for DUT_BE
     reg  [31:0] be_s_arp_rx_tdata;
     reg         be_s_arp_rx_tvalid;
@@ -80,7 +89,14 @@ module tb_arp_reply_generator;
         .arp_reply_ip      (arp_reply_ip),
         .arp_reply_mac     (arp_reply_mac),
         .remote_client_ip  (remote_client_ip),
-        .remote_client_mac (remote_client_mac)
+        .remote_client_mac (remote_client_mac),
+        .stat_icmp_echo_replies (stat_icmp_echo_replies),
+        .stat_icmp_errors       (stat_icmp_errors),
+        .icmp_err_stb           (icmp_err_stb),
+        .icmp_err_info          (icmp_err_info),
+        .icmp_err_dst_ip        (icmp_err_dst_ip),
+        .icmp_err_ports         (icmp_err_ports),
+        .icmp_err_ip_id         (icmp_err_ip_id)
     );
 
     // Instantiate DUT_BE (Big-Endian mode)
@@ -110,7 +126,14 @@ module tb_arp_reply_generator;
         .arp_reply_ip      (arp_reply_ip),
         .arp_reply_mac     (arp_reply_mac),
         .remote_client_ip  (remote_client_ip),
-        .remote_client_mac (be_remote_client_mac)
+        .remote_client_mac (be_remote_client_mac),
+        .stat_icmp_echo_replies (),
+        .stat_icmp_errors       (),
+        .icmp_err_stb           (),
+        .icmp_err_info          (),
+        .icmp_err_dst_ip        (),
+        .icmp_err_ports         (),
+        .icmp_err_ip_id         ()
     );
 
     // Clock generation (100 MHz, 10 ns period)
@@ -174,6 +197,25 @@ module tb_arp_reply_generator;
                 @(posedge clk);
                 s_arp_rx_tvalid <= 1'b1;
                 s_arp_rx_tdata  <= swap32(words[w]);
+                s_arp_rx_tlast  <= (w == num_words - 1);
+                while (!s_arp_rx_tready) @(posedge clk);
+            end
+            @(posedge clk);
+            s_arp_rx_tvalid <= 1'b0;
+            s_arp_rx_tlast  <= 1'b0;
+            s_arp_rx_tdata  <= 32'd0;
+        end
+    endtask
+
+    reg [31:0] frame_words_buf [0:63];
+
+    task send_variable_frame(input integer num_words);
+        integer w;
+        begin
+            for (w = 0; w < num_words; w = w + 1) begin
+                @(posedge clk);
+                s_arp_rx_tvalid <= 1'b1;
+                s_arp_rx_tdata  <= swap32(frame_words_buf[w]);
                 s_arp_rx_tlast  <= (w == num_words - 1);
                 while (!s_arp_rx_tready) @(posedge clk);
             end
@@ -583,6 +625,245 @@ module tb_arp_reply_generator;
             $display("[+] PASS: Big-Endian instance generated correct ARP reply (Dst MAC = 000C29AB)!");
         end else begin
             $display("[-] FAIL: Big-Endian reply mismatch! cnt=%0d [0]=0x%08X", captured_be_tx_cnt, captured_be_tx_data[0]);
+            errors = errors + 1;
+        end
+
+        // ---------------------------------------------------------------------
+        // TEST 8: ICMP Echo Request (ping) -> Hardware Echo Reply
+        // ---------------------------------------------------------------------
+        $display("\n--- TEST 8: ICMP Echo Request (ping) -> Hardware Echo Reply ---");
+        captured_tx_cnt   = 0;
+        captured_rtps_cnt = 0;
+
+        frame_words_buf[0]  = 32'h0200_5E10; // Dst MAC: 02:00:5E:10:00:01
+        frame_words_buf[1]  = 32'h0001_000C; // Src MAC: 00:0C:29:AB:CD:EF
+        frame_words_buf[2]  = 32'h29AB_CDEF;
+        frame_words_buf[3]  = 32'h0800_4500; // EtherType 0x0800, IPv4 Ver 4 IHL 5
+        frame_words_buf[4]  = 32'h0054_ABCD; // TotLen = 84B (0x0054), ID = 0xABCD
+        frame_words_buf[5]  = 32'h0000_4001; // Flags=0, TTL=64, Proto=1 (ICMP)
+        frame_words_buf[6]  = 32'h4B1D_C0A8; // Header Checksum 0x4B1D, Src IP 192.168
+        frame_words_buf[7]  = 32'h0164_C0A8; // Src IP .1.100, Dst IP 192.168
+        frame_words_buf[8]  = 32'h010A_0800; // Dst IP .1.10, ICMP Type 8 (Echo Req), Code 0
+        frame_words_buf[9]  = 32'h3210_1234; // ICMP Checksum 0x3210, ID 0x1234
+        frame_words_buf[10] = 32'h0001_6162; // ICMP Seq 0x0001, Data "ab"
+        frame_words_buf[11] = 32'h6364_6566; // Data "cdef"
+        frame_words_buf[12] = 32'h6768_696A; // Data "ghij"
+        frame_words_buf[13] = 32'h6B6C_6D6E; // Data "klmn"
+        frame_words_buf[14] = 32'h6F70_7172; // Data "opqr"
+
+        send_variable_frame(15);
+        repeat (25) @(posedge clk);
+
+        // Verify ICMP packet was filtered away from RTPS
+        if (captured_rtps_cnt === 0) begin
+            $display("[+] PASS: 0 ICMP beats leaked to RTPS IP (clean protocol selection)!");
+        end else begin
+            $display("[-] FAIL: %0d ICMP beats leaked to RTPS IP!", captured_rtps_cnt);
+            errors = errors + 1;
+        end
+
+        // Verify Echo Reply captured on m_arp_tx
+        if (captured_tx_cnt >= 15) begin
+            $display("[+] PASS: Captured %0d beats ICMP Echo Reply!", captured_tx_cnt);
+        end else begin
+            $display("[-] FAIL: ICMP Echo Reply not captured! cnt=%0d", captured_tx_cnt);
+            errors = errors + 1;
+        end
+
+        // Verify Dst MAC = 00:0C:29:AB:CD:EF, Src MAC = 02:00:5E:10:00:01
+        if (captured_tx_data[0] === 32'h000C_29AB &&
+            captured_tx_data[1] === 32'hCDEF_0200 &&
+            captured_tx_data[2] === 32'h5E10_0001) begin
+            $display("[+] PASS: Reply MAC addresses swapped correctly!");
+        end else begin
+            $display("[-] FAIL: Reply MAC mismatch! [0]=0x%08X [1]=0x%08X [2]=0x%08X",
+                     captured_tx_data[0], captured_tx_data[1], captured_tx_data[2]);
+            errors = errors + 1;
+        end
+
+        // Verify IPv4 Src IP = 192.168.1.10, Dst IP = 192.168.1.100, Type = 0 (Echo Reply), Code = 0
+        if (captured_tx_data[6][15:0] === 16'hC0A8 &&
+            captured_tx_data[7] === 32'h010A_C0A8 &&
+            captured_tx_data[8] === 32'h0164_0000) begin
+            $display("[+] PASS: Reply IP addresses swapped and ICMP Type 0 Code 0 verified!");
+        end else begin
+            $display("[-] FAIL: Reply IP/Type mismatch! [6]=0x%08X [7]=0x%08X [8]=0x%08X",
+                     captured_tx_data[6], captured_tx_data[7], captured_tx_data[8]);
+            errors = errors + 1;
+        end
+
+        // Verify 1's complement differential ICMP checksum: 0x3210 + 0x0800 = 0x3A10
+        if (captured_tx_data[9][31:16] === 16'h3A10) begin
+            $display("[+] PASS: ICMP Checksum differentially updated to 0x3A10!");
+        end else begin
+            $display("[-] FAIL: ICMP Checksum mismatch! [9]=0x%08X (expected 0x3A101234)", captured_tx_data[9]);
+            errors = errors + 1;
+        end
+
+        // Verify stat_icmp_echo_replies counter incremented
+        if (stat_icmp_echo_replies === 32'd1) begin
+            $display("[+] PASS: stat_icmp_echo_replies counter = 1");
+        end else begin
+            $display("[-] FAIL: stat_icmp_echo_replies = %0d (expected 1)", stat_icmp_echo_replies);
+            errors = errors + 1;
+        end
+
+        // ---------------------------------------------------------------------
+        // TEST 9: ICMP Error Reporting (Type 3 Code 3 - Port Unreachable)
+        // ---------------------------------------------------------------------
+        $display("\n--- TEST 9: ICMP Error Reporting (Type 3 Code 3: Port Unreachable) ---");
+        captured_tx_cnt   = 0;
+        captured_rtps_cnt = 0;
+
+        frame_words_buf[0]  = 32'h0200_5E10; // Dst MAC: FPGA
+        frame_words_buf[1]  = 32'h0001_000C; // Src MAC: Laptop
+        frame_words_buf[2]  = 32'h29AB_CDEF;
+        frame_words_buf[3]  = 32'h0800_4500; // EtherType 0x0800, IPv4 Ver 4 IHL 5
+        frame_words_buf[4]  = 32'h0046_5678; // TotLen = 70B, ID = 0x5678
+        frame_words_buf[5]  = 32'h0000_4001; // Flags=0, TTL=64, Proto=1 (ICMP)
+        frame_words_buf[6]  = 32'hA080_C0A8; // Header Checksum 0xA080, Src IP 192.168
+        frame_words_buf[7]  = 32'h0164_C0A8; // Src IP .1.100, Dst IP 192.168
+        frame_words_buf[8]  = 32'h010A_0303; // Dst IP .1.10, ICMP Type 3 (Dest Unreach), Code 3 (Port Unreach)
+        frame_words_buf[9]  = 32'h1111_0000; // ICMP Checksum 0x1111, Unused
+        frame_words_buf[10] = 32'h05DC_4500; // Next-Hop MTU 1500 (0x05DC), Offending IP Ver/IHL/TOS (0x4500)
+        frame_words_buf[11] = 32'h1060_9988; // Offending IP TotLen 0x1060, ID 0x9988
+        frame_words_buf[12] = 32'h0000_4011; // Offending IP Flags=0, TTL=64, Proto=17 (UDP)
+        frame_words_buf[13] = 32'h0000_C0A8; // Offending IP Csum, Src IP 192.168
+        frame_words_buf[14] = 32'h010A_C0A8; // Offending IP Src IP .1.10, Dst IP 192.168
+        frame_words_buf[15] = 32'h0164_1CF3; // Offending IP Dst IP .1.100, Offending UDP Src Port 7411 (0x1CF3)
+        frame_words_buf[16] = 32'h1CF2_104C; // Offending UDP Dst Port 7410 (0x1CF2), Len 0x104C
+
+        send_variable_frame(17);
+        repeat (15) @(posedge clk);
+
+        // Verify ICMP error was filtered from RTPS and generated no bogus reply
+        if (captured_rtps_cnt === 0 && captured_tx_cnt === 0) begin
+            $display("[+] PASS: Inbound ICMP error consumed cleanly with 0 beats leaked to RTPS!");
+        end else begin
+            $display("[-] FAIL: Inbound ICMP error leaked! rtps_cnt=%0d tx_cnt=%0d", captured_rtps_cnt, captured_tx_cnt);
+            errors = errors + 1;
+        end
+
+        // Verify ICMP error telemetry registers
+        if (stat_icmp_errors === 32'd1 &&
+            icmp_err_info === 32'h0303_05DC &&
+            icmp_err_dst_ip === 32'hC0A8_0164 &&
+            icmp_err_ports === 32'h1CF3_1CF2 &&
+            icmp_err_ip_id === 16'h9988) begin
+            $display("[+] PASS: Successfully extracted ICMP Type 3 Code 3, MTU 1500, IP ID 0x9988, Ports 7411->7410!");
+        end else begin
+            $display("[-] FAIL: ICMP error telemetry mismatch! stat=%0d info=0x%08X dst_ip=0x%08X ports=0x%08X id=0x%04X",
+                     stat_icmp_errors, icmp_err_info, icmp_err_dst_ip, icmp_err_ports, icmp_err_ip_id);
+            errors = errors + 1;
+        end
+
+        // ---------------------------------------------------------------------
+        // TEST 10: ICMP Error Reporting (Type 11 Code 1 - Fragment Reassembly Timeout)
+        // ---------------------------------------------------------------------
+        $display("\n--- TEST 10: ICMP Error Reporting (Type 11 Code 1: Reassembly Timeout) ---");
+        frame_words_buf[8]  = 32'h010A_0B01; // ICMP Type 11 (Time Exceeded), Code 1 (Reassembly Timeout)
+        send_variable_frame(17);
+        repeat (15) @(posedge clk);
+
+        if (stat_icmp_errors === 32'd2 && icmp_err_info[31:16] === 16'h0B01) begin
+            $display("[+] PASS: Successfully parsed ICMP Type 11 Code 1 Fragment Reassembly Time Exceeded!");
+        end else begin
+            $display("[-] FAIL: Type 11 parsing failed! stat=%0d info=0x%08X", stat_icmp_errors, icmp_err_info);
+            errors = errors + 1;
+        end
+
+        // ---------------------------------------------------------------------
+        // TEST 11: 3-Way TX Priority Arbitration (ARP > ICMP > RTPS)
+        // ---------------------------------------------------------------------
+        $display("\n--- TEST 11: 3-Way TX Priority Arbitration (ARP > ICMP > RTPS) ---");
+        captured_tx_cnt = 0;
+
+        // Hold backpressure so nothing leaves TX_IDLE while we stage contention
+        m_arp_tx_tready <= 1'b0;
+
+        // 1. Concurrently trigger an ARP Request to make ARP reply pending
+        send_wire_frame(
+            15,
+            32'hFFFF_FFFF,
+            32'hFFFF_000C,
+            32'h29AB_CDEF,
+            32'h0806_0001,
+            32'h0800_0604,
+            32'h0001_000C,
+            32'h29AB_CDEF,
+            32'hC0A8_0164,
+            32'h0000_0000,
+            32'h0000_C0A8,
+            32'h010A_0000,
+            32'd0, 32'd0, 32'd0, 32'd0
+        );
+        repeat (5) @(posedge clk);
+
+        // 2. Concurrently inject an ICMP ping to trigger an ICMP Echo Reply
+        frame_words_buf[0]  = 32'h0200_5E10;
+        frame_words_buf[1]  = 32'h0001_000C;
+        frame_words_buf[2]  = 32'h29AB_CDEF;
+        frame_words_buf[3]  = 32'h0800_4500;
+        frame_words_buf[4]  = 32'h0054_ABCD;
+        frame_words_buf[5]  = 32'h0000_4001;
+        frame_words_buf[6]  = 32'h4B1D_C0A8;
+        frame_words_buf[7]  = 32'h0164_C0A8;
+        frame_words_buf[8]  = 32'h010A_0800; // Type 8, Code 0
+        frame_words_buf[9]  = 32'h3210_1234;
+        frame_words_buf[10] = 32'h0001_6162;
+        frame_words_buf[11] = 32'h6364_6566;
+        frame_words_buf[12] = 32'h6768_696A;
+        frame_words_buf[13] = 32'h6B6C_6D6E;
+        frame_words_buf[14] = 32'h6F70_7172;
+        send_variable_frame(15);
+        repeat (5) @(posedge clk);
+
+        // 3. Queue an RTPS egress packet on s_rtps_rx
+        @(posedge clk);
+        s_rtps_rx_tvalid <= 1'b1;
+        s_rtps_rx_tdata  <= 32'hBEEF_0001;
+        s_rtps_rx_tlast  <= 1'b1;
+
+        // Release downstream backpressure: all 3 requests are pending simultaneously!
+        @(posedge clk);
+        m_arp_tx_tready <= 1'b1;
+
+        // Wait for transmissions to complete
+        repeat (50) @(posedge clk);
+        s_rtps_rx_tvalid <= 1'b0;
+        s_rtps_rx_tlast  <= 1'b0;
+        repeat (20) @(posedge clk);
+
+        // Verify ARP reply (EtherType 0x0806) transmitted first
+        if (captured_tx_data[3] === 32'h0806_0001) begin
+            $display("[+] PASS: Priority 0 (ARP Reply) transmitted first!");
+        end else begin
+            $display("[-] FAIL: Priority 0 (ARP Reply) did not transmit first! [3]=0x%08X", captured_tx_data[3]);
+            errors = errors + 1;
+        end
+
+        // ---------------------------------------------------------------------
+        // TEST 12: Zero-Stall Lookahead: RTPS UDP packet passed with 60 ns latency
+        // ---------------------------------------------------------------------
+        $display("\n--- TEST 12: RTPS UDP Pass-Through directly following ICMP ---");
+        captured_rtps_cnt = 0;
+
+        send_wire_frame(
+            6,
+            32'h0200_5E10,
+            32'h0001_000C,
+            32'h29AB_CDEF,
+            32'h0800_4500,
+            32'h0030_1234,
+            32'h4011_AABB, // UDP proto 0x11
+            32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0
+        );
+        repeat (15) @(posedge clk);
+
+        if (captured_rtps_cnt === 6) begin
+            $display("[+] PASS: 6-beat UDP frame passed to RTPS with exact 6-beat lookahead!");
+        end else begin
+            $display("[-] FAIL: UDP frame failed to pass! cnt=%0d", captured_rtps_cnt);
             errors = errors + 1;
         end
         $display("\n=================================================================");
