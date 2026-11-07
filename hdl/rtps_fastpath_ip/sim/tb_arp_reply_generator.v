@@ -866,6 +866,90 @@ module tb_arp_reply_generator;
             $display("[-] FAIL: UDP frame failed to pass! cnt=%0d", captured_rtps_cnt);
             errors = errors + 1;
         end
+
+        // ---------------------------------------------------------------------
+        // TEST 13: ARP & ICMP Ping Responds Even When RTPS Downstream is Stalled
+        // ---------------------------------------------------------------------
+        $display("\n--- TEST 13: ARP & ICMP Ping Under Stalled RTPS Consumer (m_rtps_tx_tready = 0) ---");
+        // Downstream RTPS consumer is completely backpressured (e.g. emu_enable=1 or uninitialized)
+        m_rtps_tx_tready  = 1'b0;
+        captured_tx_cnt   = 0;
+        captured_rtps_cnt = 0;
+
+        // 1. Send ambient UDP frame to fill/stall the lookahead FIFO
+        send_wire_frame(
+            8,
+            32'h0200_5E10,
+            32'h0001_000C,
+            32'h29AB_CDEF,
+            32'h0800_4500,
+            32'h0030_1234,
+            32'h4011_AABB, // UDP
+            32'hC0A8_0164, // Src IP
+            32'hC0A8_010A, // Dst IP
+            32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0
+        );
+        repeat (10) @(posedge clk);
+
+        // 2. Send ARP Request for 192.168.1.10 while FIFO has stalled pass-through data
+        send_wire_frame(
+            15,
+            32'hFFFF_FFFF,
+            32'hFFFF_000C,
+            32'h29AB_CDEF,
+            32'h0806_0001,
+            32'h0800_0604,
+            32'h0001_000C,
+            32'h29AB_CDEF,
+            32'hC0A8_0164,
+            32'h0000_0000,
+            32'h0000_C0A8,
+            32'h010A_0000,
+            32'h0000_0000,
+            32'h0000_0000,
+            32'h0000_0000,
+            32'h0000_0000
+        );
+        repeat (20) @(posedge clk);
+
+        if (captured_tx_cnt === 15 && captured_tx_data[7] === 32'hC0A8_010A) begin
+            $display("[+] PASS: ARP Reply for 192.168.1.10 transmitted successfully despite stalled RTPS!");
+        end else begin
+            $display("[-] FAIL: ARP Reply blocked by stalled RTPS! captured_tx_cnt=%0d", captured_tx_cnt);
+            errors = errors + 1;
+        end
+
+        // 3. Send ICMP Echo Request (ping 192.168.1.10) while RTPS consumer is still stalled
+        captured_tx_cnt = 0;
+        send_wire_frame(
+            15,
+            32'h0200_5E10,
+            32'h0001_000C,
+            32'h29AB_CDEF,
+            32'h0800_4500,
+            32'h003C_1234,
+            32'h4001_A080, // proto 0x01 (ICMP)
+            32'hC0A8_0164,
+            32'hC0A8_010A,
+            32'h0800_4D5A, // Type 8, Code 0
+            32'h0001_0001,
+            32'h6162_6364,
+            32'h6566_6768,
+            32'h696A_6B6C,
+            32'h6D6E_6F70,
+            32'h7172_7374
+        );
+        repeat (25) @(posedge clk);
+
+        if (captured_tx_cnt === 15 && captured_tx_data[8][15:0] === 16'h0000) begin
+            $display("[+] PASS: ICMP Echo Reply (Type 0) transmitted successfully despite stalled RTPS!");
+        end else begin
+            $display("[-] FAIL: ICMP Echo Reply blocked by stalled RTPS! captured_tx_cnt=%0d", captured_tx_cnt);
+            errors = errors + 1;
+        end
+
+        m_rtps_tx_tready = 1'b1; // Restore ready
+        repeat (10) @(posedge clk);
         $display("\n=================================================================");
         if (errors === 0) begin
             $display("[+] ALL TESTS PASSED! ARP_REPLY_GENERATOR IS 100%% VERIFIED!");

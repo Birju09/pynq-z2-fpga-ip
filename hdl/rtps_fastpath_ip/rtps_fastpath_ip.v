@@ -399,7 +399,7 @@ module rtps_fastpath_ip #(
     assign eng_rx_tvalid      = emu_enable ? emu_rx_tvalid : s_axis_wire_tvalid;
     assign eng_rx_tlast       = emu_enable ? emu_rx_tlast  : s_axis_wire_tlast;
     assign emu_rx_tready      = emu_enable ? eng_rx_tready : 1'b0;
-    assign s_axis_wire_tready = emu_enable ? 1'b0          : eng_rx_tready;
+    assign s_axis_wire_tready = emu_enable ? 1'b1          : eng_rx_tready;
 
     rtps_peer_emulator #(
         .DATA_WIDTH  (DATA_WIDTH),

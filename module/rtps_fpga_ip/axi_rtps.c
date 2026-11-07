@@ -1643,12 +1643,17 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     dmadev->plugin_rx_rtps_mode = 1;
     dmadev->bypass_crc          = 1;
     if (dmadev->ip_regs) {
+        /* Default to physical wire enabled (RTPS_CTRL_EMU_EN = 0) so ARP and Ping work immediately */
         u32 default_ctrl = RTPS_CTRL_ENABLE |
                            (1U << RTPS_CTRL_NUM_WRITERS_SHIFT) |
-                           RTPS_CTRL_EMU_EN |
                            RTPS_CTRL_PUB_ONLY |
                            RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
         iowrite32(default_ctrl, dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
+
+        /* Initialize Local Participant Identity: IP 192.168.1.10 and MAC 02:00:5E:10:00:01 */
+        iowrite32(0xC0A8010AU,               dmadev->ip_regs + RTPS_IP_LOCAL_IP_OFFSET);
+        iowrite32(0x5E100001U,               dmadev->ip_regs + RTPS_IP_LOCAL_MAC_LO_OFFSET);
+        iowrite32((0x0101U << 16) | 0x0200U, dmadev->ip_regs + RTPS_IP_LOCAL_MAC_HI_OFFSET);
     }
 
     platform_set_drvdata(pdev, dmadev);

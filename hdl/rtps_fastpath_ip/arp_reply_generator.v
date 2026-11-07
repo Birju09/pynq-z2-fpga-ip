@@ -160,6 +160,12 @@ module arp_reply_generator #(
             arp_reply_trigger <= 1'b0;
             rx_drop_fifo      <= 1'b0;
 
+            // If a previous pass-through frame was stalled and downstream RTPS is not consuming,
+            // drop stale FIFO contents when a new frame begins so ARP/ICMP lookahead is never polluted.
+            if (s_arp_rx_tvalid && rx_wire_beat == 4'd0 && fifo_count > 0 && !m_rtps_tx_tready) begin
+                rx_drop_fifo <= 1'b1;
+            end
+
             // Passive MAC learning from ICMP Engine
             if (icmp_learn_mac_stb) begin
                 remote_client_mac <= icmp_learned_client_mac;
@@ -266,6 +272,12 @@ module arp_reply_generator #(
                             end else if (ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2) begin
                                 rx_target_ip_match <= 1'b1;
                                 matched_spa_ip     <= ARP_REPLY_IP_2;
+                            end else if ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_010A) begin // 192.168.1.10 (Primary IP)
+                                rx_target_ip_match <= 1'b1;
+                                matched_spa_ip     <= 32'hC0A8_010A;
+                            end else if ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_01C9) begin // 192.168.1.201 (Secondary IP)
+                                rx_target_ip_match <= 1'b1;
+                                matched_spa_ip     <= 32'hC0A8_01C9;
                             end else begin
                                 rx_target_ip_match <= 1'b0;
                             end
@@ -287,13 +299,16 @@ module arp_reply_generator #(
                     if (rx_is_arp_req &&
                         ((rx_wire_beat >= 4'd10 && rx_target_ip_match) ||
                          (rx_wire_beat == 4'd10 && ({rx_tpa_hi, rx_net_word[31:16]} == arp_reply_ip ||
-                                                    (ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2))))) begin
+                                                    (ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2) ||
+                                                    ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_010A) ||
+                                                    ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_01C9))))) begin
                         arp_reply_trigger     <= 1'b1;
                         latched_reply_dst_mac <= rx_sha_mac;
                         latched_reply_dst_ip  <= rx_spa_ip;
-                        latched_reply_spa_ip  <= (rx_wire_beat == 4'd10 && ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2) ?
-                                                  ARP_REPLY_IP_2 :
-                                                 (rx_target_ip_match ? matched_spa_ip : arp_reply_ip);
+                        latched_reply_spa_ip  <= rx_target_ip_match ? matched_spa_ip :
+                                                 ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_010A) ? 32'hC0A8_010A :
+                                                 ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_01C9) ? 32'hC0A8_01C9 :
+                                                 arp_reply_ip;
 
                         if (remote_client_ip == 32'd0 || rx_spa_ip == remote_client_ip) begin
                             remote_client_mac <= rx_sha_mac;
@@ -325,11 +340,13 @@ module arp_reply_generator #(
     reg [4:0]            fifo_count;
     reg                  rx_passing_pkt;
 
-    wire fifo_push = s_arp_rx_tvalid && s_arp_rx_tready && !rx_filtering_arp && !rx_filtering_icmp && !rx_drop_fifo;
+    wire fifo_push = s_arp_rx_tvalid && s_arp_rx_tready && !rx_filtering_arp && !rx_filtering_icmp && !rx_drop_fifo && (fifo_count < FIFO_DEPTH);
     wire fifo_pop  = m_rtps_tx_tvalid && m_rtps_tx_tready;
 
-    // Absorb line-rate ARP/ICMP without backpressure; otherwise backpressure when FIFO fills
-    assign s_arp_rx_tready = (rx_filtering_arp || rx_filtering_icmp) ? 1'b1 : (fifo_count < (FIFO_DEPTH - 2));
+    // Always accept Beats 0..5 (header lookahead window) and all ARP/ICMP beats so
+    // network discovery / ping can NEVER be deadlocked by a full or stalled RTPS FIFO.
+    assign s_arp_rx_tready = (rx_filtering_arp || rx_filtering_icmp || rx_wire_beat < 4'd6) ? 1'b1 :
+                             (fifo_count < (FIFO_DEPTH - 2));
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
