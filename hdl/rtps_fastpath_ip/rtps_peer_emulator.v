@@ -231,6 +231,8 @@ module rtps_peer_emulator #(
     // Computed in 2 stages (adder tree + fold) during Beat 0 and 1, latched on Beat 3
     reg [19:0] emu_ipcs_stg0;
     reg [15:0] emu_ipcs_stg1;
+    wire [16:0] emu_ipcs_fold1 = {1'b0, emu_ipcs_stg0[15:0]} + {13'd0, emu_ipcs_stg0[19:16]};
+    wire [15:0] emu_ipcs_fold2 = emu_ipcs_fold1[15:0] + {15'd0, emu_ipcs_fold1[16]};
     always @(posedge clk) begin
         if (!rst_n) begin
             emu_ipcs_stg0 <= 20'd0;
@@ -241,7 +243,7 @@ module rtps_peer_emulator #(
                              {4'd0, 16'h4011} +
                              {4'd0, latched_dst_ip[31:16]} + {4'd0, latched_dst_ip[15:0]} +
                              {4'd0, latched_src_ip[31:16]} + {4'd0, latched_src_ip[15:0]};
-            emu_ipcs_stg1 <= ~(emu_ipcs_stg0[15:0] + {12'd0, emu_ipcs_stg0[19:16]});
+            emu_ipcs_stg1 <= ~emu_ipcs_fold2;
         end
     end
 
@@ -491,24 +493,24 @@ module rtps_peer_emulator #(
                         case (fault_ctrl[1] ? ((frag_step == 2'd0) ? 2'd1 : (frag_step == 2'd1) ? 2'd0 : 2'd2) : frag_step)
                             2'd0: begin
                                 cur_frag_word_off <= 12'd0;
-                                cur_frag_words    <= 12'd370; // 1,480 bytes
-                                cur_frag_ip_len   <= 16'd1500;
+                                cur_frag_words    <= 12'd368; // 1,472 bytes
+                                cur_frag_ip_len   <= 16'd1492;
                                 cur_frag_flags    <= {3'b001, 13'd0}; // MF=1, offset=0
                                 tx_ram_rd_addr    <= 12'd0;
                             end
                             2'd1: begin
-                                cur_frag_word_off <= 12'd370;
-                                cur_frag_words    <= 12'd370; // 1,480 bytes
-                                cur_frag_ip_len   <= 16'd1500;
-                                cur_frag_flags    <= {3'b001, 13'd185}; // MF=1, offset=185 (1480/8)
-                                tx_ram_rd_addr    <= 12'd370;
+                                cur_frag_word_off <= 12'd368;
+                                cur_frag_words    <= 12'd368; // 1,472 bytes
+                                cur_frag_ip_len   <= 16'd1492;
+                                cur_frag_flags    <= {3'b001, 13'd184}; // MF=1, offset=184 (1472/8)
+                                tx_ram_rd_addr    <= 12'd368;
                             end
                             default: begin
-                                cur_frag_word_off <= 12'd740;
-                                cur_frag_words    <= total_dgram_words - 12'd740; // 301 words = 1,204 bytes
-                                cur_frag_ip_len   <= 16'd20 + {2'b00, (total_dgram_words - 12'd740), 2'b00};
-                                cur_frag_flags    <= {3'b000, 13'd370}; // MF=0, offset=370 (2960/8)
-                                tx_ram_rd_addr    <= 12'd740;
+                                cur_frag_word_off <= 12'd736;
+                                cur_frag_words    <= total_dgram_words - 12'd736; // 305 words = 1,220 bytes
+                                cur_frag_ip_len   <= 16'd20 + {2'b00, (total_dgram_words - 12'd736), 2'b00};
+                                cur_frag_flags    <= {3'b000, 13'd368}; // MF=0, offset=368 (2944/8)
+                                tx_ram_rd_addr    <= 12'd736;
                             end
                         endcase
 

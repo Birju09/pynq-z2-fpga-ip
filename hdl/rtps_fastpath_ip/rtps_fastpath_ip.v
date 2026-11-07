@@ -697,7 +697,9 @@ module rtps_fastpath_ip #(
     wire [15:0] wr0_dst_port   = active_wr_edt[0][2][15:0];
     wire [47:0] wr0_configured_dst_mac = {active_wr_edt[0][4][15:0], active_wr_edt[0][3]};
     wire [47:0] wr0_learned_dst_mac    = (remote_client_mac != 48'd0) ? remote_client_mac : last_rx_src_mac;
-    wire [47:0] wr0_dst_mac            = (wr0_configured_dst_mac != 48'd0) ? wr0_configured_dst_mac : wr0_learned_dst_mac;
+    wire [47:0] wr0_dst_mac            = (wr0_configured_dst_mac != 48'd0) ? wr0_configured_dst_mac :
+                                         (wr0_learned_dst_mac    != 48'd0) ? wr0_learned_dst_mac :
+                                         (emu_enable ? 48'h0200_5E20_0002 : 48'hFFFF_FFFF_FFFF);
     wire wr0_route_valid               = (wr0_dst_ip != 32'd0) && (wr0_dst_port != 16'd0) && (wr0_dst_mac != 48'd0);
     wire generation_match          = (shadow_generation == 32'd0) || (active_generation == shadow_generation);
 
@@ -1056,8 +1058,8 @@ module rtps_fastpath_ip #(
     // =========================================================================
     localparam integer ETH_MTU_BYTES        = 1500;
     localparam integer IPV4_HDR_BYTES       = 20;
-    localparam integer IPV4_PAYLOAD_MAX     = ETH_MTU_BYTES - IPV4_HDR_BYTES; // 1480
-    localparam integer IPV4_NONFINAL_PAYLOAD = (IPV4_PAYLOAD_MAX / 8) * 8;     // 1480
+    localparam integer IPV4_PAYLOAD_MAX     = 1472; // Enforce <= 1514B Ethernet frame limit (14B Eth + 20B IP + 1472B = 1506B)
+    localparam integer IPV4_NONFINAL_PAYLOAD = 1472;
 
     reg [ADDR_WIDTH:0] pkt_len;
     reg [15:0]         pacing_timer;
@@ -1208,6 +1210,8 @@ module rtps_fastpath_ip #(
     // Pipelined IPv4 Header Checksum: computed in 2 stages during Beat 0 and Beat 1
     reg [19:0] ipcs_stg0;
     reg [15:0] ipcs_stg1;
+    wire [16:0] ipcs_fold1 = {1'b0, ipcs_stg0[15:0]} + {13'd0, ipcs_stg0[19:16]};
+    wire [15:0] ipcs_fold2 = ipcs_fold1[15:0] + {15'd0, ipcs_fold1[16]};
     always @(posedge clk) begin
         if (!rst_n) begin
             ipcs_stg0 <= 20'd0;
@@ -1218,7 +1222,7 @@ module rtps_fastpath_ip #(
                          {4'd0, 16'h4011} +
                          {4'd0, local_src_ip[31:16]} + {4'd0, local_src_ip[15:0]} +
                          {4'd0, wr0_dst_ip[31:16]}   + {4'd0, wr0_dst_ip[15:0]};
-            ipcs_stg1 <= ~(ipcs_stg0[15:0] + {12'd0, ipcs_stg0[19:16]});
+            ipcs_stg1 <= ~ipcs_fold2;
         end
     end
     wire [15:0] calc_tx_ip_hdr_csum = ipcs_stg1;
@@ -2009,8 +2013,8 @@ module rtps_fastpath_ip #(
                         if (tx_bytes_remaining > IPV4_NONFINAL_PAYLOAD) begin
                             tx_frag_payload_bytes <= IPV4_NONFINAL_PAYLOAD;
                             tx_frag_more          <= 1'b1;
-                            tx_frag_words         <= (IPV4_NONFINAL_PAYLOAD >> 2); // 370 words (1480B)
-                            tx_frag_ip_len        <= IPV4_HDR_BYTES + IPV4_NONFINAL_PAYLOAD; // 1500 bytes
+                            tx_frag_words         <= (IPV4_NONFINAL_PAYLOAD >> 2); // 368 words (1472B)
+                            tx_frag_ip_len        <= IPV4_HDR_BYTES + IPV4_NONFINAL_PAYLOAD; // 1492 bytes
                             tx_frag_flags         <= {2'b00, 1'b1, tx_frag_offset_bytes[15:3]}; // MF=1
                         end else begin
                             tx_frag_payload_bytes <= tx_bytes_remaining;

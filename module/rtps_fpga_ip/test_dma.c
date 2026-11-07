@@ -760,6 +760,16 @@ struct async_ctx {
     double                 pub_rate_actual;
     double                 sub_rate_actual;
     double*                sub_latencies_us;
+    const char*            pcap_filename;
+    int                    pcap_wire_frags;
+    rtps_pcap_dumper_t*    pcap_dumper;
+    pthread_mutex_t        pcap_lock;
+    uint8_t                master_mac[6];
+    uint8_t                peer_mac[6];
+    uint32_t               master_ip;
+    uint32_t               peer_ip;
+    uint16_t               master_port;
+    uint16_t               peer_port;
 };
 
 static void* async_publisher_thread(void* arg) {
@@ -800,6 +810,38 @@ static void* async_publisher_thread(void* arg) {
         int rc = DDS_DataWriter_write(ctx->plugin, &tx_sample);
         if (rc == 0) {
             ctx->published_count++;
+            if (ctx->pcap_dumper) {
+                uint32_t tx_rtps_buf[RTPS_FULL_MSG_WORDS];
+                tx_rtps_buf[0] = 0x52545053; /* "RTPS" */
+                tx_rtps_buf[1] = 0x02010110; /* Version 2.1, VendorId 0x0110 (Cyclone DDS) */
+                tx_rtps_buf[2] = ctx->plugin->edt_cfg.local_guid_prefix[0];
+                tx_rtps_buf[3] = ctx->plugin->edt_cfg.local_guid_prefix[1];
+                tx_rtps_buf[4] = ctx->plugin->edt_cfg.local_guid_prefix[2];
+                tx_rtps_buf[5] = 0x09010800; /* INFO_TS */
+                tx_rtps_buf[6] = __builtin_bswap32((uint32_t)(tx_sample.tx_timestamp_ns / 1000000000ULL));
+                tx_rtps_buf[7] = __builtin_bswap32((uint32_t)(((tx_sample.tx_timestamp_ns % 1000000000ULL) << 32) / 1000000000ULL));
+                uint16_t tx_data_octets = (uint16_t)(24 + sizeof(struct FastSample));
+                tx_rtps_buf[8]  = 0x15050000 | __builtin_bswap16(tx_data_octets);
+                tx_rtps_buf[9]  = 0x00001000;
+                tx_rtps_buf[10] = 0x00000000;
+                tx_rtps_buf[11] = 0x00000102;
+                tx_rtps_buf[12] = 0x00000000;
+                tx_rtps_buf[13] = __builtin_bswap32((uint32_t)iter);
+                tx_rtps_buf[14] = 0x00010000; /* CDR_LE */
+                memcpy(&tx_rtps_buf[15], &tx_sample, sizeof(struct FastSample));
+
+                pthread_mutex_lock(&ctx->pcap_lock);
+                if (ctx->pcap_wire_frags) {
+                    rtps_pcap_dump_fragments(ctx->pcap_dumper, &now, ctx->master_mac, ctx->peer_mac,
+                                             ctx->master_ip, ctx->peer_ip, ctx->master_port, ctx->peer_port,
+                                             (uint16_t)iter, tx_rtps_buf, RTPS_FULL_MSG_BYTES);
+                } else {
+                    rtps_pcap_dump_udp(ctx->pcap_dumper, &now, ctx->master_mac, ctx->peer_mac,
+                                       ctx->master_ip, ctx->peer_ip, ctx->master_port, ctx->peer_port,
+                                       (uint16_t)iter, tx_rtps_buf, RTPS_FULL_MSG_BYTES);
+                }
+                pthread_mutex_unlock(&ctx->pcap_lock);
+            }
         } else {
             fprintf(stderr, "[-] pub write failed at iter %d (rc=%d, errno=%d)\n", iter, rc, errno);
             break;
@@ -829,6 +871,19 @@ static void* async_subscriber_thread(void* arg) {
                 }
             }
             ctx->received_count++;
+            if (ctx->pcap_dumper && ctx->plugin->rx_mmap_buf) {
+                pthread_mutex_lock(&ctx->pcap_lock);
+                if (ctx->pcap_wire_frags) {
+                    rtps_pcap_dump_fragments(ctx->pcap_dumper, &now, ctx->peer_mac, ctx->master_mac,
+                                             ctx->peer_ip, ctx->master_ip, ctx->peer_port, ctx->master_port,
+                                             (uint16_t)(ctx->received_count + 1000), ctx->plugin->rx_mmap_buf, RTPS_FULL_MSG_BYTES);
+                } else {
+                    rtps_pcap_dump_udp(ctx->pcap_dumper, &now, ctx->peer_mac, ctx->master_mac,
+                                       ctx->peer_ip, ctx->master_ip, ctx->peer_port, ctx->master_port,
+                                       (uint16_t)(ctx->received_count + 1000), ctx->plugin->rx_mmap_buf, RTPS_FULL_MSG_BYTES);
+                }
+                pthread_mutex_unlock(&ctx->pcap_lock);
+            }
             if (ctx->received_count % 200 == 0 || ctx->received_count == (uint32_t)ctx->iterations) {
                 printf("  Progress: [%u/%d] (%.1f%%)\n",
                        ctx->received_count, ctx->iterations,
@@ -856,7 +911,11 @@ static void* async_subscriber_thread(void* arg) {
     return NULL;
 }
 
-static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int iterations, int rate_hz) {
+static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int iterations, int rate_hz,
+                                      const char* pcap_filename, int pcap_wire_frags,
+                                      const uint8_t master_mac[6], const uint8_t peer_mac[6],
+                                      uint32_t master_ip, uint32_t peer_ip,
+                                      uint16_t master_port, uint16_t peer_port) {
     printf("=================================================================\n");
     printf("     True Asynchronous 1 kHz - 2 kHz Decoupled Pub/Sub Benchmark \n");
     printf("=================================================================\n");
@@ -873,8 +932,33 @@ static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int
     ctx.rate_hz         = rate_hz;
     ctx.iterations      = iterations;
     ctx.running         = 1;
+    ctx.pcap_filename   = pcap_filename;
+    ctx.pcap_wire_frags = pcap_wire_frags;
+    memcpy(ctx.master_mac, master_mac, 6);
+    memcpy(ctx.peer_mac, peer_mac, 6);
+    ctx.master_ip       = master_ip;
+    ctx.peer_ip         = peer_ip;
+    ctx.master_port     = master_port;
+    ctx.peer_port       = peer_port;
+    pthread_mutex_init(&ctx.pcap_lock, NULL);
+
+    rtps_pcap_dumper_t pcap_dumper = {0};
+    if (pcap_filename) {
+        if (rtps_pcap_open(&pcap_dumper, pcap_filename) == 0) {
+            printf("[+] PCAP capture enabled -> writing packets to '%s' (%s)\n",
+                   pcap_filename, pcap_wire_frags ? "3-Fragment Wire Format" : "Full Reassembled UDP");
+            ctx.pcap_dumper = &pcap_dumper;
+        } else {
+            fprintf(stderr, "[-] Failed to open PCAP file '%s': %s\n", pcap_filename, strerror(errno));
+        }
+    }
+
     ctx.sub_latencies_us= (double*)malloc(iterations * sizeof(double));
-    if (!ctx.sub_latencies_us) return 1;
+    if (!ctx.sub_latencies_us) {
+        if (ctx.pcap_dumper) rtps_pcap_close(ctx.pcap_dumper);
+        pthread_mutex_destroy(&ctx.pcap_lock);
+        return 1;
+    }
 
     pthread_t pub_tid, sub_tid;
     struct timespec t_start, t_end;
@@ -890,6 +974,13 @@ static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int
     }
     ctx.running = 0;
     pthread_join(sub_tid, NULL);
+
+    if (ctx.pcap_dumper) {
+        printf("[+] Saved %u packets to '%s' (Wireshark PCAP)\n\n", ctx.pcap_dumper->pkt_count, pcap_filename);
+        rtps_pcap_close(ctx.pcap_dumper);
+        ctx.pcap_dumper = NULL;
+    }
+    pthread_mutex_destroy(&ctx.pcap_lock);
 
     clock_gettime(CLOCK_MONOTONIC, &t_end);
     double total_sec = timespec_to_us(&t_start, &t_end) / 1e6;
@@ -1149,6 +1240,27 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    uint8_t master_mac[6] = {
+        (uint8_t)((plugin.edt_cfg.local_mac_hi >> 8) & 0xFF),
+        (uint8_t)(plugin.edt_cfg.local_mac_hi & 0xFF),
+        (uint8_t)((plugin.edt_cfg.local_mac_lo >> 24) & 0xFF),
+        (uint8_t)((plugin.edt_cfg.local_mac_lo >> 16) & 0xFF),
+        (uint8_t)((plugin.edt_cfg.local_mac_lo >> 8) & 0xFF),
+        (uint8_t)(plugin.edt_cfg.local_mac_lo & 0xFF)
+    };
+    uint8_t peer_mac[6] = {
+        (uint8_t)((peer_mac_hi >> 8) & 0xFF),
+        (uint8_t)(peer_mac_hi & 0xFF),
+        (uint8_t)((peer_mac_lo >> 24) & 0xFF),
+        (uint8_t)((peer_mac_lo >> 16) & 0xFF),
+        (uint8_t)((peer_mac_lo >> 8) & 0xFF),
+        (uint8_t)(peer_mac_lo & 0xFF)
+    };
+    uint32_t master_ip   = 0xC0A801C9; /* 192.168.1.201 (Dedicated PL TX Secondary IP) */
+    uint32_t peer_ip     = 0xC0A80164; /* 192.168.1.100 */
+    uint16_t master_port = 7411;
+    uint16_t peer_port   = 7410;
+
     printf("=================================================================\n");
     printf("  Hybrid PS+PL RTPS v2.x Fast-Path & Option B Transport Benchmark\n");
     printf("  Target        : %s\n", DEVICE_PATH);
@@ -1160,7 +1272,7 @@ int main(int argc, char* argv[]) {
            enable_peer_emu
                ? "Integrated RTI Peer Emulator (100 MHz Hardware Fabric Loopback)"
                : "Physical Ethernet Wire (LAN8720 RMII PHY -> RJ45)");
-    printf("  Wire Framing  : 3 IPv4 Fragments/Sample (1480B + 1480B + 1204B)\n");
+    printf("  Wire Framing  : 3 IPv4 Fragments/Sample (1472B + 1472B + 1220B)\n");
     printf("  Peer Endpoint : 192.168.1.100:7410 (GUID 01010002-BB000002-00000002)\n");
     printf("  Buffer Mode   : %s\n",
            plugin.use_mmap ? "Zero-Copy Direct Coherent mmap (get_loan)"
@@ -1169,7 +1281,9 @@ int main(int argc, char* argv[]) {
     printf("=================================================================\n\n");
 
     if (async_mode) {
-        int async_rc = run_async_pubsub_benchmark(&plugin, fd, iterations, target_rate_hz);
+        int async_rc = run_async_pubsub_benchmark(&plugin, fd, iterations, target_rate_hz,
+                                                  pcap_filename, pcap_wire_frags,
+                                                  master_mac, peer_mac, master_ip, peer_ip, master_port, peer_port);
         FpgaTransport_cleanup_plugin(&plugin);
         free(latencies_roundtrip);
         free(latencies_tx);
@@ -1267,13 +1381,6 @@ int main(int argc, char* argv[]) {
 
         /* Dump TX and RX packets to PCAP if capturing */
         if (pcap_filename) {
-            uint8_t master_mac[6] = {0x00, 0x01, 0x5E, 0x10, 0x00, 0x02};
-            uint8_t peer_mac[6]   = {0x00, 0x02, 0x5E, 0x20, 0x00, 0x02};
-            uint32_t master_ip    = 0xC0A801C9; /* 192.168.1.201 (PL TX Secondary IP) */
-            uint32_t peer_ip      = 0xC0A80164; /* 192.168.1.100 */
-            uint16_t master_port  = 7411;
-            uint16_t peer_port    = 7410;
-
             /* 1. Build & Dump Complete Wire RTPS message for TX (Command) */
             uint32_t tx_rtps_buf[RTPS_FULL_MSG_WORDS];
             /* RTPS Header */

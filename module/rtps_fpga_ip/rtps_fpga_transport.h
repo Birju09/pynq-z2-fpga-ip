@@ -330,7 +330,7 @@ static inline int FpgaTransport_init_plugin(
     plugin->edt_cfg.local_guid_prefix[2] = 0x00000001U;
     plugin->edt_cfg.local_ip             = 0xC0A8010AU; /* 192.168.1.10 */
     plugin->edt_cfg.local_mac_lo         = 0x5E100001U;
-    plugin->edt_cfg.local_mac_hi         = 0x0000U;
+    plugin->edt_cfg.local_mac_hi         = 0x0200U;
     plugin->edt_cfg.local_vendor_id      = 0x0101U;     /* RTI Connext VendorId (0x0101) */
     plugin->edt_cfg.num_writers          = 1;
     plugin->edt_cfg.plugin_rx_rtps_mode  = (uint8_t)plugin->option_b_rtps_rx_mode;

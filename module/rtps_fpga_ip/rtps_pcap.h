@@ -196,9 +196,9 @@ static inline int rtps_pcap_dump_udp(rtps_pcap_dumper_t* dumper,
 /*
  * Dump 3-Fragment wire format:
  * Splits a full RTPS UDP datagram into 3 IPv4 fragments identical to the FPGA hardware wire framing:
- * - Fragment 0: MF=1, Offset=0   (1480B payload: 8B UDP + 1472B RTPS)
- * - Fragment 1: MF=1, Offset=185 (1480B payload: RTPS +1472..+2951)
- * - Fragment 2: MF=0, Offset=370 (Remaining payload bytes)
+ * - Fragment 0: MF=1, Offset=0   (1472B payload: 8B UDP + 1464B RTPS)
+ * - Fragment 1: MF=1, Offset=184 (1472B payload: RTPS +1464..+2935)
+ * - Fragment 2: MF=0, Offset=368 (Remaining payload bytes)
  */
 static inline int rtps_pcap_dump_fragments(rtps_pcap_dumper_t* dumper,
                                            const struct timespec* ts,
@@ -230,11 +230,11 @@ static inline int rtps_pcap_dump_fragments(rtps_pcap_dumper_t* dumper,
     free(wire_payload);
 
     /* Fragment parameters matching PL fabric */
-    uint32_t frag_offsets[3] = {0, 1480, 2960};
+    uint32_t frag_offsets[3] = {0, 1472, 2944};
     uint32_t frag_lens[3];
-    frag_lens[0] = 1480;
-    frag_lens[1] = 1480;
-    frag_lens[2] = (udp_total_len > 2960) ? (udp_total_len - 2960) : 0;
+    frag_lens[0] = 1472;
+    frag_lens[1] = 1472;
+    frag_lens[2] = (udp_total_len > 2944) ? (udp_total_len - 2944) : 0;
 
     struct eth_hdr eth;
     memcpy(eth.dst_mac, dst_mac, 6);
