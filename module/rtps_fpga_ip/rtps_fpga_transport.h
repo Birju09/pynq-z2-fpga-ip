@@ -2,6 +2,7 @@
 #define _RTPS_FPGA_TRANSPORT_H_
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -747,7 +748,7 @@ static inline int fpga_fastpath_take(
     if (fpga->reader_state[reader_slot] != FPGA_LIFECYCLE_ACTIVE)
         return -EPERM;
 
-    void* rx_target = fpga->use_mmap ? fpga->rx_buf : malloc(RTPS_FULL_MSG_BYTES);
+    void* rx_target = fpga->use_mmap ? (void*)fpga->rx_buf : malloc(RTPS_FULL_MSG_BYTES);
     if (!rx_target)
         return -ENOMEM;
 

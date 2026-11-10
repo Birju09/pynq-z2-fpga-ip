@@ -1,0 +1,13 @@
+// ============================================================================
+// FastSample.idl
+//
+// 4,096-Byte Hardware-Accelerated Sample Definition (@final @flat_data)
+// Matches the PYNQ-Z2 RTPS Fastpath IP Framing & Memory Contract
+// ============================================================================
+
+struct FastSample {
+    unsigned long cycle_id;
+    unsigned long flags;
+    unsigned long long tx_timestamp_ns;
+    unsigned long payload[1020];
+};

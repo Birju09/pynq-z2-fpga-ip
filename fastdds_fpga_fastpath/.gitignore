@@ -1,0 +1,5 @@
+build/
+build-armhf/
+build-x86_64/
+*.o
+*.a
