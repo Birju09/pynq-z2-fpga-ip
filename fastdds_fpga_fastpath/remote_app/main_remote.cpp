@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,6 +38,12 @@
 #include <fastdds/dds/topic/Topic.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
+#if __has_include(<fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>)
+#include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
+#else
+#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
+#endif
+
 #include "../idl/FastSample.hpp"
 #include "../idl/FastSamplePubSubTypes.hpp"
 
@@ -50,9 +57,12 @@ static void sigint_handler(int) {
 
 class RemoteNode {
 public:
-    RemoteNode(uint32_t domain_id, const std::string& topic_name, bool echo_mode, bool pub_mode, int pub_rate_hz)
+    RemoteNode(uint32_t domain_id, const std::string& topic_name,
+               bool echo_mode, bool pub_mode, int pub_rate_hz,
+               const std::string& interface_ip, const std::string& peer_ip)
         : domain_id_(domain_id), topic_name_(topic_name),
           echo_mode_(echo_mode), pub_mode_(pub_mode), pub_rate_hz_(pub_rate_hz),
+          interface_ip_(interface_ip), peer_ip_(peer_ip),
           samples_received_(0), samples_sent_(0), corrupted_samples_(0), seq_gaps_(0),
           last_seq_(0) {}
 
@@ -63,6 +73,34 @@ public:
     bool init() {
         DomainParticipantQos pqos = PARTICIPANT_QOS_DEFAULT;
         pqos.name("Remote_Workstation_FastDDS_Node");
+
+        if (!interface_ip_.empty()) {
+            pqos.transport().use_builtin_transports = false;
+            auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
+            udp_transport->interfaceWhiteList.push_back(interface_ip_);
+            pqos.transport().user_transports.push_back(udp_transport);
+            std::cout << "[RemoteNode] Bound Fast DDS to interface: " << interface_ip_ << "\n";
+        }
+
+        if (!peer_ip_.empty()) {
+            struct in_addr peer_addr;
+            if (inet_pton(AF_INET, peer_ip_.c_str(), &peer_addr) == 1) {
+                uint32_t pip = ntohl(peer_addr.s_addr);
+#if FASTDDS_V3
+                eprosima::fastdds::rtps::Locator_t peer_loc;
+#else
+                eprosima::fastrtps::rtps::Locator_t peer_loc;
+#endif
+                peer_loc.kind = 1; // LOCATOR_KIND_UDPv4
+                peer_loc.port = 0;
+                peer_loc.address[12] = static_cast<uint8_t>((pip >> 24) & 0xFF);
+                peer_loc.address[13] = static_cast<uint8_t>((pip >> 16) & 0xFF);
+                peer_loc.address[14] = static_cast<uint8_t>((pip >> 8) & 0xFF);
+                peer_loc.address[15] = static_cast<uint8_t>(pip & 0xFF);
+                pqos.wire_protocol().builtin.initialPeersList.push_back(peer_loc);
+                std::cout << "[RemoteNode] Added Unicast SPDP Peer: " << peer_ip_ << "\n";
+            }
+        }
 
         participant_ = DomainParticipantFactory::get_instance()->create_participant(domain_id_, pqos);
         if (!participant_) {
@@ -295,6 +333,8 @@ private:
     bool echo_mode_;
     bool pub_mode_;
     int pub_rate_hz_;
+    std::string interface_ip_;
+    std::string peer_ip_;
 
     std::atomic<uint32_t> samples_received_;
     std::atomic<uint32_t> samples_sent_;
@@ -327,6 +367,8 @@ int main(int argc, char* argv[]) {
     bool pub_mode = false;
     int pub_rate_hz = 1000;
     int max_samples = 0; // 0 = run until Ctrl+C
+    std::string interface_ip = "";
+    std::string peer_ip = "";
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -342,11 +384,17 @@ int main(int argc, char* argv[]) {
             pub_rate_hz = std::stoi(argv[++i]);
         } else if (arg == "--samples" && i + 1 < argc) {
             max_samples = std::stoi(argv[++i]);
+        } else if (arg == "--interface" && i + 1 < argc) {
+            interface_ip = argv[++i];
+        } else if (arg == "--peer-ip" && i + 1 < argc) {
+            peer_ip = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
                       << "  --topic <name>      DDS Topic name (default: FastSampleTopic)\n"
                       << "  --domain <id>       DDS Domain ID (default: 0)\n"
+                      << "  --interface <IP>    Bind Fast DDS to specific local NIC IP\n"
+                      << "  --peer-ip <IP>      PYNQ-Z2 PS eth0 IP for unicast SPDP discovery\n"
                       << "  --echo              Bounce received samples back to FPGA\n"
                       << "  --publish           Publish mode: transmit samples from PC to FPGA\n"
                       << "  --rate <Hz>         Publish rate in Hz (default: 1000)\n"
@@ -359,11 +407,13 @@ int main(int argc, char* argv[]) {
               << "  Remote Workstation Fast DDS Application\n"
               << "=================================================================\n"
               << "  Topic        : " << topic_name << " (Domain " << domain_id << ")\n"
+              << "  Interface    : " << (interface_ip.empty() ? "All Interfaces" : interface_ip) << "\n"
+              << "  Unicast Peer : " << (peer_ip.empty() ? "Multicast Only" : peer_ip) << "\n"
               << "  Role         : " << (pub_mode ? "Publisher" : (echo_mode ? "Subscriber + Echo" : "Subscriber")) << "\n"
               << "  Target Samples: " << (max_samples > 0 ? std::to_string(max_samples) : "Continuous") << "\n"
               << "=================================================================\n\n";
 
-    RemoteNode node(domain_id, topic_name, echo_mode, pub_mode, pub_rate_hz);
+    RemoteNode node(domain_id, topic_name, echo_mode, pub_mode, pub_rate_hz, interface_ip, peer_ip);
     if (!node.init()) {
         return 1;
     }

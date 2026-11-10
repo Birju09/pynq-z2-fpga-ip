@@ -38,14 +38,25 @@ build_armhf() {
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_TOOLCHAIN_FILE=/project/fastdds_fpga_fastpath/armhf-toolchain.cmake && \
             make -j\$(nproc) && \
+            mkdir -p lib && \
+            cp -L /usr/lib/arm-linux-gnueabihf/libfastrtps.so.2.5 \
+                  /usr/lib/arm-linux-gnueabihf/libfastcdr.so.1 \
+                  /usr/lib/arm-linux-gnueabihf/libfoonathan_memory.so.0.7.1 \
+                  /usr/lib/arm-linux-gnueabihf/libtinyxml2.so.9 \
+                  /usr/lib/arm-linux-gnueabihf/libsqlite3.so.0 \
+                  /usr/lib/arm-linux-gnueabihf/libssl.so.3 \
+                  /usr/lib/arm-linux-gnueabihf/libcrypto.so.3 \
+                  lib/ && \
             echo '' && \
-            echo '===> [ARM] Binary Architecture Verification:' && \
-            file fpga_fastpath_node remote_dds_node
+            echo '===> [ARM] Binary Architecture & RPATH Verification:' && \
+            file fpga_fastpath_node remote_dds_node && \
+            arm-linux-gnueabihf-readelf -d fpga_fastpath_node | grep -E 'RPATH|RUNPATH|NEEDED'
         "
 
     echo ""
-    echo "===> [ARM] Build Complete! Binaries in ${SCRIPT_DIR}/${ARM_BUILD_DIR}/:"
+    echo "===> [ARM] Build Complete! Copy BOTH the binary and lib/ folder to your PYNQ-Z2:"
     ls -lh "${SCRIPT_DIR}/${ARM_BUILD_DIR}/fpga_fastpath_node" "${SCRIPT_DIR}/${ARM_BUILD_DIR}/remote_dds_node"
+    ls -lh "${SCRIPT_DIR}/${ARM_BUILD_DIR}/lib/"
 }
 
 build_x86() {
@@ -65,14 +76,25 @@ build_x86() {
                 -DBUILD_FPGA_APP=OFF \
                 -DBUILD_REMOTE_APP=ON && \
             make -j\$(nproc) && \
+            mkdir -p lib && \
+            cp -L /usr/lib/x86_64-linux-gnu/libfastrtps.so.2.5 \
+                  /usr/lib/x86_64-linux-gnu/libfastcdr.so.1 \
+                  /usr/lib/x86_64-linux-gnu/libfoonathan_memory.so.0.7.1 \
+                  /usr/lib/x86_64-linux-gnu/libtinyxml2.so.9 \
+                  /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 \
+                  /usr/lib/x86_64-linux-gnu/libssl.so.3 \
+                  /usr/lib/x86_64-linux-gnu/libcrypto.so.3 \
+                  lib/ && \
             echo '' && \
-            echo '===> [x86_64] Binary Architecture Verification:' && \
-            file remote_dds_node
+            echo '===> [x86_64] Binary Architecture & RPATH Verification:' && \
+            file remote_dds_node && \
+            readelf -d remote_dds_node | grep -E 'RPATH|RUNPATH|NEEDED'
         "
 
     echo ""
-    echo "===> [x86_64] Build Complete! Binary in ${SCRIPT_DIR}/${X86_BUILD_DIR}/:"
+    echo "===> [x86_64] Build Complete! Copy remote_dds_node and lib/ to your x86 PC:"
     ls -lh "${SCRIPT_DIR}/${X86_BUILD_DIR}/remote_dds_node"
+    ls -lh "${SCRIPT_DIR}/${X86_BUILD_DIR}/lib/"
 }
 
 case "${TARGET}" in

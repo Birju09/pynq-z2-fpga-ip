@@ -2,8 +2,9 @@
 // main_fpga.cpp
 //
 // PYNQ-Z2 FPGA Fastpath Application:
-// - Control Plane : Fast DDS Participant & Discovery
+// - Control Plane : Fast DDS Participant & Discovery (over PS eth0)
 // - Data Plane    : Pure zero-copy coherent DDR DMA publishing via FPGA Fastpath IP
+//                   (over PL RMII PHY)
 // ============================================================================
 
 #include <algorithm>
@@ -74,8 +75,15 @@ int main(int argc, char* argv[]) {
             target_rate_hz = std::stoi(argv[++i]);
         } else if (arg == "--samples" && i + 1 < argc) {
             total_samples = std::stoi(argv[++i]);
-        } else if (arg == "--local-ip" && i + 1 < argc) {
-            cfg.local_ip = parse_ipv4(argv[++i]);
+        } else if ((arg == "--ps-ip" || arg == "--local-ip") && i + 1 < argc) {
+            cfg.ps_ip = argv[++i];
+        } else if (arg == "--pl-ip" && i + 1 < argc) {
+            uint32_t ip = parse_ipv4(argv[++i]);
+            if (ip != 0) cfg.pl_ip = ip;
+        } else if (arg == "--peer-ip" && i + 1 < argc) {
+            cfg.peer_ip = argv[++i];
+            uint32_t pip = parse_ipv4(cfg.peer_ip);
+            if (pip != 0) cfg.fallback_dst_ip = pip;
         } else if (arg == "--peer-mac" && i + 1 < argc) {
             if (parse_mac(argv[++i], cfg.override_peer_mac)) {
                 cfg.has_peer_mac_override = true;
@@ -95,7 +103,9 @@ int main(int argc, char* argv[]) {
                       << "  --domain <id>       DDS Domain ID (default: 0)\n"
                       << "  --rate <Hz>         Publish rate in Hz (default: 1000)\n"
                       << "  --samples <N>       Total samples to transmit (default: 10000)\n"
-                      << "  --local-ip <IP>     Local board IPv4 address (default: 192.168.1.10)\n"
+                      << "  --ps-ip <IP>        PS eth0 IP for Fast DDS Discovery (--local-ip alias)\n"
+                      << "  --pl-ip <IP>        PL RMII PHY hardware IP (default: 192.168.1.201)\n"
+                      << "  --peer-ip <IP>      Remote PC IP for unicast SPDP discovery & fallback\n"
                       << "  --peer-mac <MAC>    Remote peer MAC address override\n"
                       << "  --sim-peer          Enable PL internal peer emulator (loopback)\n"
                       << "  --no-wait           Start immediately without waiting for discovery\n"
@@ -109,10 +119,12 @@ int main(int argc, char* argv[]) {
               << "=================================================================\n"
               << "  Device       : " << cfg.device_path << "\n"
               << "  Topic        : " << cfg.topic_name << " (Domain " << cfg.domain_id << ")\n"
-              << "  Local IP     : " << ((cfg.local_ip >> 24) & 0xFF) << "."
-                                     << ((cfg.local_ip >> 16) & 0xFF) << "."
-                                     << ((cfg.local_ip >> 8) & 0xFF) << "."
-                                     << (cfg.local_ip & 0xFF) << "\n"
+              << "  PS Discovery : " << (cfg.ps_ip.empty() ? "All Interfaces" : cfg.ps_ip)
+              << (cfg.peer_ip.empty() ? "" : (" (Unicast Peer: " + cfg.peer_ip + ")")) << "\n"
+              << "  PL RMII IP   : " << ((cfg.pl_ip >> 24) & 0xFF) << "."
+                                     << ((cfg.pl_ip >> 16) & 0xFF) << "."
+                                     << ((cfg.pl_ip >> 8) & 0xFF) << "."
+                                     << (cfg.pl_ip & 0xFF) << "\n"
               << "  Publish Rate : " << target_rate_hz << " Hz\n"
               << "  Total Samples: " << total_samples << " (4,096 B / sample)\n"
               << "  Wire Mode    : " << (cfg.enable_peer_emu ? "Internal Peer Emulator" : "Physical RMII Wire") << "\n"
@@ -149,11 +161,14 @@ int main(int argc, char* argv[]) {
     // Discovery Phase
     if (sim_peer) {
         std::cout << "[FpgaApp] Operating in Peer Emulator mode. Configuring hardware loopback...\n";
-        bridge.configure_loopback_emulator();
-    } else if (!skip_discovery) {
+        bridge.configure_default_endpoints();
+    } else if (skip_discovery) {
+        std::cout << "[FpgaApp] Skipping discovery wait. Applying default wire endpoints...\n";
+        bridge.configure_default_endpoints();
+    } else {
         if (!bridge.wait_for_match(20000)) {
-            std::cerr << "[-] Warning: Proceeding with default hardware endpoint settings\n";
-            bridge.configure_loopback_emulator();
+            std::cerr << "[-] Warning: Proceeding with default physical wire endpoint settings\n";
+            bridge.configure_default_endpoints();
         }
     }
 

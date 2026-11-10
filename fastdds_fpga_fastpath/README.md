@@ -94,12 +94,14 @@ fastdds_fpga_fastpath/
 ## 4. Building the Demo
 
 ### Option A: Docker Cross-Compilation (Recommended for macOS / x86 Hosts)
-Cross-compile `fpga_fastpath_node` for the PYNQ-Z2 (`arm-linux-gnueabihf`) directly using the project's Docker builder image (`pynq-ecat-builder`):
+Cross-compile self-contained binaries (with bundled `lib/` runtime dependencies via `DT_RPATH $ORIGIN/lib`):
 ```bash
-cd fastdds_fpga_fastpath
-./build_docker.sh
+cd pynq-z2-fpga-ip/fastdds_fpga_fastpath
+./build_docker.sh armhf   # Builds build-armhf/fpga_fastpath_node + lib/ for PYNQ-Z2
+./build_docker.sh x86     # Builds build-x86_64/remote_dds_node + lib/ for x86_64 Ubuntu 22.04
+./build_docker.sh all     # Builds both targets
 ```
-This configures the Ubuntu 22.04 `armhf` multiarch container with `libfastrtps-dev:armhf` and `libfastcdr-dev:armhf` and outputs the ARM EABI5 binary at `build-armhf/fpga_fastpath_node`.
+Copy `build-armhf/fpga_fastpath_node` and `build-armhf/lib/` to your PYNQ-Z2, and `build-x86_64/remote_dds_node` and `build-x86_64/lib/` to your remote x86 PC.
 
 ### Option B: Native Build on PYNQ-Z2 Board
 
@@ -133,20 +135,19 @@ This produces `remote_dds_node`.
 
 ## 5. Running the Demo
 
-### Step 1: Configure Network Subnet
-Connect an Ethernet cable between the PYNQ-Z2 board and your remote workstation.
+### Step 1: Configure Dual-Port Network Topology
+The PYNQ-Z2 uses **two** Ethernet ports:
+- **PS `eth0` (`192.168.1.10`)**: Used by Linux Fast DDS for SPDP/SEDP discovery.
+- **PL RMII PHY (`192.168.1.201`)**: Used by the FPGA fabric for zero-CPU hardware RTPS data frames.
 
-- **PYNQ-Z2 IP**: `192.168.1.10/24`
-- **Workstation IP**: `192.168.1.100/24`
-
-Verify connectivity with `ping 192.168.1.10`.
+Connect **PS `eth0`**, **PL RMII PHY**, and your **Remote Workstation (`192.168.1.100`)** to an Ethernet switch on the `192.168.1.0/24` subnet.
 
 ---
 
 ### Step 2: Start the Remote Subscriber (Workstation)
-Run the remote subscriber in echo mode (so it verifies inbound packets and bounces them back for RTT latency measurement):
+Run the remote subscriber (binding strictly to the Ethernet NIC `--interface` and specifying `--peer-ip` for reliable unicast SPDP discovery):
 ```bash
-./remote_dds_node --echo
+./remote_dds_node --interface 192.168.1.100 --peer-ip 192.168.1.10 --echo
 ```
 Output:
 ```
@@ -154,10 +155,14 @@ Output:
   Remote Workstation Fast DDS Application
 =================================================================
   Topic        : FastSampleTopic (Domain 0)
+  Interface    : 192.168.1.100
+  Unicast Peer : 192.168.1.10
   Role         : Subscriber + Echo
   Target Samples: Continuous
 =================================================================
 
+[RemoteNode] Bound Fast DDS to interface: 192.168.1.100
+[RemoteNode] Added Unicast SPDP Peer: 192.168.1.10
 [RemoteNode] Listening for FastSample packets on 'FastSampleTopic'...
 [RemoteNode] Echo Mode ACTIVE: incoming samples will be bounced back to FPGA.
 [RemoteNode] Matched FPGA Publisher! Ready to receive.
@@ -168,11 +173,11 @@ Output:
 ### Step 3: Run the FPGA Fastpath Publisher (PYNQ-Z2)
 Insert the FPGA driver kernel module first if not already loaded:
 ```bash
-sudo insmod /lib/modules/$(uname -r)/extra/axi_rtps.ko
+sudo insmod axi_rtps.ko
 ```
 Then start the FPGA node at 1,000 Hz:
 ```bash
-sudo ./fpga_fastpath_node --rate 1000 --samples 10000 --local-ip 192.168.1.10
+sudo ./fpga_fastpath_node --rate 1000 --samples 10000 --ps-ip 192.168.1.10 --pl-ip 192.168.1.201 --peer-ip 192.168.1.100
 ```
 Output:
 ```

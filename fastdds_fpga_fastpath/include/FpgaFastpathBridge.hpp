@@ -2,9 +2,9 @@
 // FpgaFastpathBridge.hpp
 //
 // Fast DDS Option 3 Hybrid Bridge:
-// - Control Plane : Fast DDS handles standard SPDP/SEDP Discovery
+// - Control Plane : Fast DDS handles standard SPDP/SEDP Discovery over PS eth0
 // - Data Plane    : Direct zero-copy publishing & receiving via FPGA Fastpath IP
-//                   (Bypasses Fast DDS software serializer & Linux kernel netstack)
+//                   over PL RMII PHY (bypasses software serializer & netstack)
 // ============================================================================
 
 #ifndef _FPGA_FASTPATH_BRIDGE_HPP_
@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -45,6 +46,12 @@
 #include <fastdds/dds/topic/Topic.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
+#if __has_include(<fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>)
+#include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
+#else
+#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
+#endif
+
 #if __has_include(<fastdds/config.hpp>)
 #include <fastdds/config.hpp>
 #endif
@@ -56,12 +63,11 @@
 #include <fastdds/rtps/common/Locator.hpp>
 #else
 #define FASTDDS_V3 0
+#include <fastrtps/rtps/builtin/data/ParticipantProxyData.h>
 #include <fastrtps/rtps/builtin/data/ReaderProxyData.h>
 #include <fastrtps/rtps/builtin/data/WriterProxyData.h>
 #include <fastrtps/rtps/common/Locator.h>
 #endif
-
-#include <fcntl.h>
 
 // Hardware Driver Headers
 #define FastSample FpgaHardwareFastSample
@@ -78,10 +84,18 @@ struct BridgeConfig {
     std::string device_path{"/dev/" XILINX_RTPS_DEV_NAME};
     uint32_t    domain_id{0};
     std::string topic_name{"FastSampleTopic"};
-    uint32_t    local_ip{0xC0A8010A};      // 192.168.1.10
+
+    // PS Control-Plane Discovery Network (Linux eth0)
+    std::string ps_ip{""};                 // Empty = bind all interfaces; or e.g. "192.168.1.10"
+    std::string peer_ip{""};               // Optional unicast SPDP peer IP, e.g. "192.168.1.100"
+
+    // PL Data-Plane Hardware Identity (RMII PHY)
+    uint32_t    pl_ip{0xC0A801C9};         // 192.168.1.201 (dedicated PL RMII IP)
+    uint8_t     pl_mac[6]{0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
     uint16_t    local_src_port{7411};
     uint16_t    default_dst_port{7410};
-    uint8_t     local_mac[6]{0x00, 0x0A, 0x35, 0x00, 0x01, 0x22};
+    uint32_t    fallback_dst_ip{0xC0A80164}; // 192.168.1.100
+
     bool        enable_peer_emu{false};    // false = Physical RMII wire (LAN8720), true = internal emulator
     uint8_t     override_peer_mac[6]{0};
     bool        has_peer_mac_override{false};
@@ -186,22 +200,33 @@ public:
         return ok;
     }
 
-    // Configure FPGA for standalone/emulator loopback test if no remote peer is attached
-    bool configure_loopback_emulator() {
+    // Configure FPGA using fallback/CLI settings while preserving wire vs emulator mode
+    bool configure_default_endpoints() {
         if (!fpga_) return false;
-        fpga_->cfg.enable_peer_emu = 1;
-        fpga_->cfg.mode_pub_only   = 0;
+        std::lock_guard<std::mutex> lock(hw_cfg_mutex_);
+
+        fpga_->cfg.enable_peer_emu = config_.enable_peer_emu ? 1 : 0;
+        fpga_->cfg.mode_pub_only   = config_.enable_peer_emu ? 0 : 1;
+
+        uint32_t dst_ip = config_.fallback_dst_ip;
+        uint8_t dst_mac[6] = {0, 0, 0, 0, 0, 0};
+        if (config_.has_peer_mac_override) {
+            std::memcpy(dst_mac, config_.override_peer_mac, 6);
+        } else if (!config_.enable_peer_emu) {
+            resolve_mac_from_arp(dst_ip, dst_mac);
+        }
 
         struct fpga_writer_endpoint wep;
         std::memset(&wep, 0, sizeof(wep));
         wep.slot_idx         = 0;
         wep.lifecycle_state  = FPGA_LIFECYCLE_ACTIVE;
         wep.payload_words    = RTPS_FAST_SAMPLE_WORDS;
-        wep.dst_ip           = 0xC0A80164; // 192.168.1.100
+        wep.dst_ip           = dst_ip;
         wep.src_port         = config_.local_src_port;
         wep.dst_port         = config_.default_dst_port;
+        std::memcpy(wep.dst_mac, dst_mac, 6);
         wep.writer_entity_id = 0x00000102;
-        wep.reader_entity_id = 0x00000107;
+        wep.reader_entity_id = 0x00000000;
         wep.seq_seed         = 1;
         wep.generation       = ++generation_;
 
@@ -216,16 +241,19 @@ public:
         rep.remote_guid_prefix[6]   = 0x00; rep.remote_guid_prefix[7] = 0x02;
         rep.remote_guid_prefix[8]   = 0x00; rep.remote_guid_prefix[9] = 0x00;
         rep.remote_guid_prefix[10]  = 0x00; rep.remote_guid_prefix[11] = 0x02;
-        rep.remote_writer_entity_id = 0x00000102;
+        rep.remote_writer_entity_id = 0x00000202;
         rep.local_reader_entity_id  = 0x00000107;
-        rep.expected_remote_src_ip  = 0xC0A80164;
+        rep.expected_remote_src_ip  = dst_ip;
         rep.generation              = generation_;
+
+        std::cout << "[FpgaBridge] Configuring Default Hardware Endpoints ("
+                  << (config_.enable_peer_emu ? "Peer Emulator" : "Physical RMII Wire")
+                  << "): PL_IP=" << ip_to_str(config_.pl_ip)
+                  << " -> Dst=" << ip_to_str(dst_ip) << ":" << wep.dst_port << "\n";
 
         fpga_configure_writer(fpga_, &wep);
         fpga_configure_reader(fpga_, &rep);
         fpga_commit_endpoints(fpga_, generation_);
-        writer_matched_ = true;
-        reader_matched_ = true;
         return true;
     }
 
@@ -323,7 +351,7 @@ private:
                 std::istringstream iss(line);
                 std::string arp_ip, hw_type, flags, hw_address;
                 if (iss >> arp_ip >> hw_type >> flags >> hw_address) {
-                    if (arp_ip == ip_str && hw_address.length() == 17) {
+                    if (arp_ip == ip_str && hw_address.length() == 17 && hw_address != "00:00:00:00:00:00") {
                         unsigned int m[6];
                         if (sscanf(hw_address.c_str(), "%x:%x:%x:%x:%x:%x",
                                    &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
@@ -337,10 +365,11 @@ private:
             }
         }
 
-        mac_out[0] = 0x00; mac_out[1] = 0x0C; mac_out[2] = 0x29;
-        mac_out[3] = 0x11; mac_out[4] = 0x22; mac_out[5] = 0x33;
-        std::cout << "[FpgaBridge] Note: ARP entry not found, using fallback MAC for " << ip_str << "\n";
-        return true;
+        // Leave all-zeros so rtps_fastpath_ip.v substitutes ingress/ARP-learned MAC automatically
+        std::memset(mac_out, 0, 6);
+        std::cout << "[FpgaBridge] Note: MAC not in Linux ARP cache for " << ip_str
+                  << "; FPGA hardware will auto-learn via PL ARP/ingress.\n";
+        return false;
     }
 
     bool init_fastdds() {
@@ -348,6 +377,40 @@ private:
 
         DomainParticipantQos pqos = PARTICIPANT_QOS_DEFAULT;
         pqos.name("PYNQZ2_FPGA_Fastpath_Node");
+
+        // Optional: Restrict PS discovery to a specific Linux interface (e.g., eth0 IP)
+        if (!config_.ps_ip.empty()) {
+            pqos.transport().use_builtin_transports = false;
+#if FASTDDS_V3
+            auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
+#else
+            auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
+#endif
+            udp_transport->interfaceWhiteList.push_back(config_.ps_ip);
+            pqos.transport().user_transports.push_back(udp_transport);
+            std::cout << "[FpgaBridge] Fast DDS Discovery bound to PS interface: " << config_.ps_ip << "\n";
+        }
+
+        // Optional: Add unicast SPDP peer locator (useful when multicast is filtered)
+        if (!config_.peer_ip.empty()) {
+            struct in_addr peer_addr;
+            if (inet_pton(AF_INET, config_.peer_ip.c_str(), &peer_addr) == 1) {
+                uint32_t pip = ntohl(peer_addr.s_addr);
+#if FASTDDS_V3
+                eprosima::fastdds::rtps::Locator_t peer_loc;
+#else
+                eprosima::fastrtps::rtps::Locator_t peer_loc;
+#endif
+                peer_loc.kind = 1; // LOCATOR_KIND_UDPv4
+                peer_loc.port = 0; // Fast DDS probes all participant ID ports on this host
+                peer_loc.address[12] = static_cast<uint8_t>((pip >> 24) & 0xFF);
+                peer_loc.address[13] = static_cast<uint8_t>((pip >> 16) & 0xFF);
+                peer_loc.address[14] = static_cast<uint8_t>((pip >> 8) & 0xFF);
+                peer_loc.address[15] = static_cast<uint8_t>(pip & 0xFF);
+                pqos.wire_protocol().builtin.initialPeersList.push_back(peer_loc);
+                std::cout << "[FpgaBridge] Added Unicast SPDP Peer: " << config_.peer_ip << "\n";
+            }
+        }
 
         participant_ = DomainParticipantFactory::get_instance()->create_participant(
             config_.domain_id, pqos, &part_listener_);
@@ -368,12 +431,12 @@ private:
                                           (static_cast<uint32_t>(part_guid.guidPrefix.value[10]) << 8) |
                                           (static_cast<uint32_t>(part_guid.guidPrefix.value[11]));
 
-        fpga_->cfg.local_ip             = config_.local_ip;
-        fpga_->cfg.local_mac_hi         = (static_cast<uint16_t>(config_.local_mac[0]) << 8) | config_.local_mac[1];
-        fpga_->cfg.local_mac_lo         = (static_cast<uint32_t>(config_.local_mac[2]) << 24) |
-                                          (static_cast<uint32_t>(config_.local_mac[3]) << 16) |
-                                          (static_cast<uint32_t>(config_.local_mac[4]) << 8)  |
-                                          config_.local_mac[5];
+        fpga_->cfg.local_ip             = config_.pl_ip;
+        fpga_->cfg.local_mac_hi         = (static_cast<uint16_t>(config_.pl_mac[0]) << 8) | config_.pl_mac[1];
+        fpga_->cfg.local_mac_lo         = (static_cast<uint32_t>(config_.pl_mac[2]) << 24) |
+                                          (static_cast<uint32_t>(config_.pl_mac[3]) << 16) |
+                                          (static_cast<uint32_t>(config_.pl_mac[4]) << 8)  |
+                                          config_.pl_mac[5];
         fpga_->cfg.enable_peer_emu      = config_.enable_peer_emu ? 1 : 0;
         fpga_->cfg.mode_pub_only        = 1;
         fpga_->cfg.pacing_timer_ticks   = config_.pacing_timer_ticks;
@@ -395,28 +458,12 @@ private:
         writer_ = publisher_->create_datawriter(topic_, wqos, &writer_listener_);
         if (!writer_) return false;
 
-        // Create Subscriber & DataReader bound to FPGA's expected hardware RX port
+        // Create Subscriber & DataReader
         subscriber_ = participant_->create_subscriber(SUBSCRIBER_QOS_DEFAULT);
         if (!subscriber_) return false;
 
         DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
         rqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
-
-        // Announce the FPGA hardware RX UDP port as our DataReader unicast locator during SEDP
-#if FASTDDS_V3
-        eprosima::fastdds::rtps::Locator_t fpga_rx_loc;
-        fpga_rx_loc.kind = 1; // LOCATOR_KIND_UDPv4
-#else
-        eprosima::fastrtps::rtps::Locator_t fpga_rx_loc;
-        fpga_rx_loc.kind = 1; // LOCATOR_KIND_UDPv4
-#endif
-        fpga_rx_loc.port = config_.local_src_port;
-        fpga_rx_loc.address[12] = static_cast<uint8_t>((config_.local_ip >> 24) & 0xFF);
-        fpga_rx_loc.address[13] = static_cast<uint8_t>((config_.local_ip >> 16) & 0xFF);
-        fpga_rx_loc.address[14] = static_cast<uint8_t>((config_.local_ip >> 8) & 0xFF);
-        fpga_rx_loc.address[15] = static_cast<uint8_t>(config_.local_ip & 0xFF);
-        rqos.endpoint().unicast_locator_list.push_back(fpga_rx_loc);
-
         reader_ = subscriber_->create_datareader(topic_, rqos, &reader_listener_);
         if (!reader_) return false;
 
@@ -451,10 +498,14 @@ private:
         wep.seq_seed         = 1;
         wep.generation       = ++generation_;
 
-        std::cout << "[FpgaBridge] Programming FPGA Writer[0] -> Dst=" << ip_to_str(remote_ip)
-                  << ":" << remote_port << " (WriterId=0x" << std::hex << wep.writer_entity_id
+        std::cout << "[FpgaBridge] SEDP Matched Remote Reader -> Programming FPGA Writer[0]: "
+                  << ip_to_str(config_.pl_ip) << ":" << wep.src_port
+                  << " -> Dst=" << ip_to_str(remote_ip) << ":" << remote_port
+                  << " (WriterId=0x" << std::hex << wep.writer_entity_id
                   << ", ReaderId=0x" << wep.reader_entity_id << std::dec << ")\n";
 
+        fpga_->cfg.enable_peer_emu = config_.enable_peer_emu ? 1 : 0;
+        fpga_->cfg.mode_pub_only   = 1;
         fpga_configure_writer(fpga_, &wep);
         fpga_commit_endpoints(fpga_, generation_);
 
@@ -487,7 +538,8 @@ private:
                                      static_cast<uint32_t>(rguid.entityId.value[3]);
         rep.generation = ++generation_;
 
-        std::cout << "[FpgaBridge] Programming FPGA Reader CAM[0] <- Src=" << ip_to_str(remote_ip)
+        std::cout << "[FpgaBridge] SEDP Matched Remote Writer -> Programming FPGA Reader CAM[0]: "
+                  << "Src=" << ip_to_str(remote_ip)
                   << " (RemoteWriterId=0x" << std::hex << rep.remote_writer_entity_id
                   << ", LocalReaderId=0x" << rep.local_reader_entity_id << std::dec << ")\n";
 
@@ -501,6 +553,19 @@ private:
         explicit BridgePartListener(FpgaFastpathBridge* parent) : parent_(parent) {}
 
 #if FASTDDS_V3
+        void on_participant_discovery(
+            eprosima::fastdds::dds::DomainParticipant*,
+            eprosima::fastdds::rtps::ParticipantDiscoveryStatus reason,
+            const eprosima::fastdds::rtps::ParticipantBuiltinTopicData& info,
+            bool& should_be_ignored) override {
+            should_be_ignored = false;
+            if (reason == eprosima::fastdds::rtps::ParticipantDiscoveryStatus::DISCOVERED_PARTICIPANT &&
+                info.guid.guidPrefix != parent_->participant_->guid().guidPrefix) {
+                std::cout << "[FpgaBridge] SPDP Discovered Remote Participant: "
+                          << info.participant_name.to_string() << "\n";
+            }
+        }
+
         void on_data_reader_discovery(
             eprosima::fastdds::dds::DomainParticipant*,
             eprosima::fastdds::rtps::ReaderDiscoveryStatus reason,
@@ -510,7 +575,7 @@ private:
             if (reason == eprosima::fastdds::rtps::ReaderDiscoveryStatus::DISCOVERED_READER &&
                 info.topic_name.to_string() == parent_->config_.topic_name &&
                 info.guid.guidPrefix != parent_->participant_->guid().guidPrefix) {
-                uint32_t remote_ip = 0xC0A80164;
+                uint32_t remote_ip = parent_->config_.fallback_dst_ip;
                 uint16_t remote_port = parent_->config_.default_dst_port;
                 for (const auto& loc : info.remote_locators.unicast) {
                     if (loc.kind == 1 /* LOCATOR_KIND_UDPv4 */) {
@@ -557,13 +622,23 @@ private:
             }
         }
 #else
+        void on_participant_discovery(
+            eprosima::fastdds::dds::DomainParticipant*,
+            eprosima::fastrtps::rtps::ParticipantDiscoveryInfo&& info) override {
+            if (info.status == eprosima::fastrtps::rtps::ParticipantDiscoveryInfo::DISCOVERED_PARTICIPANT &&
+                info.info.m_guid.guidPrefix != parent_->participant_->guid().guidPrefix) {
+                std::cout << "[FpgaBridge] SPDP Discovered Remote Participant: "
+                          << info.info.m_participantName.to_string() << "\n";
+            }
+        }
+
         void on_subscriber_discovery(
             eprosima::fastdds::dds::DomainParticipant*,
             eprosima::fastrtps::rtps::ReaderDiscoveryInfo&& info) override {
             if (info.status == eprosima::fastrtps::rtps::ReaderDiscoveryInfo::DISCOVERED_READER &&
                 info.info.topicName().to_string() == parent_->config_.topic_name &&
                 info.info.guid().guidPrefix != parent_->participant_->guid().guidPrefix) {
-                uint32_t remote_ip = 0xC0A80164;
+                uint32_t remote_ip = parent_->config_.fallback_dst_ip;
                 uint16_t remote_port = parent_->config_.default_dst_port;
                 for (const auto& loc : info.info.remote_locators().unicast) {
                     if (loc.kind == 1 /* LOCATOR_KIND_UDPv4 */) {
@@ -618,10 +693,8 @@ private:
     public:
         explicit BridgeWriterListener(FpgaFastpathBridge* parent) : parent_(parent) {}
         void on_publication_matched(eprosima::fastdds::dds::DataWriter*,
-                                    const eprosima::fastdds::dds::PublicationMatchedStatus& info) override {
-            if (info.current_count_change > 0) {
-                std::cout << "[FpgaBridge] Publication matched (total=" << info.current_count << ")\n";
-            }
+                                    const eprosima::fastdds::dds::PublicationMatchedStatus&) override {
+            // Note: Remote endpoint matching is handled via BridgePartListener (filtered by guidPrefix)
         }
     private:
         FpgaFastpathBridge* parent_;
@@ -631,10 +704,8 @@ private:
     public:
         explicit BridgeReaderListener(FpgaFastpathBridge* parent) : parent_(parent) {}
         void on_subscription_matched(eprosima::fastdds::dds::DataReader*,
-                                     const eprosima::fastdds::dds::SubscriptionMatchedStatus& info) override {
-            if (info.current_count_change > 0) {
-                std::cout << "[FpgaBridge] Subscription matched (total=" << info.current_count << ")\n";
-            }
+                                     const eprosima::fastdds::dds::SubscriptionMatchedStatus&) override {
+            // Note: Remote endpoint matching is handled via BridgePartListener (filtered by guidPrefix)
         }
     private:
         FpgaFastpathBridge* parent_;

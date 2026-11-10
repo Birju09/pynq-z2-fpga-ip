@@ -61,6 +61,11 @@ if(BUILD_FPGA_APP)
         Threads::Threads
     )
     target_compile_options(fpga_fastpath_node PRIVATE -O3 -Wall -Wextra)
+    set_target_properties(fpga_fastpath_node PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN/lib"
+    )
+    target_link_options(fpga_fastpath_node PRIVATE "-Wl,--disable-new-dtags")
 endif()
 
 # 2. Remote Workstation Standard Fast DDS Node
@@ -78,4 +83,9 @@ if(BUILD_REMOTE_APP)
         Threads::Threads
     )
     target_compile_options(remote_dds_node PRIVATE -O3 -Wall -Wextra)
+    set_target_properties(remote_dds_node PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN/lib"
+    )
+    target_link_options(remote_dds_node PRIVATE "-Wl,--disable-new-dtags")
 endif()
