@@ -772,6 +772,39 @@ struct async_ctx {
     uint16_t               peer_port;
 };
 
+static void build_wire_rtps_msg(uint32_t out_words[RTPS_FULL_MSG_WORDS],
+                                const uint32_t guid_prefix[3],
+                                const struct FastSample* sample,
+                                uint32_t seq_lo) {
+    uint8_t* p = (uint8_t*)out_words;
+    uint16_t tx_data_octets = (uint16_t)(24 + sizeof(struct FastSample));
+
+    /* RTPS header (bytes 0..19) */
+    memcpy(p, "RTPS", 4);
+    p[4] = 0x02; p[5] = 0x01; p[6] = 0x01; p[7] = 0x10;
+    for (int k = 0; k < 3; k++) {
+        p[8 + k * 4 + 0] = (uint8_t)(guid_prefix[k] >> 24);
+        p[8 + k * 4 + 1] = (uint8_t)(guid_prefix[k] >> 16);
+        p[8 + k * 4 + 2] = (uint8_t)(guid_prefix[k] >> 8);
+        p[8 + k * 4 + 3] = (uint8_t)(guid_prefix[k]);
+    }
+    /* INFO_TS (bytes 20..31, E=1 LE sec/frac) */
+    p[20] = 0x09; p[21] = 0x01; p[22] = 0x08; p[23] = 0x00;
+    out_words[6] = (uint32_t)(sample->tx_timestamp_ns / 1000000000ULL);
+    out_words[7] = (uint32_t)(((sample->tx_timestamp_ns % 1000000000ULL) << 32) / 1000000000ULL);
+    /* DATA submessage (bytes 32..59, E=1 LE fields) */
+    p[32] = 0x15; p[33] = 0x05;
+    p[34] = (uint8_t)(tx_data_octets & 0xFFU);
+    p[35] = (uint8_t)(tx_data_octets >> 8);
+    p[36] = 0x00; p[37] = 0x00; p[38] = 0x10; p[39] = 0x00;
+    p[40] = 0x00; p[41] = 0x00; p[42] = 0x00; p[43] = 0x00;
+    p[44] = 0x00; p[45] = 0x00; p[46] = 0x01; p[47] = 0x02;
+    out_words[12] = 0;
+    out_words[13] = seq_lo;
+    p[56] = 0x00; p[57] = 0x01; p[58] = 0x00; p[59] = 0x00; /* CDR_LE */
+    memcpy(&out_words[15], sample, sizeof(struct FastSample));
+}
+
 static void* async_publisher_thread(void* arg) {
     struct async_ctx* ctx = (struct async_ctx*)arg;
     struct FastSample tx_sample;
@@ -812,23 +845,8 @@ static void* async_publisher_thread(void* arg) {
             ctx->published_count++;
             if (ctx->pcap_dumper) {
                 uint32_t tx_rtps_buf[RTPS_FULL_MSG_WORDS];
-                tx_rtps_buf[0] = 0x52545053; /* "RTPS" */
-                tx_rtps_buf[1] = 0x02010110; /* Version 2.1, VendorId 0x0110 (Cyclone DDS) */
-                tx_rtps_buf[2] = ctx->plugin->edt_cfg.local_guid_prefix[0];
-                tx_rtps_buf[3] = ctx->plugin->edt_cfg.local_guid_prefix[1];
-                tx_rtps_buf[4] = ctx->plugin->edt_cfg.local_guid_prefix[2];
-                tx_rtps_buf[5] = 0x09010800; /* INFO_TS */
-                tx_rtps_buf[6] = __builtin_bswap32((uint32_t)(tx_sample.tx_timestamp_ns / 1000000000ULL));
-                tx_rtps_buf[7] = __builtin_bswap32((uint32_t)(((tx_sample.tx_timestamp_ns % 1000000000ULL) << 32) / 1000000000ULL));
-                uint16_t tx_data_octets = (uint16_t)(24 + sizeof(struct FastSample));
-                tx_rtps_buf[8]  = 0x15050000 | __builtin_bswap16(tx_data_octets);
-                tx_rtps_buf[9]  = 0x00001000;
-                tx_rtps_buf[10] = 0x00000000;
-                tx_rtps_buf[11] = 0x00000102;
-                tx_rtps_buf[12] = 0x00000000;
-                tx_rtps_buf[13] = __builtin_bswap32((uint32_t)iter);
-                tx_rtps_buf[14] = 0x00010000; /* CDR_LE */
-                memcpy(&tx_rtps_buf[15], &tx_sample, sizeof(struct FastSample));
+                build_wire_rtps_msg(tx_rtps_buf, ctx->plugin->edt_cfg.local_guid_prefix,
+                                    &tx_sample, (uint32_t)iter);
 
                 pthread_mutex_lock(&ctx->pcap_lock);
                 if (ctx->pcap_wire_frags) {
@@ -1383,26 +1401,8 @@ int main(int argc, char* argv[]) {
         if (pcap_filename) {
             /* 1. Build & Dump Complete Wire RTPS message for TX (Command) */
             uint32_t tx_rtps_buf[RTPS_FULL_MSG_WORDS];
-            /* RTPS Header */
-            tx_rtps_buf[0] = 0x52545053; /* "RTPS" */
-            tx_rtps_buf[1] = 0x02010110; /* Version 2.1, VendorId 0x0110 (Cyclone DDS) */
-            tx_rtps_buf[2] = plugin.edt_cfg.local_guid_prefix[0];
-            tx_rtps_buf[3] = plugin.edt_cfg.local_guid_prefix[1];
-            tx_rtps_buf[4] = plugin.edt_cfg.local_guid_prefix[2];
-            /* INFO_TS */
-            tx_rtps_buf[5] = 0x09010800; /* Submsg 0x09, E=1, len=8 */
-            tx_rtps_buf[6] = __builtin_bswap32((uint32_t)(tx_sample->tx_timestamp_ns / 1000000000ULL));
-            tx_rtps_buf[7] = __builtin_bswap32((uint32_t)(((tx_sample->tx_timestamp_ns % 1000000000ULL) << 32) / 1000000000ULL));
-            /* DATA */
-            uint16_t tx_data_octets = (uint16_t)(24 + sizeof(struct FastSample));
-            tx_rtps_buf[8]  = 0x15050000 | __builtin_bswap16(tx_data_octets); /* Submsg 0x15, flags 0x05 (E=1: octets LE on wire) */
-            tx_rtps_buf[9]  = 0x00001000;                  /* extraFlags=0, octetsToInlineQos=16 */
-            tx_rtps_buf[10] = 0x00000000;                  /* readerEntityId (ENTITYID_UNKNOWN) */
-            tx_rtps_buf[11] = 0x00000102;                  /* writerEntityId (Local Writer) */
-            tx_rtps_buf[12] = 0x00000000;                  /* writerSeqNum Hi */
-            tx_rtps_buf[13] = __builtin_bswap32((uint32_t)iter); /* writerSeqNum Lo */
-            tx_rtps_buf[14] = 0x00010000;                  /* CDR_LE encapsulation */
-            memcpy(&tx_rtps_buf[15], tx_sample, sizeof(struct FastSample));
+            build_wire_rtps_msg(tx_rtps_buf, plugin.edt_cfg.local_guid_prefix,
+                                tx_sample, (uint32_t)iter);
 
             if (pcap_wire_frags) {
                 rtps_pcap_dump_fragments(&pcap_dumper, &t_start, master_mac, peer_mac,

@@ -187,7 +187,8 @@ module rtps_fastpath_ip #(
         LAST_ICMP_ERR_INFO_ADDR     = 8'h6C, // 0x1B0: {icmp_type[7:0], icmp_code[7:0], next_hop_mtu[15:0]}
         LAST_ICMP_ERR_DST_IP_ADDR   = 8'h6D, // 0x1B4: Offending IPv4 destination IP
         LAST_ICMP_ERR_PORTS_ADDR    = 8'h6E, // 0x1B8: Offending UDP {src_port[15:0], dst_port[15:0]}
-        LAST_ICMP_ERR_IP_ID_ADDR    = 8'h6F; // 0x1BC: {16'd0, offending IPv4 Identification}
+        LAST_ICMP_ERR_IP_ID_ADDR    = 8'h6F, // 0x1BC: {16'd0, offending IPv4 Identification}
+        CFG_FRAG_SIZE_ADDR          = 8'h70; // 0x1C0: TX DATA_FRAG fragmentSize in bytes (default 1400)
 
     // =========================================================================
     // Endpoint Descriptor Table (EDT): Shadow & Active Banks
@@ -239,6 +240,8 @@ module rtps_fastpath_ip #(
     reg [31:0] expected_crc;
     reg [31:0] cfg_pacing_timer;
     reg [31:0] cfg_payload_words;
+    reg [31:0] cfg_frag_size;
+    wire       tx_ip_frag_mode = ctrl_reg[10]; // Bit [10]: 0 = DATA_FRAG default, 1 = Legacy IPv4 fragmentation
     reg [31:0] wdog_counter;
     reg [31:0] wdog_limit;
     reg        wdog_expired;
@@ -250,9 +253,11 @@ module rtps_fastpath_ip #(
     reg [47:0] local_mac;
     reg [15:0] local_vendor_id;
     reg [63:0] ts_offset;
-    reg [63:0] free_running_ns;
+    reg [31:0] free_running_sec;
+    reg [47:0] free_running_frac_acc; // Q32.16: [47:16] = RTPS 2^-32 s fraction
     reg [15:0] cfg_clk_period_ns;
-    wire [63:0] active_time_ns = (USE_EXT_TIMESTAMP) ? ext_timestamp_ns : free_running_ns;
+    wire [63:0] active_time_ns = (USE_EXT_TIMESTAMP) ? ext_timestamp_ns :
+                                 {free_running_sec, free_running_frac_acc[47:16]};
     reg [31:0] fault_inject_reg;
 
     // Statistics & Diagnostics
@@ -320,6 +325,14 @@ module rtps_fastpath_ip #(
         end
     endfunction
 
+    // Host DMA are little-endian, but the Ethernet/IPv4/UDP/RTPS wire format is big-endian.
+    function [31:0] bswap32;
+        input [31:0] word_in;
+        begin
+            bswap32 = {word_in[7:0], word_in[15:8], word_in[23:16], word_in[31:24]};
+        end
+    endfunction
+
     // =========================================================================
     // TX Command Sample BRAM (2048 x 32-bit = 8 KB) & On-the-Fly Checksums
     // =========================================================================
@@ -358,10 +371,10 @@ module rtps_fastpath_ip #(
         end else if (axis_wr) begin
             if (rx_ptr == 0) begin
                 crc_accum          <= s_axis_tdata;
-                payload_csum_accum <= csum_add32(16'h0000, s_axis_tdata);
+                payload_csum_accum <= csum_add32(16'h0000, bswap32(s_axis_tdata));
             end else if (rx_ptr < cfg_payload_words) begin
                 crc_accum          <= crc_accum + s_axis_tdata;
-                payload_csum_accum <= csum_add32(payload_csum_accum, s_axis_tdata);
+                payload_csum_accum <= csum_add32(payload_csum_accum, bswap32(s_axis_tdata));
             end
         end
     end
@@ -406,8 +419,10 @@ module rtps_fastpath_ip #(
         .MAX_DGRAM_W (REASM_DEPTH)
     ) u_rtps_peer_emulator (
         .clk              (clk),
-        .rst_n            (rst_n),
+        .rst_n            (rst_n && emu_enable),
         .fault_ctrl       (fault_inject_reg),
+        .tx_ip_frag_mode  (tx_ip_frag_mode),
+        .cfg_frag_size    (cfg_frag_size[15:0]),
         .peer_guid_prefix ({active_rd_edt[0][1], active_rd_edt[0][2], active_rd_edt[0][3]}),
         .peer_writer_id   (active_rd_edt[0][4]),
         .peer_reader_id   (active_rd_edt[0][5]),
@@ -422,15 +437,19 @@ module rtps_fastpath_ip #(
     );
 
     // =========================================================================
-    // Free-Running Nanosecond Timestamp Counter & 100 ms Lifecycle Watchdog
+    // Free-Running RTPS Time_t {seconds, 2^-32s fraction} & 100 ms Watchdog
     // =========================================================================
+    // 1 ns = 2^32 / 10^9 = 4.294967296 fractional units; in Q32.16: 281,475 per ns
+    wire [48:0] next_frac_acc = {1'b0, free_running_frac_acc} + ({33'd0, cfg_clk_period_ns} * 49'd281475);
     always @(posedge clk) begin
         if (!rst_n) begin
-            free_running_ns <= 64'd1000_000_000;
-            wdog_counter    <= 32'd0;
-            wdog_expired    <= 1'b0;
+            free_running_sec      <= 32'd1;
+            free_running_frac_acc <= 48'd0;
+            wdog_counter          <= 32'd0;
+            wdog_expired          <= 1'b0;
         end else begin
-            free_running_ns <= free_running_ns + {48'd0, cfg_clk_period_ns};
+            free_running_sec      <= free_running_sec + {31'd0, next_frac_acc[48]};
+            free_running_frac_acc <= next_frac_acc[47:0];
             if (wdog_pet_pulse) begin
                 wdog_counter <= 32'd0;
                 wdog_expired <= 1'b0;
@@ -494,6 +513,7 @@ module rtps_fastpath_ip #(
             expected_crc       <= 32'd0;
             cfg_pacing_timer   <= 32'd0;
             cfg_payload_words  <= 32'd1024;       // 1,024 words = 4,096 bytes (4 KB FastSample)
+            cfg_frag_size      <= 32'd1400;       // 1,400 bytes default DATA_FRAG fragmentSize
             wdog_limit         <= 32'd10_000_000; // 100 ms @ 100 MHz
             rx_timeout_limit   <= 32'd90_000;     // 900 us @ 100 MHz
 
@@ -661,6 +681,9 @@ module rtps_fastpath_ip #(
                         TYPE_PROFILE_ADDR: begin
                             type_profile_reg <= cur_wr_data;
                         end
+                        CFG_FRAG_SIZE_ADDR: begin
+                            cfg_frag_size <= {16'd0, cur_wr_data[15:0]};
+                        end
                         default: ;
                     endcase
                 end
@@ -678,7 +701,7 @@ module rtps_fastpath_ip #(
     // AXI4-Lite Slave Read Channel
     // =========================================================================
     wire [CFG_ADDR_WIDTH-1:0] rd_word_idx = s_axi_araddr[CFG_ADDR_WIDTH+1:2];
-    reg  [3:0]                completed_frags;
+    reg  [15:0]               completed_frags;
 
     wire payload_contract_ok =
         type_profile_reg[16] && // serialized CDR/XCDR
@@ -796,6 +819,7 @@ module rtps_fastpath_ip #(
                         LAST_ICMP_ERR_DST_IP_ADDR:   s_axi_rdata <= icmp_err_dst_ip;
                         LAST_ICMP_ERR_PORTS_ADDR:    s_axi_rdata <= icmp_err_ports;
                         LAST_ICMP_ERR_IP_ID_ADDR:    s_axi_rdata <= {16'd0, icmp_err_ip_id};
+                        CFG_FRAG_SIZE_ADDR:          s_axi_rdata <= cfg_frag_size;
                         default:             s_axi_rdata <= 32'd0;
                     endcase
                 end
@@ -827,8 +851,17 @@ module rtps_fastpath_ip #(
     // latest_valid declared above
 
     reg        reasm_wr_en;
+    reg [3:0]  reasm_wr_be;
     reg [11:0] reasm_wr_addr;
     reg [31:0] reasm_wr_data;
+
+    // 1.5 KB (512 x 32-bit) RX Staging RAM for unfragmented UDP/IPv4 frames (DATA & DATA_FRAG)
+    (* ram_style = "block" *) reg [DATA_WIDTH-1:0] rx_pkt_ram [0:511];
+    reg        rx_pkt_wr_en;
+    reg [8:0]  rx_pkt_wr_addr;
+    reg [31:0] rx_pkt_wr_data;
+    reg [31:0] rx_pkt_dout;
+    reg        walk_from_pkt_ram;
 
     reg [11:0] walker_rd_addr;
     reg [11:0] s2mm_rd_addr;
@@ -841,18 +874,38 @@ module rtps_fastpath_ip #(
     always @(posedge clk) begin
         if (reasm_wr_en) begin
             case (fill_slot)
-                2'd0: reasm_ram_0[reasm_wr_addr] <= reasm_wr_data;
-                2'd1: reasm_ram_1[reasm_wr_addr] <= reasm_wr_data;
-                default: reasm_ram_2[reasm_wr_addr] <= reasm_wr_data;
+                2'd0: begin
+                    if (reasm_wr_be[3]) reasm_ram_0[reasm_wr_addr][31:24] <= reasm_wr_data[31:24];
+                    if (reasm_wr_be[2]) reasm_ram_0[reasm_wr_addr][23:16] <= reasm_wr_data[23:16];
+                    if (reasm_wr_be[1]) reasm_ram_0[reasm_wr_addr][15:8]  <= reasm_wr_data[15:8];
+                    if (reasm_wr_be[0]) reasm_ram_0[reasm_wr_addr][7:0]   <= reasm_wr_data[7:0];
+                end
+                2'd1: begin
+                    if (reasm_wr_be[3]) reasm_ram_1[reasm_wr_addr][31:24] <= reasm_wr_data[31:24];
+                    if (reasm_wr_be[2]) reasm_ram_1[reasm_wr_addr][23:16] <= reasm_wr_data[23:16];
+                    if (reasm_wr_be[1]) reasm_ram_1[reasm_wr_addr][15:8]  <= reasm_wr_data[15:8];
+                    if (reasm_wr_be[0]) reasm_ram_1[reasm_wr_addr][7:0]   <= reasm_wr_data[7:0];
+                end
+                default: begin
+                    if (reasm_wr_be[3]) reasm_ram_2[reasm_wr_addr][31:24] <= reasm_wr_data[31:24];
+                    if (reasm_wr_be[2]) reasm_ram_2[reasm_wr_addr][23:16] <= reasm_wr_data[23:16];
+                    if (reasm_wr_be[1]) reasm_ram_2[reasm_wr_addr][15:8]  <= reasm_wr_data[15:8];
+                    if (reasm_wr_be[0]) reasm_ram_2[reasm_wr_addr][7:0]   <= reasm_wr_data[7:0];
+                end
             endcase
+        end
+        if (rx_pkt_wr_en) begin
+            rx_pkt_ram[rx_pkt_wr_addr] <= rx_pkt_wr_data;
         end
         reasm_dout_0 <= reasm_ram_0[slot0_rd_addr];
         reasm_dout_1 <= reasm_ram_1[slot1_rd_addr];
         reasm_dout_2 <= reasm_ram_2[slot2_rd_addr];
+        rx_pkt_dout  <= rx_pkt_ram[walker_rd_addr[8:0]];
     end
 
-    wire [31:0] walker_dout = (fill_slot == 2'd0) ? reasm_dout_0 :
-                              (fill_slot == 2'd1) ? reasm_dout_1 : reasm_dout_2;
+    wire [31:0] reasm_walker_dout = (fill_slot == 2'd0) ? reasm_dout_0 :
+                                    (fill_slot == 2'd1) ? reasm_dout_1 : reasm_dout_2;
+    wire [31:0] walker_dout       = walk_from_pkt_ram ? rx_pkt_dout : reasm_walker_dout;
 
     wire [31:0] s2mm_dout   = (egress_slot == 2'd0) ? reasm_dout_0 :
                               (egress_slot == 2'd1) ? reasm_dout_1 : reasm_dout_2;
@@ -874,35 +927,54 @@ module rtps_fastpath_ip #(
     // =========================================================================
     // RX Reassembly & RTPS Submessage Walker FSM
     // =========================================================================
-    localparam [4:0]
-        R_IDLE            = 5'd0,  // Receive IPv4 fragments into fill_slot
-        R_CHECK_UDP       = 5'd1,  // Verify reassembled UDP checksum & prime RTPS header read
-        R_RTPS_HDR_0      = 5'd2,  // Check "RTPS" magic (Word 2)
-        R_RTPS_HDR_1      = 5'd3,  // Check version == 2.x (Word 3)
-        R_RTPS_GUID_0     = 5'd4,  // Latch Remote GuidPrefix[95:64] (Word 4)
-        R_RTPS_GUID_1     = 5'd5,  // Latch Remote GuidPrefix[63:32] (Word 5)
-        R_RTPS_GUID_2     = 5'd6,  // Latch Remote GuidPrefix[31:0] (Word 6) & CAM match
-        R_SUBMSG_HDR      = 5'd7,  // Inspect Submessage Header {submsgId, flags, octetsToNext}
-        R_SUBMSG_HDR_WAIT = 5'd8,  // 1-cycle BRAM read wait for next Submessage Header
-        R_INFO_TS_WAIT    = 5'd9,  // 1-cycle BRAM read wait for INFO_TS Word +1
-        R_INFO_TS_0       = 5'd10, // Latch INFO_TS seconds
-        R_INFO_TS_1       = 5'd11, // Latch INFO_TS fraction & advance to next submessage
-        R_DATA_HDR_1      = 5'd12, // 1-cycle BRAM read wait for DATA Word +3 (writerEntityId)
-        R_DATA_HDR_2      = 5'd13, // Check writerEntityId against matched CAM slot
-        R_DATA_SEQ_HI     = 5'd14, // Latch writerSeqNum[63:32]
-        R_DATA_SEQ_LO     = 5'd15, // Latch writerSeqNum[31:0] & branch on Q-flag (inline QoS)
-        R_SKIP_QOS_WAIT   = 5'd16, // 1-cycle BRAM read wait for Inline QoS parameter header
-        R_SKIP_QOS        = 5'd17, // Walk inline QoS parameter list until PID_SENTINEL (0x0001)
-        R_COMMIT_SAMPLE   = 5'd18, // Registered commit state (breaks BRAM-to-CE critical path)
-        R_INFO_DST_WAIT   = 5'd19, // 1-cycle BRAM wait for INFO_DST Word +1
-        R_INFO_DST_0      = 5'd20, // Latch INFO_DST GuidPrefix[95:64]
-        R_INFO_DST_1      = 5'd21, // Latch INFO_DST GuidPrefix[63:32]
-        R_INFO_DST_2      = 5'd22, // Latch INFO_DST GuidPrefix[31:0]
-        R_DATA_READER_ID  = 5'd23, // Check DATA readerEntityId against local reader / ENTITYID_UNKNOWN
-        R_REASM_CHECK     = 5'd24, // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
-        R_CAM_MATCH       = 5'd25; // Reader CAM compare on fully registered GuidPrefix (breaks BRAM-to-compare critical path)
+    localparam [5:0]
+        R_IDLE            = 6'd0,  // Receive IPv4 fragments into fill_slot OR unfrag packets into rx_pkt_ram
+        R_CHECK_UDP       = 6'd1,  // Verify UDP checksum & prime RTPS header read
+        R_RTPS_HDR_0      = 6'd2,  // Check "RTPS" magic (Word 2)
+        R_RTPS_HDR_1      = 6'd3,  // Check version == 2.x (Word 3)
+        R_RTPS_GUID_0     = 6'd4,  // Latch Remote GuidPrefix[95:64] (Word 4)
+        R_RTPS_GUID_1     = 6'd5,  // Latch Remote GuidPrefix[63:32] (Word 5)
+        R_RTPS_GUID_2     = 6'd6,  // Latch Remote GuidPrefix[31:0] (Word 6) & CAM match
+        R_SUBMSG_HDR      = 6'd7,  // Inspect Submessage Header {submsgId, flags, octetsToNext}
+        R_SUBMSG_HDR_WAIT = 6'd8,  // 1-cycle BRAM read wait for next Submessage Header
+        R_INFO_TS_WAIT    = 6'd9,  // 1-cycle BRAM read wait for INFO_TS Word +1
+        R_INFO_TS_0       = 6'd10, // Latch INFO_TS seconds
+        R_INFO_TS_1       = 6'd11, // Latch INFO_TS fraction & advance to next submessage
+        R_DATA_HDR_1      = 6'd12, // 1-cycle BRAM read wait for DATA Word +3 (writerEntityId)
+        R_DATA_HDR_2      = 6'd13, // Check writerEntityId against matched CAM slot
+        R_DATA_SEQ_HI     = 6'd14, // Latch writerSeqNum[63:32]
+        R_DATA_SEQ_LO     = 6'd15, // Latch writerSeqNum[31:0] & branch on Q-flag (inline QoS)
+        R_SKIP_QOS_WAIT   = 6'd16, // 1-cycle BRAM read wait for Inline QoS parameter header
+        R_SKIP_QOS        = 6'd17, // Walk inline QoS parameter list until PID_SENTINEL (0x0001)
+        R_COMMIT_SAMPLE   = 6'd18, // Registered commit state (breaks BRAM-to-CE critical path)
+        R_INFO_DST_WAIT   = 6'd19, // 1-cycle BRAM wait for INFO_DST Word +1
+        R_INFO_DST_0      = 6'd20, // Latch INFO_DST GuidPrefix[95:64]
+        R_INFO_DST_1      = 6'd21, // Latch INFO_DST GuidPrefix[63:32]
+        R_INFO_DST_2      = 6'd22, // Latch INFO_DST GuidPrefix[31:0]
+        R_DATA_READER_ID  = 6'd23, // Check DATA readerEntityId against local reader / ENTITYID_UNKNOWN
+        R_REASM_CHECK     = 6'd24, // 1-cycle registered evaluation of IPv4 fragment coverage
+        R_CAM_MATCH       = 6'd25, // Reader CAM compare on fully registered GuidPrefix
+        R_PKT_TAIL_WR     = 6'd26, // Write trailing 1..3 bytes of unfragmented packet into rx_pkt_ram
+        R_UDP_CSUM_W0     = 6'd27, // Wait 1/2 for 3-stage rx_pseudo_csum pipeline flush
+        R_UDP_CSUM_W1     = 6'd28, // Wait 2/2 for 3-stage rx_pseudo_csum pipeline flush
+        R_COPY_DATA_PRIME = 6'd29, // 1-cycle prime for copying rx_pkt_ram DATA into reasm_ram[fill_slot]
+        R_COPY_DATA_LOOP  = 6'd30, // Copy unfragmented DATA packet into reasm_ram[fill_slot]
+        R_DF_HDR_1        = 6'd31, // DATA_FRAG: 1-cycle BRAM wait for readerEntityId
+        R_DF_READER_ID    = 6'd32, // DATA_FRAG: check readerEntityId
+        R_DF_WRITER_ID    = 6'd33, // DATA_FRAG: check writerEntityId
+        R_DF_SEQ_HI       = 6'd34, // DATA_FRAG: latch writerSN[63:32]
+        R_DF_SEQ_LO       = 6'd35, // DATA_FRAG: latch writerSN[31:0]
+        R_DF_FRAG_START   = 6'd36, // DATA_FRAG: latch fragmentStartingNum
+        R_DF_FRAG_INFO    = 6'd37, // DATA_FRAG: latch fragmentsInSubmessage & fragmentSize
+        R_DF_SAMPLE_SIZE  = 6'd38, // DATA_FRAG: latch sampleSize & branch on Q-flag
+        R_DF_VALIDATE     = 6'd39, // DATA_FRAG: validate fields & sample seqNum
+        R_DF_CALC         = 6'd40, // DATA_FRAG: iterative total_frags / byte_off / chunk_bytes calc
+        R_DF_COPY_PRIME   = 6'd41, // DATA_FRAG: 1-cycle BRAM prime for barrel-shifted copy
+        R_DF_COPY_LOOP    = 6'd42, // DATA_FRAG: barrel-shifted byte-enabled copy into reasm_ram[fill_slot]
+        R_DF_SYNTH_HDR    = 6'd43, // DATA_FRAG: synthesize Words 2..15 (RTPS+INFO_TS+DATA) for Option B
+        R_UDP_CSUM_W2     = 6'd44; // Wait 3/3 for 3-stage rx_pseudo_csum pipeline flush
 
-    reg [4:0]  rx_state;
+    reg [5:0]  rx_state;
     reg [11:0] rx_wire_beat;
     reg [15:0] rx_ip_len;
     reg [15:0] rx_ip_id;
@@ -923,20 +995,36 @@ module rtps_fastpath_ip #(
             rx_hdr_csum_accum <= csum_add32(rx_hdr_csum_accum, rx_hdr_word);
     end
     reg        rx_is_ipv4_udp;
+    reg        rx_pkt_is_ip_frag;
     reg [31:0] rx_src_ip;
     reg [31:0] rx_dst_ip;
     reg [15:0] rx_prev_half;
     reg [11:0] rx_wr_ptr;
+    reg [9:0]  rx_pkt_wr_ptr;
     reg [15:0] rx_bytes_rcvd;
     reg [15:0] rx_bytes_total;
     reg        rx_saw_last;
-    reg [15:0] rx_udp_csum_accum;
-    reg        rx_csum_clr;
-    reg [15:0] rx_udp_len_bytes;
-    reg [15:0] rx_udp_src_port;
-    reg [15:0] rx_udp_dst_port;
-    reg [15:0] rx_udp_hdr_csum;
     reg        rx_dst_match;
+
+    // Isolated metadata for IPv4-fragmented reassembly vs unfragmented staging packet
+    reg [31:0] frag_src_ip, frag_dst_ip;
+    reg [15:0] frag_udp_len_bytes, frag_udp_src_port, frag_udp_dst_port, frag_udp_hdr_csum;
+    reg [15:0] frag_udp_csum_accum;
+    reg        rx_csum_clr;
+
+    reg [31:0] pkt_src_ip, pkt_dst_ip;
+    reg [15:0] pkt_ip_pay_bytes, pkt_udp_len_bytes, pkt_udp_src_port, pkt_udp_dst_port, pkt_udp_hdr_csum;
+    reg [15:0] pkt_udp_csum_accum;
+    reg        pkt_csum_clr;
+    reg [47:0] pkt_src_mac;
+    reg [31:0] rx_tail_word;
+    reg        rx_tail_valid;
+
+    // Active latched metadata for UDP checksum & RTPS Walker
+    reg [31:0] walk_src_ip, walk_dst_ip;
+    reg [15:0] walk_udp_len_bytes, walk_udp_src_port, walk_udp_dst_port, walk_udp_hdr_csum;
+    reg [15:0] walk_udp_csum_accum;
+    reg [47:0] walk_src_mac;
 
     // Fragment Coverage Bitmap per Reassembly Slot (Section 6)
     localparam integer REASM_MAX_BYTES   = REASM_DEPTH * 4; // 1536 * 4 = 6144 bytes
@@ -948,13 +1036,7 @@ module rtps_fastpath_ip #(
     reg [15:0]             reasm_total_bytes;
     reg                    reasm_last_seen;
 
-    // Pipelined RX UDP Pseudo-Header Checksum Engine:
-    // Pipelined across 3 stages as headers stream in:
-    // - Stage 1 (Beat 8): Pre-sums IP addresses and UDP protocol (0x0011).
-    // - Stage 2 (Beat 10): Adds latched UDP datagram length (rx_udp_len_bytes).
-    // - Stage 3 (Beat 11): Latches 1's complement folded 16-bit pseudo-header checksum.
-    // By Beat 12 (thousands of clock cycles before reassembly completes), rx_pseudo_csum
-    // is 100% valid in flip-flops, completely breaking the 31-level CARRY4 timing path.
+    // Pipelined RX UDP Pseudo-Header Checksum Engine (flushed in R_UDP_CSUM_W0/W1 before R_CHECK_UDP)
     reg [19:0] rx_ip_pseudo_sum;
     reg [19:0] rx_pseudo_sum_pipe;
     reg [15:0] rx_pseudo_csum;
@@ -967,31 +1049,33 @@ module rtps_fastpath_ip #(
             rx_pseudo_sum_pipe <= 20'd0;
             rx_pseudo_csum     <= 16'd0;
         end else begin
-            // Stage 1: Sum of IP addresses + UDP protocol (0x0011)
-            rx_ip_pseudo_sum   <= {4'd0, rx_src_ip[31:16]} + {4'd0, rx_src_ip[15:0]} +
-                                  {4'd0, rx_dst_ip[31:16]} + {4'd0, rx_dst_ip[15:0]} +
+            rx_ip_pseudo_sum   <= {4'd0, walk_src_ip[31:16]} + {4'd0, walk_src_ip[15:0]} +
+                                  {4'd0, walk_dst_ip[31:16]} + {4'd0, walk_dst_ip[15:0]} +
                                   20'h0011;
-            // Stage 2: Add UDP length
-            rx_pseudo_sum_pipe <= rx_ip_pseudo_sum + {4'd0, rx_udp_len_bytes};
-            // Stage 3: Fold into 16 bits (1's complement)
+            rx_pseudo_sum_pipe <= rx_ip_pseudo_sum + {4'd0, walk_udp_len_bytes};
             rx_pseudo_csum     <= rx_pseudo_fold2;
         end
     end
 
-    // Accumulates one cycle after the RAM write; R_REASM_CHECK gives the last word time to land before R_CHECK_UDP.
+    // Separate UDP payload checksum accumulators for IPv4-frag vs unfragmented staging
     always @(posedge clk) begin
         if (!rst_n || rx_csum_clr)
-            rx_udp_csum_accum <= 16'd0;
-        else if (reasm_wr_en)
-            rx_udp_csum_accum <= csum_add32(rx_udp_csum_accum, reasm_wr_data);
+            frag_udp_csum_accum <= 16'd0;
+        else if ((rx_state == R_IDLE || rx_state == R_REASM_CHECK) && reasm_wr_en)
+            frag_udp_csum_accum <= csum_add32(frag_udp_csum_accum, reasm_wr_data);
     end
 
-    // UDP Checksum validation fold evaluated in R_CHECK_UDP:
-    // Combines accumulated payload checksum and pre-folded pseudo-header checksum.
-    // RFC 768: A transmitted checksum of 0x0000 indicates the sender omitted checksum calculation.
-    wire [16:0] rx_chk_fold1 = {1'b0, rx_udp_csum_accum} + {1'b0, rx_pseudo_csum};
+    always @(posedge clk) begin
+        if (!rst_n || pkt_csum_clr)
+            pkt_udp_csum_accum <= 16'd0;
+        else if (rx_pkt_wr_en)
+            pkt_udp_csum_accum <= csum_add32(pkt_udp_csum_accum, rx_pkt_wr_data);
+    end
+
+    // UDP Checksum validation fold evaluated in R_CHECK_UDP
+    wire [16:0] rx_chk_fold1 = {1'b0, walk_udp_csum_accum} + {1'b0, rx_pseudo_csum};
     wire [15:0] rx_chk_final = rx_chk_fold1[15:0] + {15'd0, rx_chk_fold1[16]};
-    wire        rx_chk_valid = (rx_udp_hdr_csum == 16'h0000) ||
+    wire        rx_chk_valid = (walk_udp_hdr_csum == 16'h0000) ||
                                ((&rx_chk_fold1[15:1]) && (rx_chk_fold1[0] ^ rx_chk_fold1[16]));
 
     wire [12:0] rx_frag_off_8b  = rx_flags_frag[12:0];
@@ -999,7 +1083,6 @@ module rtps_fastpath_ip #(
     wire [15:0] rx_ip_pay_bytes = rx_ip_len - 16'd20;
     wire [11:0] rx_frag_w_start = {rx_frag_off_8b[10:0], 1'b0};
 
-    // Header fields are stable several beats before payload; register the sum to shorten the write-enable path.
     reg [11:0] rx_wr_end;
     always @(posedge clk) rx_wr_end <= rx_frag_w_start + rx_ip_pay_bytes[13:2];
 
@@ -1018,8 +1101,44 @@ module rtps_fastpath_ip #(
     reg [11:0] walk_next_submsg_word;
     reg [63:0] walk_ts;
     reg [31:0] walk_writer_id;
+    reg [31:0] walk_reader_id;
     reg [63:0] walk_seq_num;
     reg [11:0] latest_payload_word_off;
+    reg [11:0] pending_payload_word_off;
+    reg [31:0] walk_rtps_ver_vendor;
+
+    // DATA_FRAG (0x16) Reassembly State (up to 32 fragments, byte-granular via barrel shifter)
+    reg        df_in_qos;
+    reg [31:0] df_frag_start;
+    reg [15:0] df_frags_in_submsg;
+    reg [15:0] df_frag_size;
+    reg [31:0] df_sample_size;
+    reg [11:0] df_pay_start_word;
+    reg [1:0]  df_calc_phase;
+    reg [15:0] df_calc_rem;
+    reg [5:0]  df_calc_cnt;
+    reg [15:0] df_calc_acc;
+    reg [15:0] df_byte_off;
+    reg [15:0] df_submsg_bytes;
+    reg [15:0] df_chunk_bytes;
+    reg [5:0]  df_total_frags;
+
+    reg        df_active_valid;
+    reg [1:0]  df_active_cam_idx;
+    reg [63:0] df_active_seq;
+    reg [15:0] df_active_sample_size;
+    reg [15:0] df_active_frag_size;
+    reg [5:0]  df_active_total_frags;
+    reg [31:0] df_frag_bitmap;
+
+    reg [15:0] df_dst_byte_addr;
+    reg [15:0] df_rem_bytes;
+    reg [11:0] df_src_word_ptr;
+    reg [31:0] df_prev_word;
+    reg        df_first_beat;
+    reg [1:0]  df_shift;
+    reg [3:0]  df_synth_idx;
+    reg [11:0] copy_word_idx;
 
     // INFO_DST Participant Filtering (Section 4)
     reg [95:0] walk_dst_guid_prefix;
@@ -1034,15 +1153,15 @@ module rtps_fastpath_ip #(
     wire rd2_active = active_rd_edt[2][0][0] && (active_rd_edt[2][0][3:1] == 3'd2);
     wire rd3_active = active_rd_edt[3][0][0] && (active_rd_edt[3][0][3:1] == 3'd2);
 
-    wire rd0_port_ok = (active_rd_edt[0][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[0][0][31:16]);
-    wire rd1_port_ok = (active_rd_edt[1][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[1][0][31:16]);
-    wire rd2_port_ok = (active_rd_edt[2][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[2][0][31:16]);
-    wire rd3_port_ok = (active_rd_edt[3][0][31:16] == 16'd0) || (rx_udp_dst_port == active_rd_edt[3][0][31:16]);
+    wire rd0_port_ok = (active_rd_edt[0][0][31:16] == 16'd0) || (walk_udp_dst_port == active_rd_edt[0][0][31:16]);
+    wire rd1_port_ok = (active_rd_edt[1][0][31:16] == 16'd0) || (walk_udp_dst_port == active_rd_edt[1][0][31:16]);
+    wire rd2_port_ok = (active_rd_edt[2][0][31:16] == 16'd0) || (walk_udp_dst_port == active_rd_edt[2][0][31:16]);
+    wire rd3_port_ok = (active_rd_edt[3][0][31:16] == 16'd0) || (walk_udp_dst_port == active_rd_edt[3][0][31:16]);
 
-    wire rd0_ip_ok   = (active_rd_edt[0][6] == 32'd0) || (rx_src_ip == active_rd_edt[0][6]);
-    wire rd1_ip_ok   = (active_rd_edt[1][6] == 32'd0) || (rx_src_ip == active_rd_edt[1][6]);
-    wire rd2_ip_ok   = (active_rd_edt[2][6] == 32'd0) || (rx_src_ip == active_rd_edt[2][6]);
-    wire rd3_ip_ok   = (active_rd_edt[3][6] == 32'd0) || (rx_src_ip == active_rd_edt[3][6]);
+    wire rd0_ip_ok   = (active_rd_edt[0][6] == 32'd0) || (walk_src_ip == active_rd_edt[0][6]);
+    wire rd1_ip_ok   = (active_rd_edt[1][6] == 32'd0) || (walk_src_ip == active_rd_edt[1][6]);
+    wire rd2_ip_ok   = (active_rd_edt[2][6] == 32'd0) || (walk_src_ip == active_rd_edt[2][6]);
+    wire rd3_ip_ok   = (active_rd_edt[3][6] == 32'd0) || (walk_src_ip == active_rd_edt[3][6]);
 
     wire cam_hit_0 = rd0_active && rd0_port_ok && rd0_ip_ok && ({active_rd_edt[0][1], active_rd_edt[0][2], active_rd_edt[0][3]} == walk_guid_prefix);
     wire cam_hit_1 = rd1_active && rd1_port_ok && rd1_ip_ok && ({active_rd_edt[1][1], active_rd_edt[1][2], active_rd_edt[1][3]} == walk_guid_prefix);
@@ -1054,12 +1173,13 @@ module rtps_fastpath_ip #(
     wire [15:0] submsg_octets = submsg_e_flag ? {walker_dout[7:0], walker_dout[15:8]} : walker_dout[15:0];
 
     // =========================================================================
-    // Generic TX Fragmentation Planner Signals (Section 7)
+    // Generic TX Fragmentation Planner Signals (Option C: DATA_FRAG + IP-Frag)
     // =========================================================================
-    localparam integer ETH_MTU_BYTES        = 1500;
-    localparam integer IPV4_HDR_BYTES       = 20;
-    localparam integer IPV4_PAYLOAD_MAX     = 1472; // Enforce <= 1514B Ethernet frame limit (14B Eth + 20B IP + 1472B = 1506B)
+    localparam integer ETH_MTU_BYTES         = 1500;
+    localparam integer IPV4_HDR_BYTES        = 20;
+    localparam integer IPV4_PAYLOAD_MAX      = 1472;
     localparam integer IPV4_NONFINAL_PAYLOAD = 1472;
+    localparam integer TX_DF_FRAG_MAX        = 1404; // 20B IP + 8B UDP + 20B RTPS + 12B INFO_TS + 36B DATA_FRAG + 1404B = 1500B
 
     reg [ADDR_WIDTH:0] pkt_len;
     reg [15:0]         pacing_timer;
@@ -1070,7 +1190,7 @@ module rtps_fastpath_ip #(
     reg [63:0]         latched_tx_ts;
     reg [63:0]         cur_tx_seq;
     reg [15:0]         tx_udp_csum;
-    reg [1:0]          tx_frag_idx;
+    reg [15:0]         tx_frag_idx;
     reg [11:0]         tx_frag_words;
     reg [15:0]         tx_frag_ip_len;
     reg [15:0]         tx_frag_flags;
@@ -1084,15 +1204,40 @@ module rtps_fastpath_ip #(
     reg [15:0]         tx_bytes_remaining;
     reg                tx_frag_more;
 
+    // Per-fragment checksum scan state (DATA_FRAG / single DATA)
+    reg [1:0]          tx_init_phase;
+    reg [11:0]         tx_frag_ser_bytes;
+    reg [11:0]         tx_frag_bram_base;
+    reg [11:0]         tx_frag_bram_words;
+    reg [11:0]         tx_scan_cnt;
+    reg [15:0]         tx_scan_csum;
+    reg [15:0]         tx_frag_csum_seed;
+
     // Latch active Writer[0] fields
     wire [15:0] wr0_src_port   = active_wr_edt[0][2][31:16];
     wire [31:0] wr0_writer_id  = active_wr_edt[0][5];
     wire [31:0] wr0_reader_id  = active_wr_edt[0][6];
 
-    wire [15:0] tx_total_dgram_words = pkt_len[11:0] + 12'd17; // 17 header words (68B) + 1024 payload words = 1041 words
+    // Clamped 4B-aligned fragmentSize for TX DATA_FRAG (4..1404 bytes)
+    wire [15:0] tx_eff_frag_bytes = (cfg_frag_size[15:0] < 16'd4)          ? 16'd4 :
+                                    (cfg_frag_size[15:0] > TX_DF_FRAG_MAX) ? TX_DF_FRAG_MAX[15:0] :
+                                    {cfg_frag_size[15:2], 2'b00};
+    wire [15:0] tx_sample_total_bytes = {2'b00, pkt_len[11:0], 2'b00} + 16'd4; // CDR_LE (4B) + FastSample
+    wire        tx_use_single_data    = (!tx_ip_frag_mode) && (tx_sample_total_bytes <= tx_eff_frag_bytes);
+    wire        tx_use_data_frag      = (!tx_ip_frag_mode) && (tx_sample_total_bytes > tx_eff_frag_bytes);
+
+    wire [15:0] tx_total_dgram_words = pkt_len[11:0] + 12'd17; // 17 header words (68B) + payload words = 1041 words
     wire [15:0] tx_udp_total_bytes   = {2'b00, tx_total_dgram_words[11:0], 2'b00}; // 4,164 bytes
     wire [15:0] tx_data_octets_le    = {2'b00, pkt_len[11:0], 2'b00} + 16'd24;     // 4,120 bytes (0x1018)
     wire [15:0] tx_data_octets_wire  = {tx_data_octets_le[7:0], tx_data_octets_le[15:8]}; // 0x1810 on wire
+
+    wire [15:0] tx_df_octets_le        = {4'd0, tx_frag_ser_bytes} + 16'd32;
+    wire [15:0] tx_df_octets_wire      = {tx_df_octets_le[7:0], tx_df_octets_le[15:8]};
+    wire [31:0] tx_df_start_num        = {16'd0, tx_frag_idx} + 32'd1;
+    wire [31:0] tx_df_start_wire       = {tx_df_start_num[7:0], tx_df_start_num[15:8],
+                                          tx_df_start_num[23:16], tx_df_start_num[31:24]};
+    wire [15:0] tx_df_frag_size_wire   = {tx_eff_frag_bytes[7:0], tx_eff_frag_bytes[15:8]};
+    wire [31:0] tx_df_sample_size_wire = {tx_sample_total_bytes[7:0], tx_sample_total_bytes[15:8], 16'h0000};
 
     // Freeze tx_sample_dout when pacing_timer > 0 so multi-cycle beats don't lose prefetched data
     reg [DATA_WIDTH-1:0] tx_sample_buf;
@@ -1113,75 +1258,104 @@ module rtps_fastpath_ip #(
         end
     end
 
-    // Combinational UDP/RTPS Datagram Word Mux (Word 0..16 headers, Word 17..1040 sample payload)
+    // Combinational UDP/RTPS Datagram Word Mux (DATA_FRAG 0x16 or DATA 0x15)
     reg [31:0] cur_dgram_word;
     always @(*) begin
-        case (tx_dgram_word_idx)
-            12'd0:  cur_dgram_word = {wr0_src_port, wr0_dst_port};
-            12'd1:  cur_dgram_word = {tx_udp_total_bytes, tx_udp_csum};
-            12'd2:  cur_dgram_word = 32'h5254_5053; // "RTPS"
-            12'd3:  cur_dgram_word = {16'h0201, local_vendor_id}; // RTPS v2.1, VendorId=0x0110 (Cyclone)
-            12'd4:  cur_dgram_word = local_guid_prefix[95:64];
-            12'd5:  cur_dgram_word = local_guid_prefix[63:32];
-            12'd6:  cur_dgram_word = local_guid_prefix[31:0];
-            12'd7:  cur_dgram_word = 32'h0901_0800; // INFO_TS (0x09), flags=0x01 (E=1), octetsToNext=8 (LE)
-            12'd8:  cur_dgram_word = {latched_tx_ts[39:32], latched_tx_ts[47:40], latched_tx_ts[55:48], latched_tx_ts[63:56]};
-            12'd9:  cur_dgram_word = {latched_tx_ts[7:0],   latched_tx_ts[15:8],  latched_tx_ts[23:16], latched_tx_ts[31:24]};
-            12'd10: cur_dgram_word = {8'h15, 8'h05, tx_data_octets_wire}; // DATA (0x15), flags=0x05 (D=1,Q=0,E=1)
-            12'd11: cur_dgram_word = 32'h0000_1000; // extraFlags=0, octetsToInlineQos=16 (LE)
-            12'd12: cur_dgram_word = wr0_reader_id;
-            12'd13: cur_dgram_word = wr0_writer_id;
-            12'd14: cur_dgram_word = {cur_tx_seq[39:32], cur_tx_seq[47:40], cur_tx_seq[55:48], cur_tx_seq[63:56]};
-            12'd15: cur_dgram_word = {cur_tx_seq[7:0],   cur_tx_seq[15:8],  cur_tx_seq[23:16], cur_tx_seq[31:24]};
-            12'd16: cur_dgram_word = 32'h0001_0000; // CDR_LE encapsulation (0x0001, options=0x0000)
-            default: cur_dgram_word = tx_sample_word;
-        endcase
+        if (tx_use_data_frag) begin
+            case (tx_dgram_word_idx)
+                12'd0:  cur_dgram_word = {wr0_src_port, wr0_dst_port};
+                12'd1:  cur_dgram_word = {tx_frag_payload_bytes, tx_udp_csum};
+                12'd2:  cur_dgram_word = 32'h5254_5053; // "RTPS"
+                12'd3:  cur_dgram_word = {16'h0201, local_vendor_id};
+                12'd4:  cur_dgram_word = local_guid_prefix[95:64];
+                12'd5:  cur_dgram_word = local_guid_prefix[63:32];
+                12'd6:  cur_dgram_word = local_guid_prefix[31:0];
+                12'd7:  cur_dgram_word = 32'h0901_0800; // INFO_TS (0x09)
+                12'd8:  cur_dgram_word = {latched_tx_ts[39:32], latched_tx_ts[47:40], latched_tx_ts[55:48], latched_tx_ts[63:56]};
+                12'd9:  cur_dgram_word = {latched_tx_ts[7:0],   latched_tx_ts[15:8],  latched_tx_ts[23:16], latched_tx_ts[31:24]};
+                12'd10: cur_dgram_word = {8'h16, 8'h01, tx_df_octets_wire}; // DATA_FRAG (0x16), E=1
+                12'd11: cur_dgram_word = 32'h0000_1C00; // extraFlags=0, octetsToInlineQos=28 (LE)
+                12'd12: cur_dgram_word = wr0_reader_id;
+                12'd13: cur_dgram_word = wr0_writer_id;
+                12'd14: cur_dgram_word = {cur_tx_seq[39:32], cur_tx_seq[47:40], cur_tx_seq[55:48], cur_tx_seq[63:56]};
+                12'd15: cur_dgram_word = {cur_tx_seq[7:0],   cur_tx_seq[15:8],  cur_tx_seq[23:16], cur_tx_seq[31:24]};
+                12'd16: cur_dgram_word = tx_df_start_wire;
+                12'd17: cur_dgram_word = {16'h0100, tx_df_frag_size_wire}; // fragmentsInSubmessage=1, fragmentSize
+                12'd18: cur_dgram_word = tx_df_sample_size_wire;
+                12'd19: cur_dgram_word = (tx_frag_idx == 16'd0) ? 32'h0001_0000 : bswap32(tx_sample_word);
+                default: cur_dgram_word = bswap32(tx_sample_word);
+            endcase
+        end else begin
+            case (tx_dgram_word_idx)
+                12'd0:  cur_dgram_word = {wr0_src_port, wr0_dst_port};
+                12'd1:  cur_dgram_word = {tx_udp_total_bytes, tx_udp_csum};
+                12'd2:  cur_dgram_word = 32'h5254_5053; // "RTPS"
+                12'd3:  cur_dgram_word = {16'h0201, local_vendor_id}; // RTPS v2.1, VendorId=0x0110 (Cyclone)
+                12'd4:  cur_dgram_word = local_guid_prefix[95:64];
+                12'd5:  cur_dgram_word = local_guid_prefix[63:32];
+                12'd6:  cur_dgram_word = local_guid_prefix[31:0];
+                12'd7:  cur_dgram_word = 32'h0901_0800; // INFO_TS (0x09), flags=0x01 (E=1), octetsToNext=8 (LE)
+                12'd8:  cur_dgram_word = {latched_tx_ts[39:32], latched_tx_ts[47:40], latched_tx_ts[55:48], latched_tx_ts[63:56]};
+                12'd9:  cur_dgram_word = {latched_tx_ts[7:0],   latched_tx_ts[15:8],  latched_tx_ts[23:16], latched_tx_ts[31:24]};
+                12'd10: cur_dgram_word = {8'h15, 8'h05, tx_data_octets_wire}; // DATA (0x15), flags=0x05 (D=1,Q=0,E=1)
+                12'd11: cur_dgram_word = 32'h0000_1000; // extraFlags=0, octetsToInlineQos=16 (LE)
+                12'd12: cur_dgram_word = wr0_reader_id;
+                12'd13: cur_dgram_word = wr0_writer_id;
+                12'd14: cur_dgram_word = {cur_tx_seq[39:32], cur_tx_seq[47:40], cur_tx_seq[55:48], cur_tx_seq[63:56]};
+                12'd15: cur_dgram_word = {cur_tx_seq[7:0],   cur_tx_seq[15:8],  cur_tx_seq[23:16], cur_tx_seq[31:24]};
+                12'd16: cur_dgram_word = 32'h0001_0000; // CDR_LE encapsulation (0x0001, options=0x0000)
+                default: cur_dgram_word = bswap32(tx_sample_word);
+            endcase
+        end
     end
 
     // =========================================================================
     // High-Performance Pipelined UDP & IP Checksum Engines (Timing Closure)
-    //
-    // Instead of chaining 60 carry-chains with per-word end-around carries,
-    // we sum the 16-bit half-words into a wide 24-bit binary accumulator tree
-    // (max 1 carry-chain per stage, delay < 1.5 ns), and fold the carries once.
-    //
-    // The result is ready in 4 clock cycles, well before Word 1 is sent on Beat 9.
     // =========================================================================
     reg [23:0] ucs_tree_0, ucs_tree_1, ucs_tree_2;
     reg [15:0] ucs_final_fold;
 
-    // Stage 1: Sum 8 half-words (4 words: payload_csum, local_src_ip, wr0_dst_ip, udp_len/proto)
-    wire [23:0] ucs_stg0_sum = {8'd0, payload_csum_accum} +
+    wire [15:0] ucs_udp_len   = tx_use_data_frag ? tx_frag_payload_bytes : tx_udp_total_bytes;
+    wire [15:0] ucs_seed_csum = tx_ip_frag_mode  ? payload_csum_accum    : tx_frag_csum_seed;
+
+    // Stage 1: Sum payload checksum, IPs, UDP len/proto, ports
+    wire [23:0] ucs_stg0_sum = {8'd0, ucs_seed_csum} +
                                {8'd0, local_src_ip[31:16]} + {8'd0, local_src_ip[15:0]} +
                                {8'd0, wr0_dst_ip[31:16]}   + {8'd0, wr0_dst_ip[15:0]} +
-                               {8'd0, 16'h0011}            + {8'd0, tx_udp_total_bytes} +
+                               {8'd0, 16'h0011}            + {8'd0, ucs_udp_len} +
                                {8'd0, wr0_src_port}        + {8'd0, wr0_dst_port};
 
-    // Stage 2: Sum next 8 half-words (RTPS magic, version/vendor, guidPrefix)
+    // Stage 2: Sum UDP len + RTPS magic, version/vendor, guidPrefix
     wire [23:0] ucs_stg1_sum = ucs_tree_0 +
-                               {8'd0, tx_udp_total_bytes} + 24'd0 +
+                               {8'd0, ucs_udp_len} + 24'd0 +
                                {8'd0, 16'h5254} + {8'd0, 16'h5053} +
                                {8'd0, 16'h0201} + {8'd0, local_vendor_id} +
                                {8'd0, local_guid_prefix[95:80]} + {8'd0, local_guid_prefix[79:64]} +
                                {8'd0, local_guid_prefix[63:48]} + {8'd0, local_guid_prefix[47:32]} +
                                {8'd0, local_guid_prefix[31:16]} + {8'd0, local_guid_prefix[15:0]};
 
-    // Stage 3a: terms that do not depend on tree_1, summed in parallel with stage 2 to shorten stage 3.
+    wire [23:0] ucs_submsg_sum = tx_use_data_frag ?
+        ({8'd0, 8'h16, 8'h01} + {8'd0, tx_df_octets_wire} + {8'd0, 16'h1C00} +
+         {8'd0, tx_df_start_wire[31:16]} + {8'd0, tx_df_start_wire[15:0]} +
+         {8'd0, 16'h0100} + {8'd0, tx_df_frag_size_wire} +
+         {8'd0, tx_df_sample_size_wire[31:16]} + {8'd0, tx_df_sample_size_wire[15:0]}) :
+        ({8'd0, 8'h15, 8'h05} + {8'd0, tx_data_octets_wire} + {8'd0, 16'h1000} +
+         {8'd0, 16'h0001});
+
+    // Stage 3a: terms that do not depend on tree_1, summed in parallel with stage 2
     reg [23:0] ucs_pre;
     wire [23:0] ucs_pre_sum = {8'd0, 16'h0901} + {8'd0, 16'h0800} +
                                {8'd0, latched_tx_ts[39:32], latched_tx_ts[47:40]} +
                                {8'd0, latched_tx_ts[55:48], latched_tx_ts[63:56]} +
                                {8'd0, latched_tx_ts[7:0],   latched_tx_ts[15:8]}  +
                                {8'd0, latched_tx_ts[23:16], latched_tx_ts[31:24]} +
-                               {8'd0, 8'h15, 8'h05} + {8'd0, tx_data_octets_wire} +
-                               {8'd0, 16'h0000} + {8'd0, 16'h1000} +
                                {8'd0, wr0_reader_id[31:16]} + {8'd0, wr0_reader_id[15:0]} +
                                {8'd0, wr0_writer_id[31:16]} + {8'd0, wr0_writer_id[15:0]} +
                                {8'd0, cur_tx_seq[39:32], cur_tx_seq[47:40]} +
                                {8'd0, cur_tx_seq[55:48], cur_tx_seq[63:56]} +
                                {8'd0, cur_tx_seq[7:0],   cur_tx_seq[15:8]}  +
                                {8'd0, cur_tx_seq[23:16], cur_tx_seq[31:24]} +
-                               {8'd0, 16'h0001};
+                               ucs_submsg_sum;
     always @(posedge clk) ucs_pre <= ucs_pre_sum;
 
     // Stage 3: combine tree_1 with the pre-summed terms
@@ -1267,6 +1441,9 @@ module rtps_fastpath_ip #(
     wire [ADDR_WIDTH:0]   egress_total_words  = plugin_rx_rtps_mode ? latest_rtps_words :
                                                 ((pkt_len > 0) ? pkt_len : cfg_payload_words[ADDR_WIDTH:0]);
 
+    // Convert network-order engine words back to host little-endian DDR byte order for S2MM.
+    wire [31:0] s2mm_dout_host = bswap32(s2mm_dout);
+
     assign m_axis_tkeep = {(DATA_WIDTH/8){1'b1}};
     wire   tx_handshake = m_axis_tvalid && m_axis_tready;
     wire   can_issue_bram_rd = (state == S_TX_RUN) && (egress_rd_ptr < egress_total_words) &&
@@ -1298,13 +1475,13 @@ module rtps_fastpath_ip #(
             err_csum                <= 1'b0;
             err_icmp                <= 1'b0;
             irq_is_rx               <= 1'b0;
-            completed_frags         <= 4'd0;
+            completed_frags         <= 16'd0;
 
             tx_ip_id_counter        <= 16'h1000;
             latched_tx_ts           <= 64'd0;
             cur_tx_seq              <= 64'd1;
             tx_udp_csum             <= 16'd0;
-            tx_frag_idx             <= 2'd0;
+            tx_frag_idx             <= 16'd0;
             tx_frag_words           <= 12'd0;
             tx_frag_ip_len          <= 16'd0;
             tx_frag_flags           <= 16'd0;
@@ -1313,6 +1490,13 @@ module rtps_fastpath_ip #(
             tx_beat_idx             <= 12'd0;
             tx_prev_half            <= 16'd0;
             tx_sample_rd_addr       <= {ADDR_WIDTH{1'b0}};
+            tx_init_phase           <= 2'd0;
+            tx_frag_ser_bytes       <= 12'd0;
+            tx_frag_bram_base       <= 12'd0;
+            tx_frag_bram_words      <= 12'd0;
+            tx_scan_cnt             <= 12'd0;
+            tx_scan_csum            <= 16'd0;
+            tx_frag_csum_seed       <= 16'd0;
 
             eng_tx_tdata            <= 32'd0;
             eng_tx_tvalid           <= 1'b0;
@@ -1335,13 +1519,20 @@ module rtps_fastpath_ip #(
             egress_slot             <= 2'd2;
             latest_valid            <= 1'b0;
             reasm_wr_en             <= 1'b0;
+            reasm_wr_be             <= 4'b1111;
             rx_csum_clr             <= 1'b0;
+            pkt_csum_clr            <= 1'b0;
+            rx_pkt_wr_en            <= 1'b0;
+            rx_pkt_wr_addr          <= 9'd0;
+            rx_pkt_wr_data          <= 32'd0;
+            walk_from_pkt_ram       <= 1'b0;
             reasm_wr_addr           <= 12'd0;
             reasm_wr_data           <= 32'd0;
             walker_rd_addr          <= 12'd0;
 
             rx_wire_beat            <= 12'd0;
             rx_is_ipv4_udp          <= 1'b0;
+            rx_pkt_is_ip_frag       <= 1'b0;
             rx_ip_len               <= 16'd0;
             rx_ip_id                <= 16'd0;
             rx_active_ip_id         <= 16'd0;
@@ -1354,14 +1545,35 @@ module rtps_fastpath_ip #(
             rx_dst_ip               <= 32'd0;
             rx_prev_half            <= 16'd0;
             rx_wr_ptr               <= 12'd0;
+            rx_pkt_wr_ptr           <= 10'd0;
             rx_bytes_rcvd           <= 16'd0;
             rx_bytes_total          <= 16'd0;
             rx_saw_last             <= 1'b0;
-            rx_udp_len_bytes        <= 16'd0;
-            rx_udp_src_port         <= 16'd0;
-            rx_udp_dst_port         <= 16'd0;
-            rx_udp_hdr_csum         <= 16'hFFFF;
             rx_dst_match            <= 1'b0;
+            frag_src_ip             <= 32'd0;
+            frag_dst_ip             <= 32'd0;
+            frag_udp_len_bytes      <= 16'd0;
+            frag_udp_src_port       <= 16'd0;
+            frag_udp_dst_port       <= 16'd0;
+            frag_udp_hdr_csum       <= 16'hFFFF;
+            pkt_src_ip              <= 32'd0;
+            pkt_dst_ip              <= 32'd0;
+            pkt_ip_pay_bytes        <= 16'd0;
+            pkt_udp_len_bytes       <= 16'd0;
+            pkt_udp_src_port        <= 16'd0;
+            pkt_udp_dst_port        <= 16'd0;
+            pkt_udp_hdr_csum        <= 16'hFFFF;
+            pkt_src_mac             <= 48'd0;
+            rx_tail_word            <= 32'd0;
+            rx_tail_valid           <= 1'b0;
+            walk_src_ip             <= 32'd0;
+            walk_dst_ip             <= 32'd0;
+            walk_udp_len_bytes      <= 16'd0;
+            walk_udp_src_port       <= 16'd0;
+            walk_udp_dst_port       <= 16'd0;
+            walk_udp_hdr_csum       <= 16'hFFFF;
+            walk_udp_csum_accum     <= 16'd0;
+            walk_src_mac            <= 48'd0;
             last_rx_src_ip          <= 32'd0;
             last_rx_src_port        <= 16'd0;
             last_rx_dst_port        <= 16'd0;
@@ -1381,9 +1593,42 @@ module rtps_fastpath_ip #(
             walk_next_submsg_word   <= 12'd0;
             walk_ts                 <= 64'd0;
             walk_writer_id          <= 32'd0;
+            walk_reader_id          <= 32'd0;
             walk_seq_num            <= 64'd0;
             latest_payload_word_off <= 12'd17;
+            pending_payload_word_off<= 12'd17;
+            walk_rtps_ver_vendor    <= 32'h0203_0101;
             latest_rtps_words       <= 12'd1039;
+
+            df_in_qos               <= 1'b0;
+            df_frag_start           <= 32'd0;
+            df_frags_in_submsg      <= 16'd0;
+            df_frag_size            <= 16'd0;
+            df_sample_size          <= 32'd0;
+            df_pay_start_word       <= 12'd0;
+            df_calc_phase           <= 2'd0;
+            df_calc_rem             <= 16'd0;
+            df_calc_cnt             <= 6'd0;
+            df_calc_acc             <= 16'd0;
+            df_byte_off             <= 16'd0;
+            df_submsg_bytes         <= 16'd0;
+            df_chunk_bytes          <= 16'd0;
+            df_total_frags          <= 6'd0;
+            df_active_valid         <= 1'b0;
+            df_active_cam_idx       <= 2'd0;
+            df_active_seq           <= 64'd0;
+            df_active_sample_size   <= 16'd0;
+            df_active_frag_size     <= 16'd0;
+            df_active_total_frags   <= 6'd0;
+            df_frag_bitmap          <= 32'd0;
+            df_dst_byte_addr        <= 16'd0;
+            df_rem_bytes            <= 16'd0;
+            df_src_word_ptr         <= 12'd0;
+            df_prev_word            <= 32'd0;
+            df_first_beat           <= 1'b0;
+            df_shift                <= 2'd0;
+            df_synth_idx            <= 4'd0;
+            copy_word_idx           <= 12'd0;
 
             stat_tx_samples         <= 32'd0;
             stat_rx_samples         <= 32'd0;
@@ -1414,10 +1659,13 @@ module rtps_fastpath_ip #(
             reasm_last_seen      <= 1'b0;
         end else begin
             // Default single-cycle pulse deassertions
-            reasm_wr_en <= 1'b0;
-            rx_csum_clr <= 1'b0;
-            rx_hdr_add  <= 1'b0;
-            rx_hdr_init <= 1'b0;
+            reasm_wr_en  <= 1'b0;
+            reasm_wr_be  <= 4'b1111;
+            rx_pkt_wr_en <= 1'b0;
+            rx_csum_clr  <= 1'b0;
+            pkt_csum_clr <= 1'b0;
+            rx_hdr_add   <= 1'b0;
+            rx_hdr_init  <= 1'b0;
 
             // Atomic synchronization pulse on commit (Section 2)
             if (edt_commit_applied) begin
@@ -1479,26 +1727,39 @@ module rtps_fastpath_ip #(
                             12'd5: begin
                                 // Beat 5: {IPv4_FlagsFrag, TTL_Proto}
                                 rx_flags_frag     <= eng_rx_tdata[31:16];
+                                rx_pkt_is_ip_frag <= eng_rx_tdata[29] || (eng_rx_tdata[28:16] != 13'd0);
                                 rx_hdr_word       <= eng_rx_tdata;
                                 rx_hdr_add        <= 1'b1;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                                 rx_is_ipv4_udp    <= rx_is_ipv4_udp && (eng_rx_tdata[7:0] == 8'h11);
 
-                                // If a new IP_ID arrives, reset reassembly context for the new datagram
-                                if (rx_is_ipv4_udp && (eng_rx_tdata[7:0] == 8'h11) &&
-                                    (!rx_active_valid || (rx_active_ip_id != rx_ip_id))) begin
-                                    rx_active_ip_id                <= rx_ip_id;
-                                    rx_active_src_mac              <= rx_wire_src_mac;
-                                    rx_active_valid                <= 1'b1;
-                                    rx_bytes_rcvd                  <= 16'd0;
-                                    rx_bytes_total                 <= 16'd0;
-                                    rx_saw_last                    <= 1'b0;
-                                    rx_csum_clr                    <= 1'b1;
-                                    rx_udp_hdr_csum                <= 16'hFFFF;
-                                    reasm_coverage       <= {REASM_BLOCKS{1'b0}};
-                                    reasm_blocks_covered <= 10'd0;
-                                    reasm_total_bytes    <= 16'd0;
-                                    reasm_last_seen      <= 1'b0;
+                                if (rx_is_ipv4_udp && (eng_rx_tdata[7:0] == 8'h11)) begin
+                                    if (eng_rx_tdata[29] || (eng_rx_tdata[28:16] != 13'd0)) begin
+                                        // IPv4-fragmented path: reset only when a new IP_ID arrives
+                                        if (!rx_active_valid || (rx_active_ip_id != rx_ip_id)) begin
+                                            rx_active_ip_id      <= rx_ip_id;
+                                            rx_active_src_mac    <= rx_wire_src_mac;
+                                            rx_active_valid      <= 1'b1;
+                                            rx_bytes_rcvd        <= 16'd0;
+                                            rx_bytes_total       <= 16'd0;
+                                            rx_saw_last          <= 1'b0;
+                                            rx_csum_clr          <= 1'b1;
+                                            frag_udp_hdr_csum    <= 16'hFFFF;
+                                            reasm_coverage       <= {REASM_BLOCKS{1'b0}};
+                                            reasm_blocks_covered <= 10'd0;
+                                            reasm_total_bytes    <= 16'd0;
+                                            reasm_last_seen      <= 1'b0;
+                                            df_active_valid      <= 1'b0;
+                                            df_frag_bitmap       <= 32'd0;
+                                        end
+                                    end else begin
+                                        // Unfragmented UDP/IPv4 path: buffer in rx_pkt_ram without disturbing IPv4-frag state
+                                        pkt_csum_clr      <= 1'b1;
+                                        pkt_src_mac       <= rx_wire_src_mac;
+                                        pkt_udp_hdr_csum  <= 16'hFFFF;
+                                        pkt_ip_pay_bytes  <= rx_ip_len - 16'd20;
+                                        rx_tail_valid     <= 1'b0;
+                                    end
                                 end
                             end
                             12'd6: begin
@@ -1523,49 +1784,70 @@ module rtps_fastpath_ip #(
                                 rx_hdr_add        <= 1'b1;
                                 rx_prev_half      <= eng_rx_tdata[15:0];
                                 rx_wr_ptr         <= rx_frag_w_start;
+                                rx_pkt_wr_ptr     <= 10'd0;
                                 rx_wire_beat      <= rx_wire_beat + 12'd1;
                                 rx_dst_match      <= ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == local_src_ip) ||
-                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hC0A8_010A) || // Primary IP 192.168.1.10
-                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hC0A8_01C9) || // Secondary IP 192.168.1.201
-                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hC0A8_01FF) || // Subnet Broadcast
-                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hFFFF_FFFF);   // Global Broadcast
+                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == {local_src_ip[31:8], 8'hFF}) ||
+                                                     ({rx_dst_ip[31:16], eng_rx_tdata[31:16]} == 32'hFFFF_FFFF);
+                                if (rx_pkt_is_ip_frag) begin
+                                    frag_src_ip <= rx_src_ip;
+                                    frag_dst_ip <= {rx_dst_ip[31:16], eng_rx_tdata[31:16]};
+                                end else begin
+                                    pkt_src_ip  <= rx_src_ip;
+                                    pkt_dst_ip  <= {rx_dst_ip[31:16], eng_rx_tdata[31:16]};
+                                end
                             end
                             default: begin
-                                // Store reassembled 32-bit word into fill_slot at rx_wr_ptr
-                                if (rx_is_ipv4_udp && rx_dst_match && rx_wr_ptr < rx_wr_end) begin
-                                    reasm_wr_en       <= 1'b1;
-                                    reasm_wr_addr     <= rx_wr_ptr;
-                                    reasm_wr_data     <= {rx_prev_half, eng_rx_tdata[31:16]};
-                                    if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd0) begin
-                                        rx_udp_src_port <= rx_prev_half;
-                                        rx_udp_dst_port <= eng_rx_tdata[31:16];
-                                    end
-                                    if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd1) begin
-                                        rx_udp_len_bytes <= rx_prev_half;
-                                        rx_udp_hdr_csum  <= eng_rx_tdata[31:16];
-                                    end
-                                    rx_wr_ptr <= rx_wr_ptr + 12'd1;
+                                if (rx_pkt_is_ip_frag) begin
+                                    if (rx_is_ipv4_udp && rx_dst_match && rx_wr_ptr < rx_wr_end) begin
+                                        reasm_wr_en   <= 1'b1;
+                                        reasm_wr_be   <= 4'b1111;
+                                        reasm_wr_addr <= rx_wr_ptr;
+                                        reasm_wr_data <= {rx_prev_half, eng_rx_tdata[31:16]};
+                                        if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd0) begin
+                                            frag_udp_src_port <= rx_prev_half;
+                                            frag_udp_dst_port <= eng_rx_tdata[31:16];
+                                        end
+                                        if (rx_frag_off_8b == 13'd0 && rx_wr_ptr == 12'd1) begin
+                                            frag_udp_len_bytes <= rx_prev_half;
+                                            frag_udp_hdr_csum  <= eng_rx_tdata[31:16];
+                                        end
+                                        rx_wr_ptr <= rx_wr_ptr + 12'd1;
 
-                                    // Mark 8-byte block in coverage bitmap (Section 6)
-                                    // Qualified by !rx_wr_ptr[0] as each 8-byte block enters on Word 0
-                                    if (!rx_wr_ptr[0] && !reasm_coverage[rx_wr_ptr[10:1]]) begin
-                                        reasm_coverage[rx_wr_ptr[10:1]] <= 1'b1;
-                                        reasm_blocks_covered            <= reasm_blocks_covered + 10'd1;
+                                        if (!rx_wr_ptr[0] && !reasm_coverage[rx_wr_ptr[10:1]]) begin
+                                            reasm_coverage[rx_wr_ptr[10:1]] <= 1'b1;
+                                            reasm_blocks_covered            <= reasm_blocks_covered + 10'd1;
+                                        end
+                                    end
+                                end else begin
+                                    if (rx_is_ipv4_udp && rx_dst_match && (rx_pkt_wr_ptr < {1'b0, pkt_ip_pay_bytes[10:2]}) && (rx_pkt_wr_ptr < 10'd511)) begin
+                                        rx_pkt_wr_en   <= 1'b1;
+                                        rx_pkt_wr_addr <= rx_pkt_wr_ptr[8:0];
+                                        rx_pkt_wr_data <= {rx_prev_half, eng_rx_tdata[31:16]};
+                                        if (rx_pkt_wr_ptr == 10'd0) begin
+                                            pkt_udp_src_port <= rx_prev_half;
+                                            pkt_udp_dst_port <= eng_rx_tdata[31:16];
+                                        end
+                                        if (rx_pkt_wr_ptr == 10'd1) begin
+                                            pkt_udp_len_bytes <= rx_prev_half;
+                                            pkt_udp_hdr_csum  <= eng_rx_tdata[31:16];
+                                        end
+                                        rx_pkt_wr_ptr <= rx_pkt_wr_ptr + 10'd1;
                                     end
                                 end
                                 rx_prev_half <= eng_rx_tdata[15:0];
 
                                 if (eng_rx_tlast) begin
                                     rx_wire_beat <= 12'd0;
-                                    // Non-IPv4/UDP frames or ambient packets not matching our IP are dropped without a checksum error
                                     if (!rx_is_ipv4_udp || !rx_dst_match) begin
-                                        rx_active_valid <= 1'b0;
+                                        if (rx_pkt_is_ip_frag)
+                                            rx_active_valid <= 1'b0;
                                     end else if (rx_hdr_csum_accum != 16'hFFFF) begin
-                                        err_csum        <= 1'b1;
-                                        stat_csum_errs  <= stat_csum_errs + 32'd1;
-                                        rx_active_valid <= 1'b0;
-                                    end else begin
-                                        // Update reassembly status
+                                        err_csum       <= 1'b1;
+                                        stat_csum_errs <= stat_csum_errs + 32'd1;
+                                        if (rx_pkt_is_ip_frag)
+                                            rx_active_valid <= 1'b0;
+                                    end else if (rx_pkt_is_ip_frag) begin
                                         if (!rx_frag_mf) begin
                                             rx_bytes_total    <= {rx_frag_off_8b, 3'b000} + rx_ip_pay_bytes;
                                             rx_saw_last       <= 1'b1;
@@ -1574,39 +1856,94 @@ module rtps_fastpath_ip #(
                                         end
                                         rx_bytes_rcvd <= rx_bytes_rcvd + rx_ip_pay_bytes;
                                         rx_state      <= R_REASM_CHECK;
+                                    end else begin
+                                        // Unfragmented UDP/IPv4: capture trailing 1..3 unaligned bytes if any
+                                        if (pkt_ip_pay_bytes[1:0] == 2'b01) begin
+                                            rx_tail_word  <= {eng_rx_tdata[15:8], 24'd0};
+                                            rx_tail_valid <= 1'b1;
+                                        end else if (pkt_ip_pay_bytes[1:0] == 2'b10) begin
+                                            rx_tail_word  <= {eng_rx_tdata[15:0], 16'd0};
+                                            rx_tail_valid <= 1'b1;
+                                        end else if (pkt_ip_pay_bytes[1:0] == 2'b11) begin
+                                            rx_tail_word  <= {rx_prev_half, eng_rx_tdata[31:24], 8'd0};
+                                            rx_tail_valid <= 1'b1;
+                                        end else begin
+                                            rx_tail_valid <= 1'b0;
+                                        end
+                                        walk_from_pkt_ram <= 1'b1;
+                                        rx_state          <= R_PKT_TAIL_WR;
                                     end
                                 end else begin
                                     rx_wire_beat <= rx_wire_beat + 12'd1;
                                 end
                             end
                         endcase
-                        // A frame shorter than the header ends here; resync the beat counter
                         if (eng_rx_tlast && rx_wire_beat <= 12'd8) rx_wire_beat <= 12'd0;
                     end
                 end
 
-                // 1-cycle registered evaluation of reassembly coverage (breaks 768-to-1 MUX critical path)
+                // Write optional unaligned tail word & latch packet metadata into walker
+                R_PKT_TAIL_WR: begin
+                    if (rx_tail_valid && rx_pkt_wr_ptr < 10'd511) begin
+                        rx_pkt_wr_en   <= 1'b1;
+                        rx_pkt_wr_addr <= rx_pkt_wr_ptr[8:0];
+                        rx_pkt_wr_data <= rx_tail_word;
+                    end
+                    walk_src_ip        <= pkt_src_ip;
+                    walk_dst_ip        <= pkt_dst_ip;
+                    walk_udp_len_bytes <= pkt_udp_len_bytes;
+                    walk_udp_src_port  <= pkt_udp_src_port;
+                    walk_udp_dst_port  <= pkt_udp_dst_port;
+                    walk_udp_hdr_csum  <= pkt_udp_hdr_csum;
+                    walk_src_mac       <= pkt_src_mac;
+                    rx_state           <= R_UDP_CSUM_W0;
+                end
+
+                // 1-cycle registered evaluation of IPv4 fragment coverage
                 R_REASM_CHECK: begin
                     if (reasm_last_seen && rx_dst_match &&
                         (reasm_total_bytes > 16'd0) &&
                         (reasm_blocks_covered == ((reasm_total_bytes + 16'd7) >> 3))) begin
-                        rx_active_valid <= 1'b0;
-                        rx_bytes_rcvd   <= 16'd0;
-                        rx_saw_last     <= 1'b0;
-                        walker_rd_addr  <= 12'd2; // Prime Word 2 ("RTPS")
-                        rx_state        <= R_CHECK_UDP;
+                        rx_active_valid    <= 1'b0;
+                        rx_bytes_rcvd      <= 16'd0;
+                        rx_saw_last        <= 1'b0;
+                        walk_from_pkt_ram  <= 1'b0;
+                        walk_src_ip        <= frag_src_ip;
+                        walk_dst_ip        <= frag_dst_ip;
+                        walk_udp_len_bytes <= frag_udp_len_bytes;
+                        walk_udp_src_port  <= frag_udp_src_port;
+                        walk_udp_dst_port  <= frag_udp_dst_port;
+                        walk_udp_hdr_csum  <= frag_udp_hdr_csum;
+                        walk_src_mac       <= rx_active_src_mac;
+                        rx_state           <= R_UDP_CSUM_W0;
                     end else begin
                         if (!rx_dst_match)
                             rx_active_valid <= 1'b0;
-                        rx_state        <= R_IDLE;
+                        rx_state <= R_IDLE;
                     end
                 end
 
-                // Fold UDP pseudo-header into rx_udp_csum_accum & check == 0xFFFF
+                // Flush 3-stage rx_pseudo_csum pipeline & latch final payload checksum
+                R_UDP_CSUM_W0: begin
+                    rx_state <= R_UDP_CSUM_W1;
+                end
+
+                R_UDP_CSUM_W1: begin
+                    walk_udp_csum_accum <= walk_from_pkt_ram ? pkt_udp_csum_accum : frag_udp_csum_accum;
+                    rx_state            <= R_UDP_CSUM_W2;
+                end
+
+                R_UDP_CSUM_W2: begin
+                    walker_rd_addr <= 12'd2; // Prime Word 2 ("RTPS")
+                    rx_state       <= R_CHECK_UDP;
+                end
+
+                // Fold UDP pseudo-header & check == 0xFFFF
                 R_CHECK_UDP: begin
                     walk_dst_valid       <= 1'b0;
                     walk_dst_guid_prefix <= 96'd0;
-                    walk_dgram_words     <= rx_udp_len_bytes[13:2];
+                    walk_dgram_words     <= (walk_udp_len_bytes + 16'd3) >> 2;
+                    df_in_qos            <= 1'b0;
                     if (!rx_chk_valid) begin
                         err_csum       <= 1'b1;
                         stat_csum_errs <= stat_csum_errs + 32'd1;
@@ -1618,7 +1955,6 @@ module rtps_fastpath_ip #(
                 end
 
                 R_RTPS_HDR_0: begin
-                    // walker_dout holds Word 2 ("RTPS" = 0x5254_5053)
                     if (walker_dout != 32'h5254_5053) begin
                         rx_state <= R_IDLE;
                     end else begin
@@ -1628,8 +1964,8 @@ module rtps_fastpath_ip #(
                 end
 
                 R_RTPS_HDR_1: begin
-                    // walker_dout holds Word 3 ({ProtoVer[15:0], VendorId[15:0]})
-                    if (walker_dout[31:24] != 8'h02) begin // Major version must be 2
+                    walk_rtps_ver_vendor <= walker_dout;
+                    if (walker_dout[31:24] != 8'h02) begin
                         rx_state <= R_IDLE;
                     end else begin
                         walker_rd_addr <= 12'd5; // Prime Word 5 (GuidPrefix[63:32])
@@ -1639,13 +1975,13 @@ module rtps_fastpath_ip #(
 
                 R_RTPS_GUID_0: begin
                     walk_guid_prefix[95:64] <= walker_dout;
-                    walker_rd_addr          <= 12'd6; // Prime Word 6 (GuidPrefix[31:0])
+                    walker_rd_addr          <= 12'd6;
                     rx_state                <= R_RTPS_GUID_1;
                 end
 
                 R_RTPS_GUID_1: begin
                     walk_guid_prefix[63:32] <= walker_dout;
-                    walker_rd_addr          <= 12'd7; // Prime Word 7 (First Submessage Header)
+                    walker_rd_addr          <= 12'd7;
                     rx_state                <= R_RTPS_GUID_2;
                 end
 
@@ -1655,7 +1991,6 @@ module rtps_fastpath_ip #(
                     rx_state               <= R_CAM_MATCH;
                 end
 
-                // walker_rd_addr still points at Word 7, so walker_dout holds the first submessage header on exit
                 R_CAM_MATCH: begin
                     if (cam_hit_0) begin
                         walk_cam_hit <= 1'b1;
@@ -1675,7 +2010,7 @@ module rtps_fastpath_ip #(
                         rx_state     <= R_SUBMSG_HDR;
                     end else begin
                         walk_cam_hit <= 1'b0;
-                        rx_state     <= R_IDLE; // Unknown participant GUID -> ignore
+                        rx_state     <= R_IDLE;
                     end
                 end
 
@@ -1692,7 +2027,7 @@ module rtps_fastpath_ip #(
 
                         case (walker_dout[31:24])
                             8'h09: begin // INFO_TS (0x09)
-                                if (walker_dout[17]) begin // I-flag=1 (invalid timestamp) -> skip
+                                if (walker_dout[17]) begin
                                     walk_cur_word  <= walk_cur_word + 12'd1 + submsg_octets[13:2];
                                     walker_rd_addr <= walk_cur_word + 12'd1 + submsg_octets[13:2];
                                     rx_state       <= R_SUBMSG_HDR_WAIT;
@@ -1701,7 +2036,7 @@ module rtps_fastpath_ip #(
                                     rx_state       <= R_INFO_TS_WAIT;
                                 end
                             end
-                            8'h0E: begin // INFO_DST (0x0E) - Section 4
+                            8'h0E: begin // INFO_DST (0x0E)
                                 if (submsg_octets != 16'd12) begin
                                     rx_state <= R_IDLE;
                                 end else begin
@@ -1709,13 +2044,28 @@ module rtps_fastpath_ip #(
                                     rx_state       <= R_INFO_DST_WAIT;
                                 end
                             end
-                            8'h15: begin // DATA (0x15) - Section 5
-                                // Body: +1 flags/octetsToInlineQos, +2 readerEntityId, +3 writerEntityId
-                                walker_rd_addr <= walk_cur_word + 12'd2; // Prime Word +2: readerEntityId
-                                rx_state       <= R_DATA_HDR_1;          // 1-cycle wait state for Word +2
+                            8'h15: begin // DATA (0x15)
+                                df_in_qos      <= 1'b0;
+                                walker_rd_addr <= walk_cur_word + 12'd2;
+                                rx_state       <= R_DATA_HDR_1;
+                            end
+                            8'h16: begin // DATA_FRAG (0x16)
+                                if (walk_from_pkt_ram) begin
+                                    df_in_qos      <= 1'b1;
+                                    walker_rd_addr <= walk_cur_word + 12'd2;
+                                    rx_state       <= R_DF_HDR_1;
+                                end else begin
+                                    stat_skipped_submsg <= stat_skipped_submsg + 32'd1;
+                                    if (submsg_octets == 16'd0) begin
+                                        rx_state <= R_IDLE;
+                                    end else begin
+                                        walk_cur_word  <= walk_cur_word + 12'd1 + submsg_octets[13:2];
+                                        walker_rd_addr <= walk_cur_word + 12'd1 + submsg_octets[13:2];
+                                        rx_state       <= R_SUBMSG_HDR_WAIT;
+                                    end
+                                end
                             end
                             default: begin
-                                // Skip HEARTBEAT (0x07), ACKNACK (0x06), DATA_FRAG (0x16), or Vendor (0x80+)
                                 stat_skipped_submsg <= stat_skipped_submsg + 32'd1;
                                 if (submsg_octets == 16'd0) begin
                                     rx_state <= R_IDLE;
@@ -1734,21 +2084,19 @@ module rtps_fastpath_ip #(
                 end
 
                 R_INFO_TS_WAIT: begin
-                    walker_rd_addr <= walk_cur_word + 12'd2; // Prime Word +2 (frac)
+                    walker_rd_addr <= walk_cur_word + 12'd2;
                     rx_state       <= R_INFO_TS_0;
                 end
 
                 R_INFO_TS_0: begin
-                    // walker_dout holds Word +1 (seconds)
                     walk_ts[63:32] <= walk_submsg_flags[0] ?
                                       {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
                                       walker_dout;
-                    walker_rd_addr <= walk_next_submsg_word; // Prime next Submessage Header
+                    walker_rd_addr <= walk_next_submsg_word;
                     rx_state       <= R_INFO_TS_1;
                 end
 
                 R_INFO_TS_1: begin
-                    // walker_dout holds Word +2 (fraction)
                     walk_ts[31:0]  <= walk_submsg_flags[0] ?
                                       {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
                                       walker_dout;
@@ -1756,21 +2104,20 @@ module rtps_fastpath_ip #(
                     rx_state       <= R_SUBMSG_HDR;
                 end
 
-                // INFO_DST Participant Filtering (Section 4)
                 R_INFO_DST_WAIT: begin
-                    walker_rd_addr <= walk_cur_word + 12'd2; // Prime Word +2
+                    walker_rd_addr <= walk_cur_word + 12'd2;
                     rx_state       <= R_INFO_DST_0;
                 end
 
                 R_INFO_DST_0: begin
                     walk_dst_guid_prefix[95:64] <= walker_dout;
-                    walker_rd_addr              <= walk_cur_word + 12'd3; // Prime Word +3
+                    walker_rd_addr              <= walk_cur_word + 12'd3;
                     rx_state                    <= R_INFO_DST_1;
                 end
 
                 R_INFO_DST_1: begin
                     walk_dst_guid_prefix[63:32] <= walker_dout;
-                    walker_rd_addr              <= walk_next_submsg_word; // Prime next submessage header
+                    walker_rd_addr              <= walk_next_submsg_word;
                     rx_state                    <= R_INFO_DST_2;
                 end
 
@@ -1782,15 +2129,12 @@ module rtps_fastpath_ip #(
                 end
 
                 R_DATA_HDR_1: begin
-                    // 1-cycle BRAM wait for Word +2 (readerEntityId); prime Word +3 (writerEntityId)
                     walker_rd_addr <= walk_cur_word + 12'd3;
                     rx_state       <= R_DATA_READER_ID;
                 end
 
-                // Validate DATA.readerId (Section 5)
                 R_DATA_READER_ID: begin
-                    // walker_dout holds Word +2: readerEntityId
-                    // readerId must be ENTITYID_UNKNOWN (0), or match local configured reader in CAM slot
+                    walk_reader_id <= walker_dout;
                     if ((walker_dout != 32'h0000_0000) &&
                         (active_rd_edt[walk_cam_idx][5] != 32'h0000_0000) &&
                         (walker_dout != active_rd_edt[walk_cam_idx][5])) begin
@@ -1798,52 +2142,362 @@ module rtps_fastpath_ip #(
                         walker_rd_addr <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT;
                     end else begin
-                        walker_rd_addr <= walk_cur_word + 12'd4; // Prime Word +4: seqNum Hi
+                        walker_rd_addr <= walk_cur_word + 12'd4;
                         rx_state       <= R_DATA_HDR_2;
                     end
                 end
 
                 R_DATA_HDR_2: begin
-                    // walker_dout holds Word +3: writerEntityId
                     walk_writer_id <= walker_dout;
                     if (!info_dst_matches_local || (walker_dout != active_rd_edt[walk_cam_idx][4])) begin
                         walk_cur_word  <= walk_next_submsg_word;
                         walker_rd_addr <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT;
                     end else begin
-                        walker_rd_addr <= walk_cur_word + 12'd5; // Prime Word +5: seqNum Lo
+                        walker_rd_addr <= walk_cur_word + 12'd5;
                         rx_state       <= R_DATA_SEQ_HI;
                     end
                 end
 
                 R_DATA_SEQ_HI: begin
-                    // walker_dout holds Word +4: seqNum Hi
                     walk_seq_num[63:32] <= walk_submsg_flags[0] ?
                                            {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
                                            walker_dout;
-                    walker_rd_addr      <= walk_cur_word + 12'd5; // Prime Word +5: seqNum Lo
+                    walker_rd_addr      <= walk_cur_word + 12'd5;
                     rx_state            <= R_DATA_SEQ_LO;
                 end
 
                 R_DATA_SEQ_LO: begin
-                    // walker_dout holds Word +5: seqNum Lo
                     walk_seq_num[31:0] <= walk_submsg_flags[0] ?
                                           {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
                                           walker_dout;
-                    walker_rd_addr     <= walk_cur_word + 12'd6; // Prime Word +6 (first QoS PID or Encapsulation)
-                    if (walk_submsg_flags[1]) begin // Q-flag == 1: Inline QoS parameter list present
-                        walk_cur_word  <= walk_cur_word + 12'd6;
-                        rx_state       <= R_SKIP_QOS; // walker_dout already holds Word +6 on next cycle!
+                    walker_rd_addr     <= walk_cur_word + 12'd6;
+                    if (walk_submsg_flags[1]) begin
+                        walk_cur_word <= walk_cur_word + 12'd6;
+                        rx_state      <= R_SKIP_QOS_WAIT;
                     end else begin
-                        // Q-flag == 0: Pipeline into R_COMMIT_SAMPLE to break BRAM-to-CE critical path
+                        pending_payload_word_off <= walk_cur_word + 12'd7;
+                        if (walk_from_pkt_ram) begin
+                            rx_state <= R_COPY_DATA_PRIME;
+                        end else begin
+                            rx_state <= R_COMMIT_SAMPLE;
+                        end
+                    end
+                end
+
+                // Copy unfragmented DATA packet from rx_pkt_ram into reasm_ram[fill_slot]
+                R_COPY_DATA_PRIME: begin
+                    if (walk_seq_num <= last_rx_seq_num_by_cam[walk_cam_idx]) begin
+                        stat_stale_drops <= stat_stale_drops + 32'd1;
+                        rx_state         <= R_IDLE;
+                    end else begin
+                        df_active_valid <= 1'b0;
+                        df_frag_bitmap  <= 32'd0;
+                        copy_word_idx   <= 12'd0;
+                        walker_rd_addr  <= 12'd0;
+                        rx_state        <= R_COPY_DATA_LOOP;
+                    end
+                end
+
+                R_COPY_DATA_LOOP: begin
+                    if (walker_rd_addr == 12'd0 && copy_word_idx == 12'd0) begin
+                        walker_rd_addr <= 12'd1;
+                    end else if (copy_word_idx < walk_dgram_words) begin
+                        reasm_wr_en    <= 1'b1;
+                        reasm_wr_be    <= 4'b1111;
+                        reasm_wr_addr  <= copy_word_idx;
+                        reasm_wr_data  <= rx_pkt_dout;
+                        copy_word_idx  <= copy_word_idx + 12'd1;
+                        walker_rd_addr <= walker_rd_addr + 12'd1;
+                    end else begin
                         rx_state <= R_COMMIT_SAMPLE;
                     end
                 end
 
-                // Registered commit state: all inputs come from registers (Section 3)
+                // DATA_FRAG (0x16) Submessage Parser
+                R_DF_HDR_1: begin
+                    walker_rd_addr <= walk_cur_word + 12'd3;
+                    rx_state       <= R_DF_READER_ID;
+                end
+
+                R_DF_READER_ID: begin
+                    walk_reader_id <= walker_dout;
+                    if ((walker_dout != 32'h0000_0000) &&
+                        (active_rd_edt[walk_cam_idx][5] != 32'h0000_0000) &&
+                        (walker_dout != active_rd_edt[walk_cam_idx][5])) begin
+                        walk_cur_word  <= walk_next_submsg_word;
+                        walker_rd_addr <= walk_next_submsg_word;
+                        rx_state       <= R_SUBMSG_HDR_WAIT;
+                    end else begin
+                        walker_rd_addr <= walk_cur_word + 12'd4;
+                        rx_state       <= R_DF_WRITER_ID;
+                    end
+                end
+
+                R_DF_WRITER_ID: begin
+                    walk_writer_id <= walker_dout;
+                    if (!info_dst_matches_local || (walker_dout != active_rd_edt[walk_cam_idx][4])) begin
+                        walk_cur_word  <= walk_next_submsg_word;
+                        walker_rd_addr <= walk_next_submsg_word;
+                        rx_state       <= R_SUBMSG_HDR_WAIT;
+                    end else begin
+                        walker_rd_addr <= walk_cur_word + 12'd5;
+                        rx_state       <= R_DF_SEQ_HI;
+                    end
+                end
+
+                R_DF_SEQ_HI: begin
+                    walk_seq_num[63:32] <= walk_submsg_flags[0] ?
+                                           {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
+                                           walker_dout;
+                    walker_rd_addr      <= walk_cur_word + 12'd6;
+                    rx_state            <= R_DF_SEQ_LO;
+                end
+
+                R_DF_SEQ_LO: begin
+                    walk_seq_num[31:0] <= walk_submsg_flags[0] ?
+                                          {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
+                                          walker_dout;
+                    walker_rd_addr     <= walk_cur_word + 12'd7;
+                    rx_state           <= R_DF_FRAG_START;
+                end
+
+                R_DF_FRAG_START: begin
+                    df_frag_start  <= walk_submsg_flags[0] ?
+                                      {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
+                                      walker_dout;
+                    walker_rd_addr <= walk_cur_word + 12'd8;
+                    rx_state       <= R_DF_FRAG_INFO;
+                end
+
+                R_DF_FRAG_INFO: begin
+                    df_frags_in_submsg <= walk_submsg_flags[0] ?
+                                          {walker_dout[23:16], walker_dout[31:24]} : walker_dout[31:16];
+                    df_frag_size       <= walk_submsg_flags[0] ?
+                                          {walker_dout[7:0], walker_dout[15:8]} : walker_dout[15:0];
+                    walker_rd_addr     <= walk_cur_word + 12'd9;
+                    rx_state           <= R_DF_SAMPLE_SIZE;
+                end
+
+                R_DF_SAMPLE_SIZE: begin
+                    df_sample_size <= walk_submsg_flags[0] ?
+                                      {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
+                                      walker_dout;
+                    if (walk_submsg_flags[1]) begin
+                        walk_cur_word <= walk_cur_word + 12'd9;
+                        rx_state      <= R_SKIP_QOS;
+                    end else begin
+                        df_pay_start_word <= walk_cur_word + 12'd9;
+                        rx_state          <= R_DF_VALIDATE;
+                    end
+                end
+
+                R_DF_VALIDATE: begin
+                    if (walk_seq_num <= last_rx_seq_num_by_cam[walk_cam_idx]) begin
+                        stat_stale_drops <= stat_stale_drops + 32'd1;
+                        rx_state         <= R_IDLE;
+                    end else if ((df_frag_start < 32'd1) || (df_frag_start > 32'd32) ||
+                                 (df_frags_in_submsg < 16'd1) ||
+                                 ((df_frag_start + {16'd0, df_frags_in_submsg}) > 32'd33) ||
+                                 (df_frag_size == 16'd0) ||
+                                 (df_sample_size == 32'd0) ||
+                                 (df_sample_size > ((REASM_DEPTH - 16) * 4))) begin
+                        rx_state <= R_IDLE;
+                    end else if (df_active_valid && (df_active_cam_idx == walk_cam_idx) && (walk_seq_num < df_active_seq)) begin
+                        stat_stale_drops <= stat_stale_drops + 32'd1;
+                        rx_state         <= R_IDLE;
+                    end else if (df_active_valid && (df_active_cam_idx == walk_cam_idx) && (walk_seq_num == df_active_seq)) begin
+                        if ((df_active_sample_size != df_sample_size[15:0]) || (df_active_frag_size != df_frag_size)) begin
+                            df_active_valid <= 1'b0;
+                            df_frag_bitmap  <= 32'd0;
+                            rx_state        <= R_IDLE;
+                        end else begin
+                            df_calc_phase <= 2'd1;
+                            df_calc_cnt   <= 6'd0;
+                            df_calc_acc   <= 16'd0;
+                            rx_state      <= R_DF_CALC;
+                        end
+                    end else begin
+                        // New writerSN (or newer sample preempting incomplete older one)
+                        rx_active_valid       <= 1'b0;
+                        df_active_valid       <= 1'b1;
+                        df_active_cam_idx     <= walk_cam_idx;
+                        df_active_seq         <= walk_seq_num;
+                        df_active_sample_size <= df_sample_size[15:0];
+                        df_active_frag_size   <= df_frag_size;
+                        df_frag_bitmap        <= 32'd0;
+                        df_calc_phase         <= 2'd0;
+                        df_calc_rem           <= df_sample_size[15:0];
+                        df_calc_cnt           <= 6'd0;
+                        df_calc_acc           <= 16'd0;
+                        rx_state              <= R_DF_CALC;
+                    end
+                end
+
+                R_DF_CALC: begin
+                    case (df_calc_phase)
+                        2'd0: begin
+                            // Compute df_active_total_frags = ceil(sampleSize / fragSize)
+                            if (df_calc_rem > df_frag_size && df_calc_cnt < 6'd32) begin
+                                df_calc_rem <= df_calc_rem - df_frag_size;
+                                df_calc_cnt <= df_calc_cnt + 6'd1;
+                            end else if (df_calc_cnt >= 6'd32) begin
+                                df_active_valid <= 1'b0;
+                                rx_state        <= R_IDLE;
+                            end else begin
+                                df_active_total_frags <= df_calc_cnt + 6'd1;
+                                df_calc_cnt           <= 6'd0;
+                                df_calc_acc           <= 16'd0;
+                                df_calc_phase         <= 2'd1;
+                            end
+                        end
+                        2'd1: begin
+                            // Compute df_byte_off = (fragStart - 1) * fragSize
+                            if (df_calc_cnt < (df_frag_start[5:0] - 6'd1)) begin
+                                df_calc_acc <= df_calc_acc + df_frag_size;
+                                df_calc_cnt <= df_calc_cnt + 6'd1;
+                            end else begin
+                                df_byte_off   <= df_calc_acc;
+                                df_calc_cnt   <= 6'd0;
+                                df_calc_acc   <= 16'd0;
+                                df_calc_phase <= 2'd2;
+                            end
+                        end
+                        2'd2: begin
+                            // Compute df_submsg_bytes = fragsInSubmsg * fragSize
+                            if (df_calc_cnt < df_frags_in_submsg[5:0]) begin
+                                df_calc_acc <= df_calc_acc + df_frag_size;
+                                df_calc_cnt <= df_calc_cnt + 6'd1;
+                            end else begin
+                                df_submsg_bytes <= df_calc_acc;
+                                df_calc_phase   <= 2'd3;
+                            end
+                        end
+                        default: begin
+                            // Bound chunk size to remaining sampleSize and UDP packet length
+                            if (df_byte_off >= df_sample_size[15:0]) begin
+                                rx_state <= R_IDLE;
+                            end else begin
+                                df_chunk_bytes   <= (df_submsg_bytes <= (df_sample_size[15:0] - df_byte_off)) ?
+                                                    df_submsg_bytes : (df_sample_size[15:0] - df_byte_off);
+                                df_dst_byte_addr <= 16'd64 + df_byte_off; // Word 16 = CDR_LE, Word 17 = FastSample
+                                df_shift         <= df_byte_off[1:0];
+                                df_src_word_ptr  <= df_pay_start_word;
+                                df_prev_word     <= 32'd0;
+                                df_first_beat    <= 1'b1;
+                                walker_rd_addr   <= df_pay_start_word;
+                                rx_state         <= R_DF_COPY_PRIME;
+                            end
+                        end
+                    endcase
+                end
+
+                R_DF_COPY_PRIME: begin
+                    // Check packet isn't truncated past UDP length
+                    if (({df_pay_start_word, 2'b00} + df_chunk_bytes) > walk_udp_len_bytes || df_chunk_bytes == 16'd0) begin
+                        rx_state <= R_IDLE;
+                    end else begin
+                        df_rem_bytes   <= df_chunk_bytes;
+                        walker_rd_addr <= df_src_word_ptr + 12'd1;
+                        rx_state       <= R_DF_COPY_LOOP;
+                    end
+                end
+
+                R_DF_COPY_LOOP: begin : df_copy_blk
+                    reg [1:0]  s_byte;
+                    reg [2:0]  avail_bytes;
+                    reg [2:0]  cnt_bytes;
+                    reg [3:0]  lane_be;
+                    reg [31:0] shifted_word;
+                    reg [31:0] frag_mask_add;
+                    reg [31:0] frag_mask_all;
+                    integer    bi;
+
+                    s_byte      = df_first_beat ? df_shift : 2'd0;
+                    avail_bytes = 3'd4 - {1'b0, s_byte};
+                    cnt_bytes   = (df_rem_bytes < {13'd0, avail_bytes}) ? df_rem_bytes[2:0] : avail_bytes;
+
+                    for (bi = 0; bi < 4; bi = bi + 1) begin
+                        lane_be[3 - bi] = (bi >= s_byte) && (bi < (s_byte + cnt_bytes));
+                    end
+
+                    case (df_shift)
+                        2'd0:    shifted_word = rx_pkt_dout;
+                        2'd1:    shifted_word = {df_prev_word[7:0],  rx_pkt_dout[31:8]};
+                        2'd2:    shifted_word = {df_prev_word[15:0], rx_pkt_dout[31:16]};
+                        default: shifted_word = {df_prev_word[23:0], rx_pkt_dout[31:24]};
+                    endcase
+
+                    reasm_wr_en      <= 1'b1;
+                    reasm_wr_be      <= lane_be;
+                    reasm_wr_addr    <= df_dst_byte_addr[13:2];
+                    reasm_wr_data    <= shifted_word;
+                    df_prev_word     <= rx_pkt_dout;
+                    df_first_beat    <= 1'b0;
+                    df_dst_byte_addr <= df_dst_byte_addr + 16'd4;
+                    df_rem_bytes     <= df_rem_bytes - {13'd0, cnt_bytes};
+                    walker_rd_addr   <= walker_rd_addr + 12'd1;
+
+                    if (df_rem_bytes <= {13'd0, cnt_bytes}) begin
+                        // Update received-fragment bitmask
+                        frag_mask_add = (((df_frags_in_submsg >= 16'd32) ? 32'hFFFF_FFFF : ((32'd1 << df_frags_in_submsg[4:0]) - 32'd1))
+                                         << (df_frag_start[4:0] - 5'd1));
+                        frag_mask_all = (df_active_total_frags >= 6'd32) ? 32'hFFFF_FFFF : ((32'd1 << df_active_total_frags[4:0]) - 32'd1);
+
+                        df_frag_bitmap <= df_frag_bitmap | frag_mask_add;
+                        if (((df_frag_bitmap | frag_mask_add) & frag_mask_all) == frag_mask_all) begin
+                            df_synth_idx <= 4'd0;
+                            rx_state     <= R_DF_SYNTH_HDR;
+                        end else if (walk_next_submsg_word < walk_dgram_words) begin
+                            walk_cur_word  <= walk_next_submsg_word;
+                            walker_rd_addr <= walk_next_submsg_word;
+                            rx_state       <= R_SUBMSG_HDR_WAIT;
+                        end else begin
+                            rx_state <= R_IDLE;
+                        end
+                    end
+                end
+
+                // Synthesize Words 2..15 (RTPS + INFO_TS + DATA 0x15) for Option B compatibility
+                R_DF_SYNTH_HDR: begin : df_synth_blk
+                    reg [15:0] synth_oct_le;
+                    reg [15:0] synth_oct_wire;
+                    synth_oct_le   = df_active_sample_size + 16'd20;
+                    synth_oct_wire = {synth_oct_le[7:0], synth_oct_le[15:8]};
+
+                    reasm_wr_en   <= 1'b1;
+                    reasm_wr_be   <= 4'b1111;
+                    reasm_wr_addr <= 12'd2 + {8'd0, df_synth_idx};
+                    case (df_synth_idx)
+                        4'd0:    reasm_wr_data <= 32'h5254_5053;
+                        4'd1:    reasm_wr_data <= walk_rtps_ver_vendor;
+                        4'd2:    reasm_wr_data <= walk_guid_prefix[95:64];
+                        4'd3:    reasm_wr_data <= walk_guid_prefix[63:32];
+                        4'd4:    reasm_wr_data <= walk_guid_prefix[31:0];
+                        4'd5:    reasm_wr_data <= 32'h0901_0800;
+                        4'd6:    reasm_wr_data <= {walk_ts[39:32], walk_ts[47:40], walk_ts[55:48], walk_ts[63:56]};
+                        4'd7:    reasm_wr_data <= {walk_ts[7:0],   walk_ts[15:8],  walk_ts[23:16], walk_ts[31:24]};
+                        4'd8:    reasm_wr_data <= {8'h15, 8'h05, synth_oct_wire};
+                        4'd9:    reasm_wr_data <= 32'h0000_1000;
+                        4'd10:   reasm_wr_data <= walk_reader_id;
+                        4'd11:   reasm_wr_data <= walk_writer_id;
+                        4'd12:   reasm_wr_data <= {walk_seq_num[39:32], walk_seq_num[47:40], walk_seq_num[55:48], walk_seq_num[63:56]};
+                        default: reasm_wr_data <= {walk_seq_num[7:0],   walk_seq_num[15:8],  walk_seq_num[23:16], walk_seq_num[31:24]};
+                    endcase
+
+                    if (df_synth_idx == 4'd13) begin
+                        pending_payload_word_off <= 12'd17;
+                        walk_dgram_words         <= 12'd16 + ((df_active_sample_size + 16'd3) >> 2);
+                        df_active_valid          <= 1'b0;
+                        df_frag_bitmap           <= 32'd0;
+                        rx_state                 <= R_COMMIT_SAMPLE;
+                    end else begin
+                        df_synth_idx <= df_synth_idx + 4'd1;
+                    end
+                end
+
+                // Unified Registered Commit State for all RX paths
                 R_COMMIT_SAMPLE: begin
-                    // Word +6 is Encapsulation, Word +7 is Payload start
-                    // Check Latest-Value invariant per CAM entry: new seqNum > last_rx_seq_num_by_cam[walk_cam_idx]
                     if (walk_seq_num > last_rx_seq_num_by_cam[walk_cam_idx]) begin
                         if (last_rx_seq_num_by_cam[walk_cam_idx] != 64'd0 &&
                             (walk_seq_num > (last_rx_seq_num_by_cam[walk_cam_idx] + 64'd1))) begin
@@ -1857,14 +2511,14 @@ module rtps_fastpath_ip #(
                         last_rx_ts_by_cam[walk_cam_idx]      <= walk_ts;
                         last_rx_seq_num                      <= walk_seq_num;
                         last_rx_ts                           <= walk_ts;
-                        last_rx_src_ip                       <= rx_src_ip;
-                        last_rx_src_port                     <= rx_udp_src_port;
-                        last_rx_dst_port                     <= rx_udp_dst_port;
+                        last_rx_src_ip                       <= walk_src_ip;
+                        last_rx_src_port                     <= walk_udp_src_port;
+                        last_rx_dst_port                     <= walk_udp_dst_port;
                         last_rx_cam_idx                      <= walk_cam_idx;
-                        last_rx_src_mac                      <= rx_active_src_mac;
+                        last_rx_src_mac                      <= walk_src_mac;
                         stat_rx_samples                      <= stat_rx_samples + 32'd1;
                         rd_match_count[walk_cam_idx]         <= rd_match_count[walk_cam_idx] + 32'd1;
-                        latest_payload_word_off              <= walk_cur_word + 12'd7; // Skip 4B encapsulation word (+6)
+                        latest_payload_word_off              <= pending_payload_word_off;
                         latest_rtps_words                    <= walk_dgram_words - 12'd2;
                         latest_slot                          <= fill_slot;
                         latest_valid                         <= 1'b1;
@@ -1879,40 +2533,20 @@ module rtps_fastpath_ip #(
                     rx_state <= R_SKIP_QOS;
                 end
 
-                // Walk Inline QoS parameter list until PID_SENTINEL (0x0001) (Section 3)
+                // Walk Inline QoS parameter list until PID_SENTINEL (0x0001)
                 R_SKIP_QOS: begin
-                    // Parameter header: {parameterId[15:0], length[15:0]} (LE if E=1)
                     if ((walk_submsg_flags[0] ? {walker_dout[23:16], walker_dout[31:24]} : walker_dout[31:16]) == 16'h0001) begin
-                        // Reached PID_SENTINEL -> next word is Encapsulation, +2 is Payload
-                        if (walk_seq_num > last_rx_seq_num_by_cam[walk_cam_idx]) begin
-                            if (last_rx_seq_num_by_cam[walk_cam_idx] != 64'd0 &&
-                                (walk_seq_num > (last_rx_seq_num_by_cam[walk_cam_idx] + 64'd1))) begin
-                                stat_seq_gaps <= stat_seq_gaps +
-                                    (walk_seq_num[31:0] -
-                                     last_rx_seq_num_by_cam[walk_cam_idx][31:0] -
-                                     32'd1);
-                            end
-
-                            last_rx_seq_num_by_cam[walk_cam_idx] <= walk_seq_num;
-                            last_rx_ts_by_cam[walk_cam_idx]      <= walk_ts;
-                            last_rx_seq_num                      <= walk_seq_num;
-                            last_rx_ts                           <= walk_ts;
-                            last_rx_src_ip                       <= rx_src_ip;
-                            last_rx_src_port                     <= rx_udp_src_port;
-                            last_rx_dst_port                     <= rx_udp_dst_port;
-                            last_rx_cam_idx                      <= walk_cam_idx;
-                            last_rx_src_mac                      <= rx_active_src_mac;
-                            stat_rx_samples                      <= stat_rx_samples + 32'd1;
-                            rd_match_count[walk_cam_idx]         <= rd_match_count[walk_cam_idx] + 32'd1;
-                            latest_payload_word_off              <= walk_cur_word + 12'd2;
-                            latest_rtps_words                    <= walk_dgram_words - 12'd2;
-                            latest_slot                          <= fill_slot;
-                            latest_valid                         <= 1'b1;
-                            fill_slot                            <= pick_free_slot(fill_slot, egress_slot);
+                        if (df_in_qos) begin
+                            df_pay_start_word <= walk_cur_word + 12'd1;
+                            rx_state          <= R_DF_VALIDATE;
                         end else begin
-                            stat_stale_drops <= stat_stale_drops + 32'd1;
+                            pending_payload_word_off <= walk_cur_word + 12'd2;
+                            if (walk_from_pkt_ram) begin
+                                rx_state <= R_COPY_DATA_PRIME;
+                            end else begin
+                                rx_state <= R_COMMIT_SAMPLE;
+                            end
                         end
-                        rx_state <= R_IDLE;
                     end else begin
                         walk_cur_word  <= walk_cur_word + 12'd1 +
                                           (walk_submsg_flags[0] ? {walker_dout[3:0], walker_dout[15:10]} : walker_dout[13:2]);
@@ -1980,18 +2614,19 @@ module rtps_fastpath_ip #(
                         ip_done_irq    <= 1'b1;
                         state          <= S_DONE_IRQ;
                     end else if ((crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
-                        err_crc            <= 1'b0;
-                        err_no_match       <= 1'b0;
-                        err_rx_timeout     <= 1'b0;
-                        err_csum           <= 1'b0;
-                        completed_frags      <= 4'd0;
-                        tx_frag_idx          <= 2'd0;
-                        tx_bytes_remaining   <= tx_udp_total_bytes;
+                        err_crc              <= 1'b0;
+                        err_no_match         <= 1'b0;
+                        err_rx_timeout       <= 1'b0;
+                        err_csum             <= 1'b0;
+                        completed_frags      <= 16'd0;
+                        tx_frag_idx          <= 16'd0;
+                        tx_bytes_remaining   <= tx_ip_frag_mode ? tx_udp_total_bytes : tx_sample_total_bytes;
                         tx_frag_offset_bytes <= 16'd0;
+                        tx_init_phase        <= 2'd0;
                         tx_ip_id_counter     <= tx_ip_id_counter + 16'd1;
                         writer_seq_num[0]    <= writer_seq_num[0] + 64'd1;
                         if (!mode_pub_only) begin
-                            latest_valid     <= 1'b0; // Only clear in synchronous mode waiting for dedicated feedback
+                            latest_valid     <= 1'b0;
                         end
                         state                <= S_TX_FRAG_INIT;
                     end else begin
@@ -2003,40 +2638,105 @@ module rtps_fastpath_ip #(
                 end
 
                 // -------------------------------------------------------------
-                // 3. S_TX_FRAG_INIT: Generic Fragmentation Planner (Section 7)
+                // 3. S_TX_FRAG_INIT: Option C Fragmentation Planner (DATA_FRAG / IP-Frag)
                 // -------------------------------------------------------------
                 S_TX_FRAG_INIT: begin
                     cycle_tick_cnt <= cycle_tick_cnt + 32'd1;
 
-                    // Hold the previous fragment's tlast beat until the stream accepts it
-                    if (!(eng_tx_tvalid && !eng_tx_tready)) begin
-                        if (tx_bytes_remaining > IPV4_NONFINAL_PAYLOAD) begin
-                            tx_frag_payload_bytes <= IPV4_NONFINAL_PAYLOAD;
-                            tx_frag_more          <= 1'b1;
-                            tx_frag_words         <= (IPV4_NONFINAL_PAYLOAD >> 2); // 368 words (1472B)
-                            tx_frag_ip_len        <= IPV4_HDR_BYTES + IPV4_NONFINAL_PAYLOAD; // 1492 bytes
-                            tx_frag_flags         <= {2'b00, 1'b1, tx_frag_offset_bytes[15:3]}; // MF=1
-                        end else begin
-                            tx_frag_payload_bytes <= tx_bytes_remaining;
-                            tx_frag_more          <= 1'b0;
-                            tx_frag_words         <= (tx_bytes_remaining + 16'd3) >> 2;
-                            tx_frag_ip_len        <= IPV4_HDR_BYTES + tx_bytes_remaining;
-                            tx_frag_flags         <= {2'b00, 1'b0, tx_frag_offset_bytes[15:3]}; // MF=0
-                        end
-
-                        tx_dgram_word_idx <= tx_frag_offset_bytes >> 2;
-
-                        if ((tx_frag_offset_bytes >> 2) >= 12'd17) begin
-                            tx_sample_rd_addr <= (tx_frag_offset_bytes >> 2) - 12'd17;
-                        end else begin
-                            tx_sample_rd_addr <= 11'd0;
-                        end
-
-                        tx_beat_idx   <= 12'd0;
+                    if (eng_tx_tvalid && eng_tx_tready) begin
                         eng_tx_tvalid <= 1'b0;
                         eng_tx_tlast  <= 1'b0;
-                        pacing_timer  <= cfg_pacing_timer[15:0];
-                        state         <= S_TX_FRAG_SEND;
+                    end
+
+                    if (!(eng_tx_tvalid && !eng_tx_tready)) begin
+                        case (tx_init_phase)
+                            2'd0: begin
+                                if (tx_ip_frag_mode) begin
+                                    if (tx_bytes_remaining > IPV4_NONFINAL_PAYLOAD) begin
+                                        tx_frag_payload_bytes <= IPV4_NONFINAL_PAYLOAD;
+                                        tx_frag_more          <= 1'b1;
+                                        tx_frag_words         <= (IPV4_NONFINAL_PAYLOAD >> 2);
+                                        tx_frag_ip_len        <= IPV4_HDR_BYTES + IPV4_NONFINAL_PAYLOAD;
+                                        tx_frag_flags         <= {2'b00, 1'b1, tx_frag_offset_bytes[15:3]};
+                                    end else begin
+                                        tx_frag_payload_bytes <= tx_bytes_remaining;
+                                        tx_frag_more          <= 1'b0;
+                                        tx_frag_words         <= (tx_bytes_remaining + 16'd3) >> 2;
+                                        tx_frag_ip_len        <= IPV4_HDR_BYTES + tx_bytes_remaining;
+                                        tx_frag_flags         <= {2'b00, 1'b0, tx_frag_offset_bytes[15:3]};
+                                    end
+                                    tx_dgram_word_idx <= tx_frag_offset_bytes >> 2;
+                                    if ((tx_frag_offset_bytes >> 2) >= 12'd17)
+                                        tx_sample_rd_addr <= (tx_frag_offset_bytes >> 2) - 12'd17;
+                                    else
+                                        tx_sample_rd_addr <= 11'd0;
+                                    tx_beat_idx   <= 12'd0;
+                                    eng_tx_tvalid <= 1'b0;
+                                    eng_tx_tlast  <= 1'b0;
+                                    pacing_timer  <= cfg_pacing_timer[15:0];
+                                    state         <= S_TX_FRAG_SEND;
+                                end else if (tx_use_single_data) begin
+                                    tx_frag_payload_bytes <= tx_udp_total_bytes;
+                                    tx_frag_more          <= 1'b0;
+                                    tx_frag_words         <= tx_total_dgram_words[11:0];
+                                    tx_frag_ip_len        <= IPV4_HDR_BYTES + tx_udp_total_bytes;
+                                    tx_frag_flags         <= 16'd0;
+                                    tx_frag_ser_bytes     <= tx_sample_total_bytes[11:0];
+                                    tx_frag_bram_base     <= 12'd0;
+                                    tx_frag_bram_words    <= pkt_len[11:0];
+                                    tx_scan_csum          <= 16'd0;
+                                    tx_scan_cnt           <= 12'd0;
+                                    tx_sample_rd_addr     <= {ADDR_WIDTH{1'b0}};
+                                    tx_init_phase         <= 2'd1;
+                                end else begin : df_init_blk
+                                    reg [11:0] ser_bytes;
+                                    ser_bytes = (tx_bytes_remaining > tx_eff_frag_bytes) ?
+                                                tx_eff_frag_bytes[11:0] : tx_bytes_remaining[11:0];
+                                    tx_frag_ser_bytes     <= ser_bytes;
+                                    tx_frag_more          <= (tx_bytes_remaining > tx_eff_frag_bytes);
+                                    tx_frag_payload_bytes <= 16'd76 + {4'd0, ser_bytes};
+                                    tx_frag_words         <= 12'd19 + {2'b00, ser_bytes[11:2]};
+                                    tx_frag_ip_len        <= 16'd96 + {4'd0, ser_bytes};
+                                    tx_frag_flags         <= 16'd0;
+                                    tx_frag_bram_base     <= (tx_frag_idx == 16'd0) ? 12'd0 : (tx_frag_offset_bytes[13:2] - 12'd1);
+                                    tx_frag_bram_words    <= (tx_frag_idx == 16'd0) ? (ser_bytes[11:2] - 12'd1) : ser_bytes[11:2];
+                                    tx_scan_csum          <= (tx_frag_idx == 16'd0) ? 16'h0001 : 16'h0000;
+                                    tx_scan_cnt           <= 12'd0;
+                                    tx_sample_rd_addr     <= (tx_frag_idx == 16'd0) ? {ADDR_WIDTH{1'b0}} :
+                                                             (tx_frag_offset_bytes[ADDR_WIDTH+1:2] - 11'd1);
+                                    tx_init_phase         <= 2'd1;
+                                end
+                            end
+                            2'd1: begin
+                                if (tx_frag_bram_words == 12'd0) begin
+                                    tx_frag_csum_seed <= tx_scan_csum;
+                                    tx_init_phase     <= 2'd3;
+                                end else begin
+                                    tx_sample_rd_addr <= tx_sample_rd_addr + 11'd1;
+                                    tx_init_phase     <= 2'd2;
+                                end
+                            end
+                            2'd2: begin
+                                tx_scan_csum <= csum_add32(tx_scan_csum, bswap32(tx_sample_dout));
+                                if (tx_scan_cnt == (tx_frag_bram_words - 12'd1)) begin
+                                    tx_init_phase <= 2'd3;
+                                end else begin
+                                    tx_scan_cnt       <= tx_scan_cnt + 12'd1;
+                                    tx_sample_rd_addr <= tx_sample_rd_addr + 11'd1;
+                                end
+                            end
+                            default: begin
+                                tx_frag_csum_seed <= tx_scan_csum;
+                                tx_sample_rd_addr <= tx_frag_bram_base[ADDR_WIDTH-1:0];
+                                tx_dgram_word_idx <= 12'd0;
+                                tx_beat_idx       <= 12'd0;
+                                eng_tx_tvalid     <= 1'b0;
+                                eng_tx_tlast      <= 1'b0;
+                                pacing_timer      <= cfg_pacing_timer[15:0];
+                                tx_init_phase     <= 2'd0;
+                                state             <= S_TX_FRAG_SEND;
+                            end
+                        endcase
                     end
                 end
 
@@ -2055,7 +2755,7 @@ module rtps_fastpath_ip #(
                         if (tx_beat_idx == 12'd3) begin
                             tx_frag_hdr_csum <= calc_tx_ip_hdr_csum;
                         end
-                        if (tx_frag_idx == 2'd0 && tx_beat_idx == 12'd4) begin
+                        if ((tx_frag_idx == 16'd0 || !tx_ip_frag_mode) && tx_beat_idx == 12'd4) begin
                             tx_udp_csum <= calc_tx_udp_csum;
                         end
 
@@ -2067,44 +2767,53 @@ module rtps_fastpath_ip #(
                                 eng_tx_tlast  <= (tx_beat_idx == (12'd8 + tx_frag_words));
 
                                 if (tx_beat_idx == (12'd8 + tx_frag_words)) begin
-                                    completed_frags <= completed_frags + 4'd1;
+                                    completed_frags <= completed_frags + 16'd1;
                                     if (!tx_frag_more) begin
                                         stat_tx_samples <= stat_tx_samples + 32'd1;
                                         if (mode_pub_only) begin
-                                            // Publish-only mode: all fragments sent, no RX feedback expected!
                                             last_cycle_ticks <= cycle_tick_cnt + 32'd1;
                                             if (latest_valid) begin
-                                                // Asynchronous concurrent ingress arrived during TX: immediately service RX
-                                                egress_slot      <= latest_slot;
-                                                latest_valid     <= 1'b0;
-                                                irq_is_rx        <= 1'b1;
+                                                egress_slot  <= latest_slot;
+                                                latest_valid <= 1'b0;
+                                                irq_is_rx    <= 1'b1;
                                             end else begin
-                                                irq_is_rx        <= 1'b0;
+                                                irq_is_rx    <= 1'b0;
                                             end
-                                            ip_done_irq      <= 1'b1;
-                                            state            <= S_DONE_IRQ;
+                                            ip_done_irq <= 1'b1;
+                                            state       <= S_DONE_IRQ;
                                         end else begin
-                                            rx_wait_cnt      <= 32'd0;
-                                            state            <= S_WAIT_RX_FB;
+                                            rx_wait_cnt <= 32'd0;
+                                            state       <= S_WAIT_RX_FB;
                                         end
                                     end else begin
-                                        tx_bytes_remaining   <= tx_bytes_remaining - tx_frag_payload_bytes;
-                                        tx_frag_offset_bytes <= tx_frag_offset_bytes + tx_frag_payload_bytes;
-                                        tx_frag_idx          <= tx_frag_idx + 2'd1;
-                                        state                <= S_TX_FRAG_INIT;
+                                        if (tx_use_data_frag) begin
+                                            tx_bytes_remaining   <= tx_bytes_remaining - {4'd0, tx_frag_ser_bytes};
+                                            tx_frag_offset_bytes <= tx_frag_offset_bytes + {4'd0, tx_frag_ser_bytes};
+                                            tx_ip_id_counter     <= tx_ip_id_counter + 16'd1;
+                                        end else begin
+                                            tx_bytes_remaining   <= tx_bytes_remaining - tx_frag_payload_bytes;
+                                            tx_frag_offset_bytes <= tx_frag_offset_bytes + tx_frag_payload_bytes;
+                                        end
+                                        tx_frag_idx   <= tx_frag_idx + 16'd1;
+                                        tx_init_phase <= 2'd0;
+                                        state         <= S_TX_FRAG_INIT;
                                     end
                                 end else begin
                                     tx_beat_idx <= tx_beat_idx + 12'd1;
-                                    // For fragments 1 & 2, beat 7 precedes beat 8 (where sample word 353/723 is read),
-                                    // so increment tx_sample_rd_addr on beat 7 so beat 9 gets word 354/724!
-                                    if (tx_beat_idx == 12'd7 && tx_dgram_word_idx >= 12'd17) begin
+                                    if (tx_beat_idx == 12'd7 && tx_dgram_word_idx >= (tx_use_data_frag ? 12'd19 : 12'd17)) begin
                                         tx_sample_rd_addr <= tx_sample_rd_addr + 11'd1;
                                     end else if (tx_beat_idx >= 12'd8) begin
                                         tx_prev_half      <= cur_dgram_word[15:0];
                                         tx_dgram_word_idx <= tx_dgram_word_idx + 12'd1;
-                                        // Advance sample BRAM read pointer 1 beat ahead of payload window (tx_dgram_word_idx >= 16)
-                                        if (tx_dgram_word_idx >= 12'd16) begin
-                                            tx_sample_rd_addr <= tx_sample_rd_addr + 11'd1;
+                                        if (tx_use_data_frag) begin
+                                            if ((tx_frag_idx == 16'd0 && tx_dgram_word_idx >= 12'd19) ||
+                                                (tx_frag_idx != 16'd0 && tx_dgram_word_idx >= 12'd18)) begin
+                                                tx_sample_rd_addr <= tx_sample_rd_addr + 11'd1;
+                                            end
+                                        end else begin
+                                            if (tx_dgram_word_idx >= 12'd16) begin
+                                                tx_sample_rd_addr <= tx_sample_rd_addr + 11'd1;
+                                            end
                                         end
                                     end
                                 end
@@ -2236,7 +2945,7 @@ module rtps_fastpath_ip #(
                                 m_axis_tlast  <= skid_last;
                                 m_axis_tvalid <= 1'b1;
                                 if (bram_pipe_valid) begin
-                                    skid_data  <= s2mm_dout;
+                                    skid_data  <= s2mm_dout_host;
                                     skid_last  <= bram_pipe_last;
                                     skid_valid <= 1'b1;
                                 end else begin
@@ -2246,7 +2955,7 @@ module rtps_fastpath_ip #(
                         end else begin
                             if (m_axis_tready || !m_axis_tvalid) begin
                                 if (bram_pipe_valid) begin
-                                    m_axis_tdata  <= s2mm_dout;
+                                    m_axis_tdata  <= s2mm_dout_host;
                                     m_axis_tlast  <= bram_pipe_last;
                                     m_axis_tvalid <= 1'b1;
                                 end else if (m_axis_tready && m_axis_tvalid) begin
@@ -2255,7 +2964,7 @@ module rtps_fastpath_ip #(
                                 end
                             end else begin
                                 if (bram_pipe_valid) begin
-                                    skid_data  <= s2mm_dout;
+                                    skid_data  <= s2mm_dout_host;
                                     skid_last  <= bram_pipe_last;
                                     skid_valid <= 1'b1;
                                 end

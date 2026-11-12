@@ -114,19 +114,8 @@ static inline void rtps_pcap_close(rtps_pcap_dumper_t* dumper) {
     }
 }
 
-/* The PL emits RTPS header words MSB-first, but DMA buffers hold them as host-LE words. Swap words 0..14 so "RTPS" appears on the wire. */
-static inline uint8_t* rtps_pcap_wire_copy(const void* src, uint32_t len) {
-    uint8_t* out = (uint8_t*)malloc(len);
-    if (!out) return NULL;
-    memcpy(out, src, len);
-    uint32_t* w = (uint32_t*)out;
-    for (uint32_t i = 0; i < 15 && (i + 1) * 4 <= len; i++)
-        w[i] = __builtin_bswap32(w[i]);
-    return out;
-}
-
 /*
- * Dump complete RTPS over UDP packet:
+ * Dump complete RTPS over UDP packet (payload is already in wire byte order):
  * [Ethernet II (14B)][IPv4 (20B)][UDP (8B)][RTPS Payload (length bytes)]
  */
 static inline int rtps_pcap_dump_udp(rtps_pcap_dumper_t* dumper,
@@ -142,9 +131,6 @@ static inline int rtps_pcap_dump_udp(rtps_pcap_dumper_t* dumper,
                                      uint32_t rtps_len) {
     if (!dumper || !dumper->fp || !rtps_payload || rtps_len == 0)
         return -1;
-
-    uint8_t* wire_payload = rtps_pcap_wire_copy(rtps_payload, rtps_len);
-    if (!wire_payload) return -1;
 
     uint32_t total_pkt_len = sizeof(struct eth_hdr) + sizeof(struct ip_hdr) +
                              sizeof(struct udp_hdr) + rtps_len;
@@ -183,12 +169,10 @@ static inline int rtps_pcap_dump_udp(rtps_pcap_dumper_t* dumper,
         fwrite(&eth, sizeof(eth), 1, dumper->fp) != 1 ||
         fwrite(&ip, sizeof(ip), 1, dumper->fp) != 1 ||
         fwrite(&udp, sizeof(udp), 1, dumper->fp) != 1 ||
-        fwrite(wire_payload, 1, rtps_len, dumper->fp) != rtps_len) {
-        free(wire_payload);
+        fwrite(rtps_payload, 1, rtps_len, dumper->fp) != rtps_len) {
         return -1;
     }
 
-    free(wire_payload);
     dumper->pkt_count++;
     return 0;
 }
@@ -214,20 +198,16 @@ static inline int rtps_pcap_dump_fragments(rtps_pcap_dumper_t* dumper,
     if (!dumper || !dumper->fp || !rtps_payload || rtps_len == 0)
         return -1;
 
-    uint8_t* wire_payload = rtps_pcap_wire_copy(rtps_payload, rtps_len);
-    if (!wire_payload) return -1;
-
     uint32_t udp_total_len = (uint32_t)sizeof(struct udp_hdr) + rtps_len;
     uint8_t* dgram_buf = (uint8_t*)malloc(udp_total_len);
-    if (!dgram_buf) { free(wire_payload); return -1; }
+    if (!dgram_buf) return -1;
 
     struct udp_hdr* udp = (struct udp_hdr*)dgram_buf;
     udp->src_port = htons(src_port);
     udp->dst_port = htons(dst_port);
     udp->length   = htons((uint16_t)udp_total_len);
     udp->checksum = 0; /* Wireshark happily reassembles with 0 */
-    memcpy(dgram_buf + sizeof(struct udp_hdr), wire_payload, rtps_len);
-    free(wire_payload);
+    memcpy(dgram_buf + sizeof(struct udp_hdr), rtps_payload, rtps_len);
 
     /* Fragment parameters matching PL fabric */
     uint32_t frag_offsets[3] = {0, 1472, 2944};

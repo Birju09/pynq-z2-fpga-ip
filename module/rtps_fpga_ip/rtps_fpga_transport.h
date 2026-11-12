@@ -461,34 +461,32 @@ static inline int DDS_DataReader_take(
     if (!ok || !msg.buffer.pointer)
         return -EIO;
 
+    const uint8_t*  bytes = (const uint8_t*)msg.buffer.pointer;
     const uint32_t* words = (const uint32_t*)msg.buffer.pointer;
     if (plugin->option_b_rtps_rx_mode) {
         /*
-         * Verify the 15-word (60-byte) RTPS v2.x message header returned by S2MM:
-         *   Word 0:  "RTPS" (0x52545053)
-         *   Word 1:  Version 2.x + VendorId
-         *   Word 5:  INFO_TS (0x09010800)
-         *   Word 6:  INFO_TS seconds (LE)
-         *   Word 7:  INFO_TS fraction (LE)
-         *   Word 8:  DATA submessage header (0x1505....)
-         *   Word 12: writerSN Hi (LE)
-         *   Word 13: writerSN Lo (LE)
-         *   Word 14: CDR_LE encapsulation (0x00010000)
-         *   Words 15..1038: 4,096-byte FastSample payload
+         * Verify the 15-word (60-byte) RTPS v2.x wire message returned by S2MM:
+         *   Bytes 0..3   (Word 0):  "RTPS" (0x52, 0x54, 0x50, 0x53)
+         *   Bytes 4..7   (Word 1):  Version 2.x + VendorId
+         *   Bytes 20..23 (Word 5):  INFO_TS (0x09, 0x01, 0x08, 0x00)
+         *   Bytes 24..27 (Word 6):  INFO_TS seconds (LE)
+         *   Bytes 28..31 (Word 7):  INFO_TS fraction (LE)
+         *   Byte  32     (Word 8):  DATA submessageId (0x15)
+         *   Bytes 48..51 (Word 12): writerSN Hi (LE)
+         *   Bytes 52..55 (Word 13): writerSN Lo (LE)
+         *   Bytes 56..59 (Word 14): CDR_LE encapsulation (0x00, 0x01, 0x00, 0x00)
+         *   Words 15..1038:         4,096-byte FastSample payload (native LE)
          */
-        if (words[0] != 0x52545053U || (words[8] >> 24) != 0x15U || words[14] != 0x00010000U) {
+        if (memcmp(bytes, "RTPS", 4) != 0 || bytes[32] != 0x15U ||
+            bytes[56] != 0x00U || bytes[57] != 0x01U) {
             errno = EBADMSG;
             return -EBADMSG;
         }
         if (rx_source_ts_out) {
-            uint32_t ts_sec  = __builtin_bswap32(words[6]);
-            uint32_t ts_frac = __builtin_bswap32(words[7]);
-            *rx_source_ts_out = ((uint64_t)ts_sec << 32) | ts_frac;
+            *rx_source_ts_out = ((uint64_t)words[6] << 32) | words[7];
         }
         if (rx_seq_num_out) {
-            uint32_t seq_hi = __builtin_bswap32(words[12]);
-            uint32_t seq_lo = __builtin_bswap32(words[13]);
-            *rx_seq_num_out = ((uint64_t)seq_hi << 32) | seq_lo;
+            *rx_seq_num_out = ((uint64_t)words[12] << 32) | words[13];
         }
         *sample_out = (const struct FastSample*)(&words[RTPS_WIRE_HEADER_WORDS]);
     } else {
@@ -570,6 +568,8 @@ static inline int fpga_fastpath_open(
     fpga->cfg.payload_words        = RTPS_FAST_SAMPLE_WORDS;
     fpga->cfg.type_profile         = RTPS_TYPE_PROFILE_RTI_DEFAULT;
     fpga->cfg.mode_pub_only        = 1;          /* Default to decoupled asynchronous mode */
+    fpga->cfg.tx_ip_frag_mode      = 0;          /* Default to Option C RTPS DATA_FRAG (0x16) */
+    fpga->cfg.frag_size_bytes      = 1400U;      /* Default 1,400 B DATA_FRAG fragmentSize */
 
     /* Push initial configuration to hardware */
     ioctl(fd, AXI_RTPS_IOC_CONFIG_ENDPOINTS, &fpga->cfg);

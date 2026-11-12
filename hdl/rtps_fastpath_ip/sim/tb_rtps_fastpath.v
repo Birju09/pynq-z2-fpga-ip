@@ -245,20 +245,23 @@ module tb_rtps_fastpath;
     reg [31:0] expected_word;
     integer    i, errors, rx_cnt, k, sim_timeout;
 
-    // Recorded emulator wire frames for Subscribe-only wire replay test
-    reg [31:0] rec_wire_data [0:1200];
-    reg        rec_wire_last [0:1200];
+    // Recorded emulator wire frames for Subscribe-only wire replay test (supports both IP-frag and DATA_FRAG)
+    reg [31:0] rec_wire_data [0:1500];
+    reg        rec_wire_last [0:1500];
     integer    rec_wire_cnt;
+    integer    rec_tlast_cnt;
 
     always @(posedge clk) begin
         if (rst_n && dut.u_rtps_peer_emulator.m_axis_tvalid && dut.u_rtps_peer_emulator.m_axis_tready) begin
-            if (rec_wire_cnt < 1068) begin
+            if (rec_tlast_cnt < 3 && rec_wire_cnt < 1500) begin
                 rec_wire_data[rec_wire_cnt] <= {dut.u_rtps_peer_emulator.m_axis_tdata[7:0],
                                                 dut.u_rtps_peer_emulator.m_axis_tdata[15:8],
                                                 dut.u_rtps_peer_emulator.m_axis_tdata[23:16],
                                                 dut.u_rtps_peer_emulator.m_axis_tdata[31:24]};
                 rec_wire_last[rec_wire_cnt] <= dut.u_rtps_peer_emulator.m_axis_tlast;
                 rec_wire_cnt <= rec_wire_cnt + 1;
+                if (dut.u_rtps_peer_emulator.m_axis_tlast)
+                    rec_tlast_cnt <= rec_tlast_cnt + 1;
             end
         end
     end
@@ -266,6 +269,7 @@ module tb_rtps_fastpath;
     initial begin
         errors             = 0;
         rec_wire_cnt       = 0;
+        rec_tlast_cnt      = 0;
         rst_n              = 1'b0;
         s_axi_awaddr       = 10'd0;
         s_axi_awvalid      = 1'b0;
@@ -504,11 +508,11 @@ module tb_rtps_fastpath;
         $display("[+] Stale Seq Cycle STATUS=0x%08X (ERR_RX_TIMEOUT=%b, STAT_STALE_DROPS=%0d)",
                  status_val, status_val[7], stat_val);
 
-        if (status_val[7] !== 1'b1 || stat_val !== 32'd1) begin
-            $display("[-] FAIL: Expected ERR_RX_TIMEOUT=1 and STAT_STALE_DROPS=1!");
+        if (status_val[7] !== 1'b1 || stat_val !== 32'd3) begin
+            $display("[-] FAIL: Expected ERR_RX_TIMEOUT=1 and STAT_STALE_DROPS=3 (1 per DATA_FRAG)!");
             errors = errors + 1;
         end else begin
-            $display("[+] PASS: Master rejected duplicate seqNum, incremented STAT_STALE_DROPS, and timed out cleanly!");
+            $display("[+] PASS: Master rejected duplicate seqNum across all 3 DATA_FRAG packets, incremented STAT_STALE_DROPS=3, and timed out cleanly!");
         end
         axi_write(10'h004, 32'h0000_0001); // ACK IRQ (returns directly to S_IDLE on error)
         repeat (5) @(posedge clk);
@@ -528,11 +532,11 @@ module tb_rtps_fastpath;
         $display("[+] Bad UDP Csum STATUS=0x%08X (ERR_CSUM=%b, ERR_RX_TIMEOUT=%b, STAT_CSUM_ERRS=%0d)",
                  status_val, status_val[8], status_val[7], stat_val);
 
-        if (status_val[8] !== 1'b1 || stat_val !== 32'd1) begin
-            $display("[-] FAIL: Expected ERR_CSUM=1 and STAT_CSUM_ERRS=1!");
+        if (status_val[8] !== 1'b1 || stat_val !== 32'd3) begin
+            $display("[-] FAIL: Expected ERR_CSUM=1 and STAT_CSUM_ERRS=3 (1 per DATA_FRAG)!");
             errors = errors + 1;
         end else begin
-            $display("[+] PASS: Master detected corrupted reassembled UDP checksum and dropped datagram!");
+            $display("[+] PASS: Master detected corrupted UDP checksums across all 3 DATA_FRAG packets and dropped sample!");
         end
         axi_write(10'h004, 32'h0000_0001); // ACK IRQ
         axi_write(10'h048, 32'h0000_0000); // Clear faults
@@ -648,10 +652,10 @@ module tb_rtps_fastpath;
         @(posedge clk);
         m_axis_tready <= 1'b0;
 
-        // Verify the 15-word (60-byte) RTPS v2.3 RTI Connext header + INFO_TS + DATA + CDR_LE encapsulation
-        if (rx_buf[0] !== 32'h5254_5053 || rx_buf[1] !== 32'h0203_0101 ||
-            rx_buf[5] !== 32'h0901_0800 || rx_buf[8] !== 32'h1505_1810 ||
-            rx_buf[14] !== 32'h0001_0000) begin
+        // Verify the 15-word (60-byte) RTPS v2.3 wire message header in little-endian host word order
+        if (rx_buf[0] !== 32'h5350_5452 || rx_buf[1] !== 32'h0101_0302 ||
+            rx_buf[5] !== 32'h0008_0109 || rx_buf[8] !== 32'h1018_0515 ||
+            rx_buf[14] !== 32'h0000_0100) begin
             $display("[-] FAIL: Option B RTPS Header mismatch! w0=0x%08X w1=0x%08X w5=0x%08X w8=0x%08X w14=0x%08X",
                      rx_buf[0], rx_buf[1], rx_buf[5], rx_buf[8], rx_buf[14]);
             errors = errors + 1;
@@ -1437,6 +1441,352 @@ module tb_rtps_fastpath;
             @(posedge clk);
             m_axis_tready = 1'b0;
             repeat (5) @(posedge clk);
+        end
+
+        // ==================================================================
+        // TEST 19: Legacy IPv4 Fragmentation Override (CTRL_ADDR[10] = 1)
+        // ==================================================================
+        $display("\n==================================================================");
+        $display("  TEST 19: Legacy IPv4 Fragmentation Override (CTRL_ADDR[10] = 1)");
+        $display("==================================================================");
+        begin : test19_blk
+            reg [31:0] last_seq_emu;
+            // Restore active Writer/Reader EDT, CTRL[10]=1 (IPv4 frag), emu_enable=1 (bit 4), enable=1
+            axi_write(10'h014, PAYLOAD_WORDS);
+            axi_write(10'h1C0, 32'd1400);
+            axi_write(10'h048, 32'h0000_0002); // Out-of-order IPv4 frag swap test
+            axi_write(10'h008, 32'h0000_0433); // bit 10=1 (tx_ip_frag_mode), bit 5=1 (commit), bit 4=1 (emu), bit 0=1
+            repeat (5) @(posedge clk);
+            axi_write(10'h008, 32'h0000_0413);
+            axi_write(10'h00C, calc_crc);
+
+            for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
+                @(posedge clk);
+                s_axis_tdata  <= tx_buf[i];
+                s_axis_tvalid <= 1'b1;
+                s_axis_tlast  <= (i == PAYLOAD_WORDS - 1);
+                while (!s_axis_tready) @(posedge clk);
+            end
+            @(posedge clk);
+            s_axis_tvalid <= 1'b0;
+            s_axis_tlast  <= 1'b0;
+
+            wait (ip_done_irq == 1'b1);
+            axi_read(10'h004, status_val);
+            axi_read(10'h064, last_seq_emu);
+            $display("[+] IPv4-Frag Cycle STATUS=0x%08X (Frags=%0d, Errors=%04b, seq=%0d)",
+                     status_val, status_val[13:11], status_val[8:5], last_seq_emu);
+
+            if (status_val[13:11] !== 3'd3 || status_val[8:5] !== 4'b0000) begin
+                $display("[-] FAIL: Expected 3 IPv4 fragments and 0 errors in TEST 19!");
+                errors = errors + 1;
+            end
+
+            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0002);
+            rx_cnt = 0;
+            m_axis_tready = 1'b1;
+            while (rx_cnt < PAYLOAD_WORDS) begin
+                @(posedge clk);
+                if (m_axis_tvalid && m_axis_tready) begin
+                    rx_buf[rx_cnt] = m_axis_tdata;
+                    rx_cnt = rx_cnt + 1;
+                end
+            end
+            @(posedge clk);
+            m_axis_tready = 1'b0;
+            axi_write(10'h048, 32'h0000_0000);
+
+            for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
+                expected_word = (i < 4) ? tx_buf[i] : ((~tx_buf[i]) + {16'h0000, last_seq_emu[5:0], 10'h200});
+                if (rx_buf[i] !== expected_word) begin
+                    if (errors < 10) $display("[-] FAIL TEST 19 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[i]);
+                    errors = errors + 1;
+                end
+            end
+            if (errors == 0)
+                $display("[+] PASS: Legacy IPv4 fragmentation override (CTRL[10]=1) + out-of-order reassembly verified!");
+        end
+
+        // ==================================================================
+        // TEST 20: Custom CFG_FRAG_SIZE_ADDR (1024 B -> 5 DATA_FRAG Packets)
+        // ==================================================================
+        $display("\n==================================================================");
+        $display("  TEST 20: Custom CFG_FRAG_SIZE_ADDR (1024 B -> 5 DATA_FRAG Packets)");
+        $display("==================================================================");
+        begin : test20_blk
+            reg [31:0] last_seq_emu, frag_rd_back;
+            axi_write(10'h1C0, 32'd1024); // CFG_FRAG_SIZE_ADDR = 1024 bytes (4100/1024 -> 5 frags)
+            axi_read(10'h1C0, frag_rd_back);
+            if (frag_rd_back !== 32'd1024) begin
+                $display("[-] FAIL: CFG_FRAG_SIZE_ADDR readback exp=1024 got=%0d", frag_rd_back);
+                errors = errors + 1;
+            end
+            axi_write(10'h008, 32'h0000_0013); // CTRL[10]=0 (DATA_FRAG), emu=1, enable=1
+            axi_write(10'h00C, calc_crc);
+
+            for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
+                @(posedge clk);
+                s_axis_tdata  <= tx_buf[i];
+                s_axis_tvalid <= 1'b1;
+                s_axis_tlast  <= (i == PAYLOAD_WORDS - 1);
+                while (!s_axis_tready) @(posedge clk);
+            end
+            @(posedge clk);
+            s_axis_tvalid <= 1'b0;
+            s_axis_tlast  <= 1'b0;
+
+            wait (ip_done_irq == 1'b1);
+            axi_read(10'h004, status_val);
+            axi_read(10'h064, last_seq_emu);
+            $display("[+] 5-Frag DATA_FRAG STATUS=0x%08X (Frags=%0d, Errors=%04b)",
+                     status_val, status_val[13:11], status_val[8:5]);
+
+            if (status_val[13:11] !== 3'd5 || status_val[8:5] !== 4'b0000) begin
+                $display("[-] FAIL: Expected 5 DATA_FRAG fragments and 0 errors in TEST 20!");
+                errors = errors + 1;
+            end
+
+            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0002);
+            rx_cnt = 0;
+            m_axis_tready = 1'b1;
+            while (rx_cnt < PAYLOAD_WORDS) begin
+                @(posedge clk);
+                if (m_axis_tvalid && m_axis_tready) begin
+                    rx_buf[rx_cnt] = m_axis_tdata;
+                    rx_cnt = rx_cnt + 1;
+                end
+            end
+            @(posedge clk);
+            m_axis_tready = 1'b0;
+
+            for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
+                expected_word = (i < 4) ? tx_buf[i] : ((~tx_buf[i]) + {16'h0000, last_seq_emu[5:0], 10'h200});
+                if (rx_buf[i] !== expected_word) begin
+                    if (errors < 10) $display("[-] FAIL TEST 20 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[i]);
+                    errors = errors + 1;
+                end
+            end
+            if (errors == 0)
+                $display("[+] PASS: 5-fragment DATA_FRAG (fragmentSize=1024) roundtrip verified!");
+        end
+
+        // ==================================================================
+        // TEST 21: Sub-MTU Sample (64 Words = 256 B <= 1400 B -> Single DATA)
+        // ==================================================================
+        $display("\n==================================================================");
+        $display("  TEST 21: Sub-MTU Sample (64 Words <= 1400 B -> Single DATA 0x15)");
+        $display("==================================================================");
+        begin : test21_blk
+            reg [31:0] last_seq_emu, sub_crc;
+            axi_write(10'h1C0, 32'd1400);
+            axi_write(10'h014, 32'd64); // 64 words = 256 B (+4B CDR_LE = 260B <= 1400B)
+            sub_crc = 32'd0;
+            for (i = 0; i < 64; i = i + 1) sub_crc = sub_crc + tx_buf[i];
+            axi_write(10'h00C, sub_crc);
+
+            for (i = 0; i < 64; i = i + 1) begin
+                @(posedge clk);
+                s_axis_tdata  <= tx_buf[i];
+                s_axis_tvalid <= 1'b1;
+                s_axis_tlast  <= (i == 63);
+                while (!s_axis_tready) @(posedge clk);
+            end
+            @(posedge clk);
+            s_axis_tvalid <= 1'b0;
+            s_axis_tlast  <= 1'b0;
+
+            wait (ip_done_irq == 1'b1);
+            axi_read(10'h004, status_val);
+            axi_read(10'h064, last_seq_emu);
+            $display("[+] Sub-MTU Single DATA STATUS=0x%08X (Frags=%0d, Errors=%04b)",
+                     status_val, status_val[13:11], status_val[8:5]);
+
+            if (status_val[13:11] !== 3'd1 || status_val[8:5] !== 4'b0000) begin
+                $display("[-] FAIL: Expected 1 single DATA packet and 0 errors in TEST 21!");
+                errors = errors + 1;
+            end
+
+            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0002);
+            rx_cnt = 0;
+            m_axis_tready = 1'b1;
+            while (rx_cnt < 64) begin
+                @(posedge clk);
+                if (m_axis_tvalid && m_axis_tready) begin
+                    rx_buf[rx_cnt] = m_axis_tdata;
+                    rx_cnt = rx_cnt + 1;
+                end
+            end
+            @(posedge clk);
+            m_axis_tready = 1'b0;
+
+            for (i = 0; i < 64; i = i + 1) begin
+                expected_word = (i < 4) ? tx_buf[i] : ((~tx_buf[i]) + {16'h0000, last_seq_emu[5:0], 10'h200});
+                if (rx_buf[i] !== expected_word) begin
+                    if (errors < 10) $display("[-] FAIL TEST 21 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[i]);
+                    errors = errors + 1;
+                end
+            end
+            if (errors == 0)
+                $display("[+] PASS: Sub-MTU single DATA (0x15) roundtrip verified (64 words)!");
+        end
+
+        // ==================================================================
+        // TEST 22: Non-4B-Aligned RX DATA_FRAG (fragmentSize=1397, Out-of-Order)
+        // ==================================================================
+        $display("\n==================================================================");
+        $display("  TEST 22: Unaligned RX DATA_FRAG (fragmentSize=1397, OOO + Opt B)");
+        $display("==================================================================");
+        begin : test22_blk
+            // Build 4,100 bytes of SerializedPayload (Word 0 = CDR_LE 0x00010000, Words 1..1024 = payload)
+            reg [7:0] ser_bytes [0:4099];
+            reg [7:0] pkt_bytes [0:1599];
+            integer frag_order [0:2];
+            integer f_idx, f_num, f_off, f_len, udp_len, ip_len, eth_len, b_idx, n_beats;
+            reg [31:0] hdr_csum_acc, word32, rtps_words_rd;
+            reg [15:0] ip_hdr_csum, oct_next;
+
+            axi_write(10'h014, PAYLOAD_WORDS);
+            // Configure Subscribe-only + Option B (bit 9=1, bit 7=1, bit 0=1 -> 0x0000_0283), commit EDT
+            axi_write(10'h008, 32'h0000_02A3);
+            repeat (5) @(posedge clk);
+            axi_write(10'h008, 32'h0000_0283);
+            repeat (5) @(posedge clk);
+
+            // Populate ser_bytes: 4B CDR_LE + 1024 words (little-endian CDR byte order per word = tx_buf[i])
+            ser_bytes[0] = 8'h00; ser_bytes[1] = 8'h01; ser_bytes[2] = 8'h00; ser_bytes[3] = 8'h00;
+            for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
+                word32 = tx_buf[i] ^ 32'hA55A_0000;
+                ser_bytes[4 + i*4 + 0] = word32[7:0];
+                ser_bytes[4 + i*4 + 1] = word32[15:8];
+                ser_bytes[4 + i*4 + 2] = word32[23:16];
+                ser_bytes[4 + i*4 + 3] = word32[31:24];
+            end
+
+            // Send fragments out of order: Frag 2 (1397B @ 1397), Frag 1 (1397B @ 0), Frag 3 (1306B @ 2794)
+            frag_order[0] = 2;
+            frag_order[1] = 1;
+            frag_order[2] = 3;
+
+            for (f_idx = 0; f_idx < 3; f_idx = f_idx + 1) begin
+                f_num   = frag_order[f_idx];
+                f_off   = (f_num - 1) * 1397;
+                f_len   = (f_num == 3) ? 1306 : 1397; // 1397 (%4==1) and 1306 (%4==2)
+                udp_len = 76 + f_len;
+                ip_len  = 20 + udp_len;
+                eth_len = 14 + ip_len;
+                oct_next = 32 + f_len;
+
+                // Ethernet (14B)
+                pkt_bytes[0]=8'h02; pkt_bytes[1]=8'h00; pkt_bytes[2]=8'h5E; pkt_bytes[3]=8'h10; pkt_bytes[4]=8'h00; pkt_bytes[5]=8'h01;
+                pkt_bytes[6]=8'h02; pkt_bytes[7]=8'h00; pkt_bytes[8]=8'h5E; pkt_bytes[9]=8'h20; pkt_bytes[10]=8'h00; pkt_bytes[11]=8'h02;
+                pkt_bytes[12]=8'h08; pkt_bytes[13]=8'h00;
+                // IPv4 (20B)
+                pkt_bytes[14]=8'h45; pkt_bytes[15]=8'h00;
+                pkt_bytes[16]=ip_len[15:8]; pkt_bytes[17]=ip_len[7:0];
+                pkt_bytes[18]=8'h30; pkt_bytes[19]=f_num[7:0];
+                pkt_bytes[20]=8'h00; pkt_bytes[21]=8'h00; // MF=0, Offset=0
+                pkt_bytes[22]=8'h40; pkt_bytes[23]=8'h11; // TTL=64, UDP
+                pkt_bytes[24]=8'h00; pkt_bytes[25]=8'h00;
+                pkt_bytes[26]=8'hC0; pkt_bytes[27]=8'hA8; pkt_bytes[28]=8'h01; pkt_bytes[29]=8'h64; // 192.168.1.100
+                pkt_bytes[30]=8'hC0; pkt_bytes[31]=8'hA8; pkt_bytes[32]=8'h01; pkt_bytes[33]=8'hC9; // 192.168.1.201
+                hdr_csum_acc = 0;
+                for (b_idx = 14; b_idx < 34; b_idx = b_idx + 2)
+                    hdr_csum_acc = hdr_csum_acc + {pkt_bytes[b_idx], pkt_bytes[b_idx+1]};
+                hdr_csum_acc = (hdr_csum_acc[15:0]) + (hdr_csum_acc >> 16);
+                hdr_csum_acc = (hdr_csum_acc[15:0]) + (hdr_csum_acc >> 16);
+                ip_hdr_csum = ~hdr_csum_acc[15:0];
+                pkt_bytes[24]=ip_hdr_csum[15:8]; pkt_bytes[25]=ip_hdr_csum[7:0];
+
+                // UDP (8B, RFC 768 csum=0)
+                pkt_bytes[34]=8'h1C; pkt_bytes[35]=8'hF2; // 7410
+                pkt_bytes[36]=8'h1C; pkt_bytes[37]=8'hF3; // 7411
+                pkt_bytes[38]=udp_len[15:8]; pkt_bytes[39]=udp_len[7:0];
+                pkt_bytes[40]=8'h00; pkt_bytes[41]=8'h00;
+                // RTPS Header (20B)
+                pkt_bytes[42]=8'h52; pkt_bytes[43]=8'h54; pkt_bytes[44]=8'h50; pkt_bytes[45]=8'h53;
+                pkt_bytes[46]=8'h02; pkt_bytes[47]=8'h03; pkt_bytes[48]=8'h01; pkt_bytes[49]=8'h01;
+                pkt_bytes[50]=8'h01; pkt_bytes[51]=8'h01; pkt_bytes[52]=8'hAA; pkt_bytes[53]=8'h00;
+                pkt_bytes[54]=8'hBB; pkt_bytes[55]=8'h11; pkt_bytes[56]=8'hCC; pkt_bytes[57]=8'h22;
+                pkt_bytes[58]=8'hDD; pkt_bytes[59]=8'h33; pkt_bytes[60]=8'hEE; pkt_bytes[61]=8'h44;
+                // INFO_TS (12B)
+                pkt_bytes[62]=8'h09; pkt_bytes[63]=8'h01; pkt_bytes[64]=8'h08; pkt_bytes[65]=8'h00;
+                pkt_bytes[66]=8'h01; pkt_bytes[67]=8'h02; pkt_bytes[68]=8'h03; pkt_bytes[69]=8'h04;
+                pkt_bytes[70]=8'h05; pkt_bytes[71]=8'h06; pkt_bytes[72]=8'h07; pkt_bytes[73]=8'h08;
+                // DATA_FRAG (36B)
+                pkt_bytes[74]=8'h16; pkt_bytes[75]=8'h01; pkt_bytes[76]=oct_next[7:0]; pkt_bytes[77]=oct_next[15:8];
+                pkt_bytes[78]=8'h00; pkt_bytes[79]=8'h00; pkt_bytes[80]=8'h1C; pkt_bytes[81]=8'h00;
+                pkt_bytes[82]=8'h00; pkt_bytes[83]=8'h00; pkt_bytes[84]=8'h01; pkt_bytes[85]=8'h07; // readerId
+                pkt_bytes[86]=8'h00; pkt_bytes[87]=8'h00; pkt_bytes[88]=8'h02; pkt_bytes[89]=8'h02; // writerId
+                pkt_bytes[90]=8'h00; pkt_bytes[91]=8'h00; pkt_bytes[92]=8'h00; pkt_bytes[93]=8'h00; // seqHi (LE)
+                pkt_bytes[94]=8'h0A; pkt_bytes[95]=8'h00; pkt_bytes[96]=8'h00; pkt_bytes[97]=8'h00; // seqLo = 10 (LE)
+                pkt_bytes[98]=f_num[7:0]; pkt_bytes[99]=8'h00; pkt_bytes[100]=8'h00; pkt_bytes[101]=8'h00; // fragStart
+                pkt_bytes[102]=8'h01; pkt_bytes[103]=8'h00; pkt_bytes[104]=8'h75; pkt_bytes[105]=8'h05; // frags=1, fragSize=1397 (0x0575 LE)
+                pkt_bytes[106]=8'h04; pkt_bytes[107]=8'h10; pkt_bytes[108]=8'h00; pkt_bytes[109]=8'h00; // sampleSize=4100 (0x1004 LE)
+                for (b_idx = 0; b_idx < f_len; b_idx = b_idx + 1)
+                    pkt_bytes[110 + b_idx] = ser_bytes[f_off + b_idx];
+                pkt_bytes[eth_len]   = 8'h00; pkt_bytes[eth_len+1] = 8'h00; pkt_bytes[eth_len+2] = 8'h00;
+
+                n_beats = (eth_len + 3) / 4;
+                wait (s_axis_wire_tready == 1'b1);
+                for (b_idx = 0; b_idx < n_beats; b_idx = b_idx + 1) begin
+                    @(posedge clk);
+                    // AXIS wire is LSB-first byte 0 in [7:0]
+                    s_axis_wire_tdata  <= {pkt_bytes[b_idx*4+3], pkt_bytes[b_idx*4+2], pkt_bytes[b_idx*4+1], pkt_bytes[b_idx*4+0]};
+                    s_axis_wire_tlast  <= (b_idx == n_beats - 1);
+                    s_axis_wire_tvalid <= 1'b1;
+                    while (!s_axis_wire_tready) @(posedge clk);
+                end
+                @(posedge clk);
+                s_axis_wire_tvalid <= 1'b0;
+                s_axis_wire_tlast  <= 1'b0;
+                repeat (20) @(posedge clk);
+            end
+
+            sim_timeout = 0;
+            while (!ip_done_irq && sim_timeout < 5000) begin
+                @(posedge clk);
+                sim_timeout = sim_timeout + 1;
+            end
+            axi_read(10'h004, status_val);
+            axi_read(10'h074, rtps_words_rd);
+            $display("[+] Unaligned DATA_FRAG RX STATUS=0x%08X, LAST_RX_RTPS_WORDS=%0d", status_val, rtps_words_rd);
+
+            if (status_val[4:1] !== 4'd5 || status_val[10] !== 1'b1 || rtps_words_rd !== 32'd1039) begin
+                $display("[-] FAIL: Unaligned DATA_FRAG RX failed! status=0x%08X words=%0d", status_val, rtps_words_rd);
+                errors = errors + 1;
+            end
+
+            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0002);
+            m_axis_tready = 1'b1;
+            rx_cnt = 0;
+            while (rx_cnt < 1039) begin
+                @(posedge clk);
+                if (m_axis_tvalid && m_axis_tready) begin
+                    rx_buf[rx_cnt] = m_axis_tdata;
+                    rx_cnt = rx_cnt + 1;
+                end
+            end
+            @(posedge clk);
+            m_axis_tready = 1'b0;
+
+            if (rx_buf[0] !== 32'h5350_5452 || rx_buf[8] !== 32'h1018_0515 || rx_buf[14] !== 32'h0000_0100) begin
+                $display("[-] FAIL: Synthesized Option B header mismatch! w0=0x%08X w8=0x%08X w14=0x%08X",
+                         rx_buf[0], rx_buf[8], rx_buf[14]);
+                errors = errors + 1;
+            end
+            for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
+                expected_word = tx_buf[i] ^ 32'hA55A_0000;
+                if (rx_buf[15 + i] !== expected_word) begin
+                    if (errors < 10) $display("[-] FAIL TEST 22 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[15 + i]);
+                    errors = errors + 1;
+                end
+            end
+            if (errors == 0)
+                $display("[+] PASS: Unaligned non-4B-multiple (fragmentSize=1397) OOO DATA_FRAG + Option B synthesis verified!");
         end
 
         $display("\n==================================================================");

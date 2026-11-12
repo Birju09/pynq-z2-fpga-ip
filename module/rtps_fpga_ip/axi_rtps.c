@@ -52,6 +52,8 @@ struct axi_rtps_dev {
     unsigned long rx_user_addr;
     u32 bypass_crc;
     u32 plugin_rx_rtps_mode;
+    u32 tx_ip_frag_mode;
+    u32 frag_size_bytes;
 
     /* Synchronization & Diagnostics */
     struct mutex tx_lock;
@@ -357,6 +359,8 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                 iowrite32(cfg.payload_words,        dev->ip_regs + RTPS_IP_PAYLOAD_WORDS_OFFSET);
                 if (cfg.rx_timeout_ticks > 0)
                     iowrite32(cfg.rx_timeout_ticks, dev->ip_regs + RTPS_IP_RX_TIMEOUT_OFFSET);
+                dev->frag_size_bytes = cfg.frag_size_bytes ? cfg.frag_size_bytes : 1400U;
+                iowrite32(dev->frag_size_bytes,     dev->ip_regs + RTPS_IP_FRAG_SIZE_OFFSET);
 
                 /* Program Type Profile & Strict Payload Contract (Section 8) */
                 iowrite32(type_prof, dev->ip_regs + RTPS_IP_TYPE_PROFILE_OFFSET);
@@ -416,12 +420,14 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             /* Atomically commit Shadow -> Active EDT at S_IDLE boundary */
             dev->plugin_rx_rtps_mode = cfg.plugin_rx_rtps_mode ? 1 : 0;
             dev->mode_pub_only       = cfg.mode_pub_only ? 1 : 0;
+            dev->tx_ip_frag_mode = cfg.tx_ip_frag_mode ? 1U : 0U;
             ctrl_word = RTPS_CTRL_ENABLE |
                         ((cfg.num_writers & 0x07U) << RTPS_CTRL_NUM_WRITERS_SHIFT) |
                         (cfg.enable_peer_emu ? RTPS_CTRL_EMU_EN : 0U) |
                         (cfg.mode_pub_only ? RTPS_CTRL_PUB_ONLY : 0U) |
                         RTPS_CTRL_COMMIT_EDT |
-                        (dev->plugin_rx_rtps_mode ? RTPS_CTRL_PLUGIN_RX_RTPS_MODE : 0U);
+                        (dev->plugin_rx_rtps_mode ? RTPS_CTRL_PLUGIN_RX_RTPS_MODE : 0U) |
+                        (dev->tx_ip_frag_mode ? RTPS_CTRL_TX_IP_FRAG_MODE : 0U);
             iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
 
             /* Poll COMMIT_STATUS until active generation matches cfg.generation (Section 10) */
@@ -535,6 +541,7 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             diag.tx_virq                = dev->tx_virq;
             diag.rx_virq                = dev->rx_virq;
             diag.ip_virq                = dev->ip_virq;
+            diag.frag_size_bytes        = ioread32(dev->ip_regs + RTPS_IP_FRAG_SIZE_OFFSET);
 
             if (copy_to_user((void __user*)arg, &diag, sizeof(diag)))
                 return -EFAULT;
@@ -680,6 +687,12 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 
             ctrl_word = ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET);
             ctrl_word |= RTPS_CTRL_ENABLE | RTPS_CTRL_COMMIT_EDT;
+            if (dev->tx_ip_frag_mode)
+                ctrl_word |= RTPS_CTRL_TX_IP_FRAG_MODE;
+            else
+                ctrl_word &= ~RTPS_CTRL_TX_IP_FRAG_MODE;
+            iowrite32(dev->frag_size_bytes ? dev->frag_size_bytes : 1400U,
+                      dev->ip_regs + RTPS_IP_FRAG_SIZE_OFFSET);
             iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
 
             if (gen > 0) {
@@ -1641,6 +1654,8 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     /* Default to asynchronous decoupled Pub/Sub mode & Option B RTPS ingress */
     dmadev->mode_pub_only       = 1;
     dmadev->plugin_rx_rtps_mode = 1;
+    dmadev->tx_ip_frag_mode     = 0;
+    dmadev->frag_size_bytes     = 1400U;
     dmadev->bypass_crc          = 1;
     if (dmadev->ip_regs) {
         /* Default to physical wire enabled (RTPS_CTRL_EMU_EN = 0) so ARP and Ping work immediately */
@@ -1649,6 +1664,7 @@ static int axi_rtps_probe(struct platform_device* pdev) {
                            RTPS_CTRL_PUB_ONLY |
                            RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
         iowrite32(default_ctrl, dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
+        iowrite32(dmadev->frag_size_bytes, dmadev->ip_regs + RTPS_IP_FRAG_SIZE_OFFSET);
 
         /* Initialize Local Participant Identity: IP 192.168.1.10 and MAC 02:00:5E:10:00:01 */
         iowrite32(0xC0A8010AU,               dmadev->ip_regs + RTPS_IP_LOCAL_IP_OFFSET);

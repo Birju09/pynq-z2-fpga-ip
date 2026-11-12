@@ -91,6 +91,12 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--sim-peer") {
             sim_peer = true;
             cfg.enable_peer_emu = true;
+        } else if (arg == "--ip-frag") {
+            cfg.tx_ip_frag_mode = true;
+        } else if (arg == "--frag-size" && i + 1 < argc) {
+            cfg.frag_size_bytes = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--max-msg-size" && i + 1 < argc) {
+            cfg.max_message_size = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--no-rx") {
             enable_rx = false;
         } else if (arg == "--no-wait") {
@@ -108,11 +114,16 @@ int main(int argc, char* argv[]) {
                       << "  --peer-ip <IP>      Remote PC IP for unicast SPDP discovery & fallback\n"
                       << "  --peer-mac <MAC>    Remote peer MAC address override\n"
                       << "  --sim-peer          Enable PL internal peer emulator (loopback)\n"
+                      << "  --ip-frag           Use legacy IPv4 fragmentation instead of DATA_FRAG (0x16)\n"
+                      << "  --frag-size <B>     DATA_FRAG fragmentSize in bytes (default: derived 1400)\n"
+                      << "  --max-msg-size <B>  Fast DDS UDP maxMessageSize (default: 1468 -> 1400B frag)\n"
                       << "  --no-wait           Start immediately without waiting for discovery\n"
                       << "  --no-rx             Disable S2MM receiver thread\n";
             return 0;
         }
     }
+
+    fastdds_fpga::FpgaFastpathBridge bridge(cfg);
 
     std::cout << "=================================================================\n"
               << "  PYNQ-Z2 Fast DDS + Hardware Fastpath Publisher (Option 3)\n"
@@ -128,9 +139,11 @@ int main(int argc, char* argv[]) {
               << "  Publish Rate : " << target_rate_hz << " Hz\n"
               << "  Total Samples: " << total_samples << " (4,096 B / sample)\n"
               << "  Wire Mode    : " << (cfg.enable_peer_emu ? "Internal Peer Emulator" : "Physical RMII Wire") << "\n"
+              << "  TX Frag Mode : " << (cfg.tx_ip_frag_mode ? "Legacy IPv4 Fragmentation"
+                                                             : ("RTPS DATA_FRAG (0x16), fragmentSize=" +
+                                                                std::to_string(bridge.effective_frag_size_bytes()) + " B")) << "\n"
               << "=================================================================\n\n";
 
-    fastdds_fpga::FpgaFastpathBridge bridge(cfg);
     if (!bridge.init()) {
         std::cerr << "[-] Failed to initialize FPGA Fastpath Bridge\n";
         return 1;

@@ -71,6 +71,7 @@
 #define RTPS_IP_LAST_ICMP_ERR_DST_IP_OFFSET   0x1B4 /* Word 109: Offending IPv4 destination IP */
 #define RTPS_IP_LAST_ICMP_ERR_PORTS_OFFSET    0x1B8 /* Word 110: Offending UDP {src_port[15:0], dst_port[15:0]} */
 #define RTPS_IP_LAST_ICMP_ERR_IP_ID_OFFSET    0x1BC /* Word 111: {16'd0, offending IPv4 Identification} */
+#define RTPS_IP_FRAG_SIZE_OFFSET              0x1C0 /* Word 112: DATA_FRAG fragmentSize in bytes (default 1400) */
 
 /* =========================================================================
  * Option 1 Hardware RTPS Endpoint Lifecycle States (plan.txt Section 4)
@@ -102,6 +103,7 @@
 #define RTPS_CTRL_PLUGIN_RX_RTPS_MODE    (1U << 7) /* Option B: S2MM outputs full 4,156B RTPS message */
 #define RTPS_CTRL_PUB_ONLY               (1U << 8) /* Publish-only mode: do not wait for feedback */
 #define RTPS_CTRL_SUB_ONLY               (1U << 9) /* Subscribe-only mode: unsolicited wire RX from S_IDLE */
+#define RTPS_CTRL_TX_IP_FRAG_MODE        (1U << 10) /* 0 = DATA_FRAG default, 1 = Legacy IPv4 fragmentation */
 
 /* STATUS_ADDR (0x04) Bit Masks */
 #define RTPS_STATUS_ACK_IRQ              (1U << 0) /* Write Bit 0: Acknowledge Level-High IRQ */
@@ -291,7 +293,9 @@ struct rtps_endpoint_cfg {
     __u8  writer_context_valid; /* 1 = writer route context valid */
     __u8  enable_peer_emu;      /* 0 = Physical Wire (LAN8720), 1 = Internal Peer Emulator */
     __u8  mode_pub_only;        /* 1 = True Asynchronous Publish-Only mode (fire & forget, no wait for feedback) */
-    __u8  reserved_pad[2];      /* 32-bit alignment padding */
+    __u8  tx_ip_frag_mode;      /* 0 = DATA_FRAG default (sub-MTU emits DATA), 1 = Legacy IPv4 fragmentation */
+    __u8  reserved_pad;         /* 32-bit alignment padding */
+    __u32 frag_size_bytes;      /* TX DATA_FRAG fragmentSize in bytes (0 = default 1400, valid 4..1404) */
     __u32 generation;           /* Endpoint configuration generation */
     __u32 type_profile;         /* Type profile / strict payload contract */
     __u32 payload_words;        /* Sample payload words (1024 = 4,096 B) */
@@ -370,6 +374,7 @@ struct rtps_cycle_diag {
     __s32 tx_virq;
     __s32 rx_virq;
     __s32 ip_virq;
+    __u32 frag_size_bytes;
 };
 
 /* IOCTL Definitions */

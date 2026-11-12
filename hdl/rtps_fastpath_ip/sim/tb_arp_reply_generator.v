@@ -950,6 +950,40 @@ module tb_arp_reply_generator;
 
         m_rtps_tx_tready = 1'b1; // Restore ready
         repeat (10) @(posedge clk);
+
+        // ---------------------------------------------------------------------
+        // TEST 14: Verify Hardcoded 192.168.1.10 Is NOT Answered When Unconfigured
+        // ---------------------------------------------------------------------
+        $display("\n--- TEST 14: Reject Unconfigured 192.168.1.10 ARP When arp_reply_ip Changed ---");
+        arp_reply_ip    = 32'hC0A801CA; // 192.168.1.202
+        captured_tx_cnt = 0;
+        send_wire_frame(
+            15,
+            32'hFFFF_FFFF,
+            32'hFFFF_000C,
+            32'h29AB_CDEF,
+            32'h0806_0001,
+            32'h0800_0604,
+            32'h0001_000C,
+            32'h29AB_CDEF,
+            32'hC0A8_0164,
+            32'h0000_0000,
+            32'h0000_C0A8,
+            32'h010A_0000, // 192.168.1.10 (no longer hardcoded)
+            32'h0000_0000,
+            32'h0000_0000,
+            32'h0000_0000,
+            32'h0000_0000
+        );
+        repeat (20) @(posedge clk);
+        if (captured_tx_cnt === 0) begin
+            $display("[+] PASS: ARP request for 192.168.1.10 ignored when arp_reply_ip=192.168.1.202!");
+        end else begin
+            $display("[-] FAIL: Unexpected ARP reply for 192.168.1.10! cnt=%0d", captured_tx_cnt);
+            errors = errors + 1;
+        end
+        arp_reply_ip = 32'hC0A8010A;
+
         $display("\n=================================================================");
         if (errors === 0) begin
             $display("[+] ALL TESTS PASSED! ARP_REPLY_GENERATOR IS 100%% VERIFIED!");

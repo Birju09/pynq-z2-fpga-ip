@@ -5,22 +5,18 @@
 //
 // Description:
 //   Cycle-Accurate In-FPGA RTI Connext DDS / RTPS Peer Participant Emulator.
-//   Processes fragmented Ethernet/IPv4/UDP/RTPS frames from the RTPS Fast-Path
-//   IP over AXI4-Stream:
-//     - Reassembles incoming IPv4 fragments by (FragOffset * 8) into a 6 KB
-//       UDP datagram buffer and verifies the IPv4 header checksums.
-//     - Parses the RTPS v2.x message header ('RTPS'), INFO_TS submessage, and
-//       DATA (0x15) submessage, extracting the 64-bit writer SequenceNumber
-//       and XCDR1 CDR_LE (0x0001) FastSample payload (default 4,096 bytes).
-//     - Transforms the payload deterministically (preserving Word 0..3 header:
-//       cycle_id, flags, tx_timestamp_ns; transforming data[0..1019] via
-//       (~word) + {16'h0000, seq_num[5:0], 10'h200}) to emulate an RTI C++
-//       Feedback subscriber/publisher echo node.
-//     - Emits 3 IPv4-fragmented Ethernet/IPv4/UDP/RTPS Feedback frames back to
-//       the Master RX engine with full IPv4 & UDP 1's complement checksums.
+//   Supports both RTPS DATA_FRAG (0x16) and IPv4-fragmented / single DATA (0x15)
+//   over AXI4-Stream:
+//     - RX accepts either IPv4-fragmented frames (MF=1 / FragOffset>0) or
+//       unfragmented UDP/RTPS frames carrying DATA (0x15) or DATA_FRAG (0x16).
+//     - Transforms FastSample payload deterministically (preserving Word 0..3
+//       header: cycle_id, flags, tx_timestamp_ns; transforming data[0..1019] via
+//       (~word) + {16'h0000, seq_num[5:0], 10'h200}).
+//     - TX emits DATA_FRAG (0x16) frames by default (or DATA if <= cfg_frag_size),
+//       or 3 IPv4-fragmented DATA (0x15) frames when tx_ip_frag_mode == 1.
 //     - Supports hardware fault injection via fault_ctrl:
 //         Bit [0]: Drop Fragment #1 (simulates packet loss / incomplete reassembly)
-//         Bit [1]: Swap Fragment #0 and Fragment #1 order (out-of-order reassembly test)
+//         Bit [1]: Swap Fragment #0 and Fragment #1 order (out-of-order test)
 //         Bit [2]: Corrupt UDP checksum on outgoing Feedback datagram
 //         Bit [3]: Emit stale / duplicate SequenceNumber (seqNum does not advance)
 // =============================================================================
@@ -32,8 +28,10 @@ module rtps_peer_emulator #(
     input  wire                   clk,
     input  wire                   rst_n,
 
-    // Fault-injection & peer identity configuration from CSRs
+    // Fault-injection, mode & peer identity configuration from CSRs
     input  wire [31:0]            fault_ctrl,
+    input  wire                   tx_ip_frag_mode,
+    input  wire [15:0]            cfg_frag_size,
     input  wire [95:0]            peer_guid_prefix,
     input  wire [31:0]            peer_writer_id,
     input  wire [31:0]            peer_reader_id,
@@ -52,7 +50,7 @@ module rtps_peer_emulator #(
 );
 
     // =========================================================================
-    // 1's Complement 16-bit Adder Helper for IPv4 & UDP Checksums
+    // 1's Complement 16-bit Adder Helpers for IPv4 & UDP Checksums
     // =========================================================================
     function [15:0] csum_add32;
         input [15:0] sum_in;
@@ -66,69 +64,78 @@ module rtps_peer_emulator #(
         end
     endfunction
 
-    function [15:0] csum_add16;
-        input [15:0] sum_in;
-        input [15:0] half_in;
-        reg   [16:0] tmp;
-        begin
-            tmp = {1'b0, sum_in} + {1'b0, half_in};
-            csum_add16 = tmp[15:0] + {15'd0, tmp[16]};
-        end
-    endfunction
-
     // =========================================================================
     // Emulator FSM States
     // =========================================================================
     localparam [2:0]
-        E_RX_FRAMES   = 3'd0, // Receive & reassemble incoming IPv4 fragments
-        E_BUILD_DGRAM = 3'd1, // Build complete outgoing UDP+RTPS Feedback datagram in tx_dgram_ram
-        E_TX_INIT     = 3'd2, // Setup current IPv4 fragment parameters & header checksum
-        E_TX_STREAM   = 3'd3; // Stream Ethernet + IPv4 + fragment payload over m_axis
+        E_RX_FRAMES    = 3'd0, // Receive incoming Ethernet/IPv4/UDP/RTPS frame
+        E_RX_PKT_STAGE = 3'd1, // Copy/reassemble unfragmented DATA / DATA_FRAG from rx_pkt_ram
+        E_BUILD_DGRAM  = 3'd2, // Transform FastSample payload into tx_sample_ram
+        E_TX_INIT      = 3'd3, // Compute per-packet/datagram UDP checksum & fragment params
+        E_TX_STREAM    = 3'd4; // Stream Ethernet + IPv4 + UDP/RTPS over m_axis
 
     reg [2:0] state;
 
-    // Reassembly buffer for incoming UDP datagram (Port A write, read during E_BUILD_DGRAM)
-    (* ram_style = "block" *) reg [31:0] rx_dgram_ram [0:MAX_DGRAM_W-1];
-    // Outgoing UDP datagram buffer (includes 8B UDP hdr + 56B RTPS hdrs + 4B encap + 4096B payload = 4164B = 1041 words)
-    (* ram_style = "block" *) reg [31:0] tx_dgram_ram [0:MAX_DGRAM_W-1];
+    // Reassembly buffer for incoming sample:
+    //   Words 8..9  = INFO_TS timestamp
+    //   Word 16     = CDR_LE (0x0001_0000)
+    //   Words 17..  = FastSample payload
+    (* ram_style = "block" *) reg [31:0] rx_dgram_ram  [0:MAX_DGRAM_W-1];
+    // 1-packet staging RAM for unfragmented UDP/RTPS frames (up to 512 words = 2 KB)
+    (* ram_style = "block" *) reg [31:0] rx_pkt_ram    [0:511];
+    // Transformed FastSample payload words (0 .. payload_words_cfg-1)
+    (* ram_style = "block" *) reg [31:0] tx_sample_ram [0:MAX_DGRAM_W-1];
 
     // =========================================================================
-    // RX Fragment Parser Registers
+    // RX Fragment & Packet Parser Registers
     // =========================================================================
     reg [11:0] rx_beat_idx;
     reg [31:0] latched_src_ip;
     reg [31:0] latched_dst_ip;
     reg [15:0] latched_src_port;
     reg [15:0] latched_dst_port;
-    reg [15:0] cur_ip_len;       // IPv4 Total Length in bytes
+    reg [15:0] cur_ip_len;
     reg [15:0] cur_ip_id;
-    reg [15:0] cur_flags_frag;   // [15:13]=flags (bit 13 = MF), [12:0]=frag_offset_8B
+    reg [15:0] cur_flags_frag;
+    reg        cur_is_ip_frag;
     reg [15:0] rx_accum_bytes;
     reg [15:0] rx_expected_bytes;
     reg        rx_saw_last_frag;
 
-    // Unaligned 16-bit Ethernet header (14 bytes = 3.5 words) staging register
-    // Frame format on 32-bit stream (Big-Endian network order per word):
-    //   Beat 0: DstMAC[47:16]
-    //   Beat 1: {DstMAC[15:0], SrcMAC[47:32]}
-    //   Beat 2: SrcMAC[31:0]
-    //   Beat 3: {EtherType(16'h0800), IPv4_VerIHL_TOS(16'h4500)}
-    //   Beat 4: {IPv4_TotalLen[15:0], IPv4_ID[15:0]}
-    //   Beat 5: {IPv4_FlagsFrag[15:0], IPv4_TTL_Proto(16'h4011)}
-    //   Beat 6: {IPv4_HdrCsum[15:0], SrcIP[31:16]}
-    //   Beat 7: {SrcIP[15:0], DstIP[31:16]}
-    //   Beat 8: {DstIP[15:0], IP_Payload_Half0[15:0]}
-    //   Beat k (k>=9): {IP_Payload_Half(2k-17)[15:0], IP_Payload_Half(2k-16)[15:0]}
     reg [15:0] rx_prev_half;
     reg [11:0] rx_dgram_wr_ptr;
+    reg [9:0]  rx_pkt_wr_ptr;
 
     wire [12:0] frag_offset_8b  = cur_flags_frag[12:0];
     wire        frag_mf         = cur_flags_frag[13];
     wire [15:0] ip_payload_len  = cur_ip_len - 16'd20;
-    wire [11:0] frag_word_start = {frag_offset_8b[10:0], 1'b0}; // offset * 8 bytes = offset * 2 words
+    wire [11:0] frag_word_start = {frag_offset_8b[10:0], 1'b0};
 
     assign s_axis_tready = (state == E_RX_FRAMES);
     wire   rx_fire       = s_axis_tvalid && s_axis_tready;
+
+    // Staging copy & DATA_FRAG reassembly state
+    reg [2:0]  pkt_substate;
+    reg [9:0]  pkt_rd_addr;
+    reg [31:0] pkt_ram_dout;
+    reg [7:0]  pkt_submsg_id;
+    reg [31:0] pkt_df_frag_start;
+    reg [15:0] pkt_df_frag_size;
+    reg [31:0] pkt_df_sample_size;
+    reg [63:0] pkt_df_seq_num;
+    reg [63:0] active_df_seq;
+    reg        active_df_valid;
+    reg [31:0] active_df_bitmap;
+    reg [5:0]  active_df_total_frags;
+    reg [15:0] df_rem_calc;
+    reg [5:0]  df_tot_cnt;
+    reg [11:0] copy_src_idx;
+    reg [11:0] copy_dst_idx;
+    reg [11:0] copy_end_idx;
+
+    always @(posedge clk) begin
+        pkt_ram_dout <= rx_pkt_ram[pkt_rd_addr];
+    end
 
     // =========================================================================
     // Outgoing Feedback State & Fragment Sequencer
@@ -136,99 +143,188 @@ module rtps_peer_emulator #(
     reg [63:0] peer_seq_num;
     reg [15:0] peer_ip_id;
     reg [11:0] build_idx;
-    reg [15:0] udp_csum_accum;
-    reg [11:0] total_dgram_words; // e.g. 1041 words (4164 bytes)
+    reg        build_prime;
     reg [15:0] payload_words_cfg; // e.g. 1024 words (4096 bytes)
+    reg [31:0] echo_ts_0;
+    reg [31:0] echo_ts_1;
 
-    reg [1:0]  frag_step;         // 0, 1, 2 (3 fragments)
-    reg [1:0]  active_frag_idx;   // Actual fragment index (swapped when fault_ctrl[1]=1)
-    reg [11:0] cur_frag_word_off; // Start word in tx_dgram_ram
-    reg [11:0] cur_frag_words;    // Number of 32-bit words in this fragment (370, 370, 301)
-    reg [15:0] cur_frag_ip_len;   // 20 + cur_frag_words*4
-    reg [15:0] cur_frag_flags;    // {2'b00, mf_bit, frag_offset_8b[12:0]}
-    reg [15:0] cur_frag_hdr_csum;
-
-    reg [11:0] tx_beat_idx;
-    reg [15:0] tx_prev_half;
-    reg [31:0] rx_ram_dout;
     reg [11:0] rx_ram_rd_addr;
-    reg [11:0] tx_ram_rd_addr;
-
-    // Pipelined checksum accumulator registers (breaks BRAM read + transform + csum timing path)
-    reg [31:0] build_word_pipe;
-    reg [11:0] csum_pipe_idx;
-    reg        build_pipe_valid;
-
-    // Single-write-port tx_dgram_ram (BRAM inference): the final UDP checksum is
-    // held in udp_csum_final and muxed onto Word 1 at the BRAM output instead of
-    // patching the RAM with a second write port (which forced ~49k FF inference).
-    reg [31:0] tx_ram_q;
-    reg        tx_rd_is_w1;
-    reg [15:0] udp_csum_final;
-    wire [31:0] tx_ram_dout = tx_rd_is_w1 ? {tx_ram_q[31:16], udp_csum_final} : tx_ram_q;
+    reg [31:0] rx_ram_dout;
+    reg [11:0] tx_sample_rd_addr;
+    reg [31:0] tx_sample_dout;
 
     always @(posedge clk) begin
         rx_ram_dout <= rx_dgram_ram[rx_ram_rd_addr];
-        tx_ram_q    <= tx_dgram_ram[tx_ram_rd_addr];
-        tx_rd_is_w1 <= (tx_ram_rd_addr == 12'd1);
     end
 
-    // Extracted fields from rx_dgram_ram during E_BUILD_DGRAM:
-    // Word 0: {SrcPort[15:0], DstPort[15:0]}
-    // Word 1: {UDP_Len[15:0], UDP_Csum[15:0]}
-    // Word 2: "RTPS" (32'h5254_5053)
-    // Word 3: {ProtoVer(16'h0201), VendorId(16'h0110)}
-    // Word 4..6: GuidPrefix[95:0]
-    // Word 7: {SubmsgId_INFO_TS(8'h09), Flags(8'h01), OctetsToNext(16'h0800)}
-    // Word 8..9: Timestamp[63:0]
-    // Word 10: {SubmsgId_DATA(8'h15), Flags(8'h05), OctetsToNext[15:0]}
-    // Word 11: {ExtraFlags(16'h0000), OctetsToInlineQos(16'h1000)}
-    // Word 12: ReaderEntityId[31:0]
-    // Word 13: WriterEntityId[31:0]
-    // Word 14: SeqNum_Hi[31:0] (LE)
-    // Word 15: SeqNum_Lo[31:0] (LE)
-    // Word 16: Encapsulation (32'h0001_0000 = CDR_LE)
-    // Word 17 .. 17+1023: FastSample payload (1024 words = 4096 bytes)
+    // Effective TX fragment size (4B-aligned, 4..1404 bytes)
+    wire [15:0] eff_frag_bytes = (cfg_frag_size < 16'd4)    ? 16'd4 :
+                                 (cfg_frag_size > 16'd1404) ? 16'd1404 :
+                                 {cfg_frag_size[15:2], 2'b00};
 
-    wire [15:0] udp_total_bytes = {2'b00, total_dgram_words, 2'b00};
-    wire [15:0] data_octets_le  = {2'b00, payload_words_cfg[11:0], 2'b00} + 16'd24; // 20B DATA hdr after octetsToNext + 4B encap + payload
-    wire [15:0] data_octets_wire = {data_octets_le[7:0], data_octets_le[15:8]};      // Little-endian on wire
+    wire [15:0] sample_total_bytes = {2'b00, payload_words_cfg[11:0], 2'b00} + 16'd4; // CDR_LE (4B) + payload
+    wire        use_single_data    = (!tx_ip_frag_mode) && (sample_total_bytes <= eff_frag_bytes);
+    wire        use_data_frag      = (!tx_ip_frag_mode) && (sample_total_bytes > eff_frag_bytes);
 
-    // Combinational word generator for E_BUILD_DGRAM
-    reg [31:0] build_word;
+    reg [15:0] total_frags_tx;
+    reg [15:0] frag_step;
+    reg [15:0] active_frag_idx;
+    reg [15:0] tx_bytes_remaining;
+    reg [15:0] tx_frag_offset_bytes;
+    reg [15:0] cur_frag_ser_bytes;
+    reg [11:0] cur_frag_ser_words;
+    reg [11:0] cur_frag_bram_base;
+    reg [11:0] cur_frag_bram_words;
+    reg [11:0] cur_frag_words;     // UDP+RTPS words in current IPv4 packet
+    reg [15:0] cur_frag_ip_len;
+    reg [15:0] cur_frag_flags;
+    reg [15:0] cur_frag_hdr_csum;
+    reg [15:0] cur_udp_len_bytes;
+    reg [15:0] udp_csum_final;
+
+    // TX Init UDP Checksum Scan
+    reg [1:0]  tx_init_phase;
+    reg [11:0] scan_cnt;
+    reg [15:0] scan_csum_accum;
+    reg [2:0]  csum_pipe_cnt;
+    reg [15:0] tx_frag_csum_seed;
+
+    reg [11:0] tx_dgram_word_idx;
+    reg [11:0] tx_beat_idx;
+    reg [15:0] tx_prev_half;
+
+    wire tx_beat_load = (state == E_TX_STREAM) && (!m_axis_tvalid || m_axis_tready);
+    always @(posedge clk) begin
+        if (state != E_TX_STREAM || tx_beat_load) begin
+            tx_sample_dout <= tx_sample_ram[tx_sample_rd_addr];
+        end
+    end
+
+    // Header field helpers for TX UDP/RTPS Mux
+    wire [15:0] ipfrag_total_dgram_words = payload_words_cfg[11:0] + 12'd17;
+    wire [15:0] ipfrag_udp_total_bytes   = {2'b00, ipfrag_total_dgram_words[11:0], 2'b00};
+    wire [15:0] data_octets_le           = {2'b00, payload_words_cfg[11:0], 2'b00} + 16'd24;
+    wire [15:0] data_octets_wire         = {data_octets_le[7:0], data_octets_le[15:8]};
+
+    wire [15:0] df_octets_le             = cur_frag_ser_bytes + 16'd32;
+    wire [15:0] df_octets_wire           = {df_octets_le[7:0], df_octets_le[15:8]};
+    wire [31:0] df_frag_start_num        = {16'd0, active_frag_idx} + 32'd1;
+    wire [31:0] df_frag_start_wire       = {df_frag_start_num[7:0], df_frag_start_num[15:8],
+                                            df_frag_start_num[23:16], df_frag_start_num[31:24]};
+    wire [15:0] df_frag_size_wire        = {eff_frag_bytes[7:0], eff_frag_bytes[15:8]};
+    wire [31:0] df_sample_size_wire      = {sample_total_bytes[7:0], sample_total_bytes[15:8], 16'h0000};
+
+    // Combinational UDP/RTPS Datagram Word Mux
+    reg [31:0] cur_dgram_word;
     always @(*) begin
-        case (build_idx)
-            12'd0:  build_word = {latched_dst_port, latched_src_port}; // Swap UDP ports for reply
-            12'd1:  build_word = {udp_total_bytes, 16'h0000};          // UDP checksum filled at end of build
-            12'd2:  build_word = 32'h5254_5053;                        // "RTPS"
-            12'd3:  build_word = 32'h0203_0101;                        // RTPS v2.3, VendorId = 0x0101 (RTI Connext)
-            12'd4:  build_word = peer_guid_prefix[95:64];
-            12'd5:  build_word = peer_guid_prefix[63:32];
-            12'd6:  build_word = peer_guid_prefix[31:0];
-            12'd7:  build_word = 32'h0901_0800;                        // INFO_TS (0x09), E=1, len=8 (LE: 0x0800)
-            12'd8:  build_word = rx_ram_dout;                          // Echo INFO_TS sec
-            12'd9:  build_word = rx_ram_dout;                          // Echo INFO_TS frac
-            12'd10: build_word = {8'h15, 8'h05, data_octets_wire};     // DATA (0x15), flags=0x05 (D=1,Q=0,E=1)
-            12'd11: build_word = 32'h0000_1000;                        // extraFlags=0, octetsToInlineQos=16 (LE: 0x1000)
-            12'd12: build_word = peer_reader_id;                       // Target Reader EntityId (or UNKNOWN)
-            12'd13: build_word = peer_writer_id;                       // RTI Feedback Writer EntityId
-            12'd14: build_word = {peer_seq_num[39:32], peer_seq_num[47:40], peer_seq_num[55:48], peer_seq_num[63:56]}; // SeqNum Hi (LE)
-            12'd15: build_word = {peer_seq_num[7:0],   peer_seq_num[15:8],  peer_seq_num[23:16], peer_seq_num[31:24]}; // SeqNum Lo (LE)
-            12'd16: build_word = 32'h0001_0000;                        // CDR_LE encapsulation (0x0001, options 0x0000)
-            default: begin
-                // Words 17..20: FastSample 16-byte header (cycle_id, flags, tx_timestamp_ns) echoed intact!
-                if (build_idx >= 12'd17 && build_idx <= 12'd20) begin
-                    build_word = rx_ram_dout;
-                end else begin
-                    // Words 21..1040: Transform payload words deterministically
-                    build_word = (~rx_ram_dout) + {16'h0000, peer_seq_num[5:0], 10'h200};
-                end
-            end
-        endcase
+        if (use_data_frag) begin
+            case (tx_dgram_word_idx)
+                12'd0:  cur_dgram_word = {latched_dst_port, latched_src_port};
+                12'd1:  cur_dgram_word = {cur_udp_len_bytes, udp_csum_final};
+                12'd2:  cur_dgram_word = 32'h5254_5053;
+                12'd3:  cur_dgram_word = 32'h0203_0101;
+                12'd4:  cur_dgram_word = peer_guid_prefix[95:64];
+                12'd5:  cur_dgram_word = peer_guid_prefix[63:32];
+                12'd6:  cur_dgram_word = peer_guid_prefix[31:0];
+                12'd7:  cur_dgram_word = 32'h0901_0800;
+                12'd8:  cur_dgram_word = echo_ts_0;
+                12'd9:  cur_dgram_word = echo_ts_1;
+                12'd10: cur_dgram_word = {8'h16, 8'h01, df_octets_wire};
+                12'd11: cur_dgram_word = 32'h0000_1C00; // extraFlags=0, octetsToInlineQos=28
+                12'd12: cur_dgram_word = peer_reader_id;
+                12'd13: cur_dgram_word = peer_writer_id;
+                12'd14: cur_dgram_word = {peer_seq_num[39:32], peer_seq_num[47:40], peer_seq_num[55:48], peer_seq_num[63:56]};
+                12'd15: cur_dgram_word = {peer_seq_num[7:0],   peer_seq_num[15:8],  peer_seq_num[23:16], peer_seq_num[31:24]};
+                12'd16: cur_dgram_word = df_frag_start_wire;
+                12'd17: cur_dgram_word = {16'h0100, df_frag_size_wire}; // fragmentsInSubmessage=1 (LE), fragmentSize (LE)
+                12'd18: cur_dgram_word = df_sample_size_wire;
+                12'd19: cur_dgram_word = (active_frag_idx == 16'd0) ? 32'h0001_0000 : bswap32(tx_sample_dout);
+                default: cur_dgram_word = bswap32(tx_sample_dout);
+            endcase
+        end else begin
+            case (tx_dgram_word_idx)
+                12'd0:  cur_dgram_word = {latched_dst_port, latched_src_port};
+                12'd1:  cur_dgram_word = {cur_udp_len_bytes, udp_csum_final};
+                12'd2:  cur_dgram_word = 32'h5254_5053;
+                12'd3:  cur_dgram_word = 32'h0203_0101;
+                12'd4:  cur_dgram_word = peer_guid_prefix[95:64];
+                12'd5:  cur_dgram_word = peer_guid_prefix[63:32];
+                12'd6:  cur_dgram_word = peer_guid_prefix[31:0];
+                12'd7:  cur_dgram_word = 32'h0901_0800;
+                12'd8:  cur_dgram_word = echo_ts_0;
+                12'd9:  cur_dgram_word = echo_ts_1;
+                12'd10: cur_dgram_word = {8'h15, 8'h05, data_octets_wire};
+                12'd11: cur_dgram_word = 32'h0000_1000;
+                12'd12: cur_dgram_word = peer_reader_id;
+                12'd13: cur_dgram_word = peer_writer_id;
+                12'd14: cur_dgram_word = {peer_seq_num[39:32], peer_seq_num[47:40], peer_seq_num[55:48], peer_seq_num[63:56]};
+                12'd15: cur_dgram_word = {peer_seq_num[7:0],   peer_seq_num[15:8],  peer_seq_num[23:16], peer_seq_num[31:24]};
+                12'd16: cur_dgram_word = 32'h0001_0000;
+                default: cur_dgram_word = bswap32(tx_sample_dout);
+            endcase
+        end
     end
 
-    // Pipelined IPv4 header checksum engine for emulator fragment transmission
-    // Computed in 2 stages (adder tree + fold) during Beat 0 and 1, latched on Beat 3
+    // Pipelined UDP Checksum Engine for TX (runs during E_TX_INIT phase 3)
+    reg [23:0] emu_ucs_tree0, emu_ucs_tree1, emu_ucs_tree2;
+    reg [15:0] emu_ucs_fold;
+
+    wire [23:0] emu_ucs_stg0 = {8'd0, tx_frag_csum_seed} +
+                               {8'd0, latched_dst_ip[31:16]} + {8'd0, latched_dst_ip[15:0]} +
+                               {8'd0, latched_src_ip[31:16]} + {8'd0, latched_src_ip[15:0]} +
+                               {8'd0, 16'h0011}              + {8'd0, cur_udp_len_bytes} +
+                               {8'd0, latched_dst_port}      + {8'd0, latched_src_port};
+
+    wire [23:0] emu_ucs_stg1 = emu_ucs_tree0 +
+                               {8'd0, cur_udp_len_bytes} +
+                               {8'd0, 16'h5254} + {8'd0, 16'h5053} +
+                               {8'd0, 16'h0203} + {8'd0, 16'h0101} +
+                               {8'd0, peer_guid_prefix[95:80]} + {8'd0, peer_guid_prefix[79:64]} +
+                               {8'd0, peer_guid_prefix[63:48]} + {8'd0, peer_guid_prefix[47:32]} +
+                               {8'd0, peer_guid_prefix[31:16]} + {8'd0, peer_guid_prefix[15:0]};
+
+    wire [23:0] emu_ucs_submsg_sum = use_data_frag ?
+        ({8'd0, 16'h1601} + {8'd0, df_octets_wire} + {8'd0, 16'h1C00} +
+         {8'd0, df_frag_start_wire[31:16]} + {8'd0, df_frag_start_wire[15:0]} +
+         {8'd0, 16'h0100} + {8'd0, df_frag_size_wire} +
+         {8'd0, df_sample_size_wire[31:16]} + {8'd0, df_sample_size_wire[15:0]}) :
+        ({8'd0, 16'h1505} + {8'd0, data_octets_wire} + {8'd0, 16'h1000} +
+         {8'd0, 16'h0001});
+
+    reg [23:0] emu_ucs_pre;
+    wire [23:0] emu_ucs_pre_sum = {8'd0, 16'h0901} + {8'd0, 16'h0800} +
+                                  {8'd0, echo_ts_0[31:16]} + {8'd0, echo_ts_0[15:0]} +
+                                  {8'd0, echo_ts_1[31:16]} + {8'd0, echo_ts_1[15:0]} +
+                                  {8'd0, peer_reader_id[31:16]} + {8'd0, peer_reader_id[15:0]} +
+                                  {8'd0, peer_writer_id[31:16]} + {8'd0, peer_writer_id[15:0]} +
+                                  {8'd0, peer_seq_num[39:32], peer_seq_num[47:40]} +
+                                  {8'd0, peer_seq_num[55:48], peer_seq_num[63:56]} +
+                                  {8'd0, peer_seq_num[7:0],   peer_seq_num[15:8]}  +
+                                  {8'd0, peer_seq_num[23:16], peer_seq_num[31:24]} +
+                                  emu_ucs_submsg_sum;
+
+    wire [23:0] emu_ucs_stg2  = emu_ucs_tree1 + emu_ucs_pre;
+    wire [19:0] emu_ucs_f1    = {4'd0, emu_ucs_tree2[15:0]} + {12'd0, emu_ucs_tree2[23:16]};
+    wire [16:0] emu_ucs_f2    = {1'b0, emu_ucs_f1[15:0]} + {13'd0, emu_ucs_f1[19:16]};
+    wire [15:0] emu_ucs_f3    = emu_ucs_f2[15:0] + {15'd0, emu_ucs_f2[16]};
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            emu_ucs_tree0 <= 24'd0;
+            emu_ucs_tree1 <= 24'd0;
+            emu_ucs_tree2 <= 24'd0;
+            emu_ucs_pre   <= 24'd0;
+            emu_ucs_fold  <= 16'd0;
+        end else begin
+            emu_ucs_tree0 <= emu_ucs_stg0;
+            emu_ucs_tree1 <= emu_ucs_stg1;
+            emu_ucs_pre   <= emu_ucs_pre_sum;
+            emu_ucs_tree2 <= emu_ucs_stg2;
+            emu_ucs_fold  <= emu_ucs_f3;
+        end
+    end
+
+    // Pipelined IPv4 header checksum engine
     reg [19:0] emu_ipcs_stg0;
     reg [15:0] emu_ipcs_stg1;
     wire [16:0] emu_ipcs_fold1 = {1'b0, emu_ipcs_stg0[15:0]} + {13'd0, emu_ipcs_stg0[19:16]};
@@ -247,96 +343,121 @@ module rtps_peer_emulator #(
         end
     end
 
-    // Pipelined Pseudo-Header Checksum Seed:
-    // Pre-computed continuously in 2 stages so build_idx == 0 only performs
-    // a single 16-bit csum_add32 instead of an unpipelined adder tree.
-    reg [19:0] pseudo_sum20_reg;
-    reg [15:0] emu_pseudo_seed;
-    wire [16:0] pseudo_fold       = {1'b0, pseudo_sum20_reg[15:0]} + {13'd0, pseudo_sum20_reg[19:16]};
-    wire [15:0] pseudo_fold_final = pseudo_fold[15:0] + {15'd0, pseudo_fold[16]};
-
-    always @(posedge clk) begin
-        if (!rst_n) begin
-            pseudo_sum20_reg <= 20'd0;
-            emu_pseudo_seed  <= 16'd0;
-        end else begin
-            pseudo_sum20_reg <= {4'd0, latched_dst_ip[31:16]} + {4'd0, latched_dst_ip[15:0]} +
-                                {4'd0, latched_src_ip[31:16]} + {4'd0, latched_src_ip[15:0]} +
-                                {4'd0, 16'h0011}             + {4'd0, udp_total_bytes};
-            emu_pseudo_seed  <= pseudo_fold_final;
-        end
-    end
-
     // Outgoing Ethernet + IPv4 + Fragment word mux
     reg [31:0] tx_wire_word;
     always @(*) begin
         case (tx_beat_idx)
-            12'd0: tx_wire_word = 32'h0200_5E10; // DstMAC[47:16] (Master MAC)
-            12'd1: tx_wire_word = 32'h0001_0200; // {DstMAC[15:0], SrcMAC[47:32]}
-            12'd2: tx_wire_word = 32'h5E20_0002; // SrcMAC[31:0] (RTI Peer MAC)
-            12'd3: tx_wire_word = 32'h0800_4500; // EtherType IPv4 (0x0800), Ver/IHL/TOS (0x4500)
+            12'd0: tx_wire_word = 32'h0200_5E10;
+            12'd1: tx_wire_word = 32'h0001_0200;
+            12'd2: tx_wire_word = 32'h5E20_0002;
+            12'd3: tx_wire_word = 32'h0800_4500;
             12'd4: tx_wire_word = {cur_frag_ip_len, peer_ip_id};
-            12'd5: tx_wire_word = {cur_frag_flags, 16'h4011}; // TTL=64, Proto=UDP(0x11)
+            12'd5: tx_wire_word = {cur_frag_flags, 16'h4011};
             12'd6: tx_wire_word = {cur_frag_hdr_csum, latched_dst_ip[31:16]};
             12'd7: tx_wire_word = {latched_dst_ip[15:0], latched_src_ip[31:16]};
-            12'd8: tx_wire_word = {latched_src_ip[15:0], tx_ram_dout[31:16]};
+            12'd8: tx_wire_word = {latched_src_ip[15:0], cur_dgram_word[31:16]};
             default: begin
-                // Last beat (tx_beat_idx == 8 + cur_frag_words) carries {tx_prev_half, 16'h0000}
                 if (tx_beat_idx == (12'd8 + cur_frag_words))
                     tx_wire_word = {tx_prev_half, 16'h0000};
                 else
-                    tx_wire_word = {tx_prev_half, tx_ram_dout[31:16]};
+                    tx_wire_word = {tx_prev_half, cur_dgram_word[31:16]};
             end
         endcase
     end
 
+    // Helper: endian-swap 16/32
+    function [15:0] bswap16;
+        input [15:0] v;
+        begin
+            bswap16 = {v[7:0], v[15:8]};
+        end
+    endfunction
+
+    function [31:0] bswap32;
+        input [31:0] v;
+        begin
+            bswap32 = {v[7:0], v[15:8], v[23:16], v[31:24]};
+        end
+    endfunction
+
     always @(posedge clk) begin
         if (!rst_n) begin
-            state             <= E_RX_FRAMES;
-            rx_beat_idx       <= 12'd0;
-            latched_src_ip    <= 32'hC0A8_01C9; // 192.168.1.201
-            latched_dst_ip    <= 32'hC0A8_0164; // 192.168.1.100
-            latched_src_port  <= 16'd7410;
-            latched_dst_port  <= 16'd7411;
-            cur_ip_len        <= 16'd0;
-            cur_ip_id         <= 16'd0;
-            cur_flags_frag    <= 16'd0;
-            rx_accum_bytes    <= 16'd0;
-            rx_expected_bytes <= 16'd0;
-            rx_saw_last_frag  <= 1'b0;
-            rx_prev_half      <= 16'd0;
-            rx_dgram_wr_ptr   <= 12'd0;
+            state                 <= E_RX_FRAMES;
+            rx_beat_idx           <= 12'd0;
+            latched_src_ip        <= 32'hC0A8_01C9;
+            latched_dst_ip        <= 32'hC0A8_0164;
+            latched_src_port      <= 16'd7410;
+            latched_dst_port      <= 16'd7411;
+            cur_ip_len            <= 16'd0;
+            cur_ip_id             <= 16'd0;
+            cur_flags_frag        <= 16'd0;
+            cur_is_ip_frag        <= 1'b0;
+            rx_accum_bytes        <= 16'd0;
+            rx_expected_bytes     <= 16'd0;
+            rx_saw_last_frag      <= 1'b0;
+            rx_prev_half          <= 16'd0;
+            rx_dgram_wr_ptr       <= 12'd0;
+            rx_pkt_wr_ptr         <= 10'd0;
 
-            peer_seq_num      <= 64'd0;
-            peer_ip_id        <= 16'hA000;
-            build_idx         <= 12'd0;
-            csum_pipe_idx     <= 12'd0;
-            build_pipe_valid  <= 1'b0;
-            build_word_pipe   <= 32'd0;
-            udp_csum_accum    <= 16'd0;
-            total_dgram_words <= 12'd1041; // 4164 bytes default
-            payload_words_cfg <= 12'd1024; // 4096 bytes default
+            pkt_substate          <= 3'd0;
+            pkt_rd_addr           <= 10'd0;
+            pkt_submsg_id         <= 8'd0;
+            pkt_df_frag_start     <= 32'd0;
+            pkt_df_frag_size      <= 16'd0;
+            pkt_df_sample_size    <= 32'd0;
+            pkt_df_seq_num        <= 64'd0;
+            active_df_seq         <= 64'd0;
+            active_df_valid       <= 1'b0;
+            active_df_bitmap      <= 32'd0;
+            active_df_total_frags <= 6'd0;
+            df_rem_calc           <= 16'd0;
+            df_tot_cnt            <= 6'd0;
+            copy_src_idx          <= 12'd0;
+            copy_dst_idx          <= 12'd0;
+            copy_end_idx          <= 12'd0;
 
-            frag_step         <= 2'd0;
-            active_frag_idx   <= 2'd0;
-            cur_frag_word_off <= 12'd0;
-            cur_frag_words    <= 12'd0;
-            cur_frag_ip_len   <= 16'd0;
-            cur_frag_flags    <= 16'd0;
-            cur_frag_hdr_csum <= 16'd0;
+            peer_seq_num          <= 64'd0;
+            peer_ip_id            <= 16'hA000;
+            build_idx             <= 12'd0;
+            build_prime           <= 1'b0;
+            payload_words_cfg     <= 16'd1024;
+            echo_ts_0             <= 32'd0;
+            echo_ts_1             <= 32'd0;
+            rx_ram_rd_addr        <= 12'd0;
+            tx_sample_rd_addr     <= 12'd0;
 
-            tx_beat_idx       <= 12'd0;
-            tx_prev_half      <= 16'd0;
-            rx_ram_rd_addr    <= 12'd0;
-            tx_ram_rd_addr    <= 12'd0;
+            total_frags_tx        <= 16'd3;
+            frag_step             <= 16'd0;
+            active_frag_idx       <= 16'd0;
+            tx_bytes_remaining    <= 16'd0;
+            tx_frag_offset_bytes  <= 16'd0;
+            cur_frag_ser_bytes    <= 16'd0;
+            cur_frag_ser_words    <= 12'd0;
+            cur_frag_bram_base    <= 12'd0;
+            cur_frag_bram_words   <= 12'd0;
+            cur_frag_words        <= 12'd0;
+            cur_frag_ip_len       <= 16'd0;
+            cur_frag_flags        <= 16'd0;
+            cur_frag_hdr_csum     <= 16'd0;
+            cur_udp_len_bytes     <= 16'd0;
+            udp_csum_final        <= 16'd0;
+            tx_init_phase         <= 2'd0;
+            scan_cnt              <= 12'd0;
+            scan_csum_accum       <= 16'd0;
+            csum_pipe_cnt         <= 3'd0;
+            tx_frag_csum_seed     <= 16'd0;
 
-            m_axis_tdata      <= 32'd0;
-            m_axis_tvalid     <= 1'b0;
-            m_axis_tlast      <= 1'b0;
+            tx_dgram_word_idx     <= 12'd0;
+            tx_beat_idx           <= 12'd0;
+            tx_prev_half          <= 16'd0;
+
+            m_axis_tdata          <= 32'd0;
+            m_axis_tvalid         <= 1'b0;
+            m_axis_tlast          <= 1'b0;
         end else begin
             case (state)
                 // -------------------------------------------------------------
-                // 1. E_RX_FRAMES: Reassemble Master's outgoing IPv4 fragments
+                // 1. E_RX_FRAMES: Receive IPv4-Frag or Unfragmented RTPS Frame
                 // -------------------------------------------------------------
                 E_RX_FRAMES: begin
                     m_axis_tvalid <= 1'b0;
@@ -354,9 +475,10 @@ module rtps_peer_emulator #(
                             end
                             12'd5: begin
                                 cur_flags_frag <= s_axis_tdata[31:16];
+                                cur_is_ip_frag <= s_axis_tdata[29] || (s_axis_tdata[28:16] != 13'd0);
                                 rx_beat_idx    <= rx_beat_idx + 12'd1;
-                                // Reset accumulators on first fragment of a new IP ID
-                                if (s_axis_tdata[28:16] == 13'd0 && rx_accum_bytes == 16'd0) begin
+                                if ((s_axis_tdata[29] || (s_axis_tdata[28:16] != 13'd0)) &&
+                                    (s_axis_tdata[28:16] == 13'd0 && rx_accum_bytes == 16'd0)) begin
                                     rx_saw_last_frag  <= 1'b0;
                                     rx_expected_bytes <= 16'd0;
                                 end
@@ -374,42 +496,48 @@ module rtps_peer_emulator #(
                                 latched_dst_ip[15:0] <= s_axis_tdata[31:16];
                                 rx_prev_half         <= s_axis_tdata[15:0];
                                 rx_dgram_wr_ptr      <= frag_word_start;
+                                rx_pkt_wr_ptr        <= 10'd0;
                                 if (frag_offset_8b == 13'd0) begin
                                     latched_src_port <= s_axis_tdata[15:0];
                                 end
                                 rx_beat_idx          <= rx_beat_idx + 12'd1;
                             end
                             default: begin
-                                // Write reassembled 32-bit UDP datagram word
-                                if (rx_dgram_wr_ptr < (frag_word_start + (ip_payload_len[13:2]))) begin
-                                    rx_dgram_ram[rx_dgram_wr_ptr] <= {rx_prev_half, s_axis_tdata[31:16]};
-                                    rx_dgram_wr_ptr               <= rx_dgram_wr_ptr + 12'd1;
-                                    if (frag_offset_8b == 13'd0 && rx_dgram_wr_ptr == 12'd0) begin
-                                        latched_dst_port <= s_axis_tdata[31:16];
+                                if (cur_is_ip_frag) begin
+                                    if (rx_dgram_wr_ptr < (frag_word_start + ip_payload_len[13:2])) begin
+                                        rx_dgram_ram[rx_dgram_wr_ptr] <= {rx_prev_half, s_axis_tdata[31:16]};
+                                        rx_dgram_wr_ptr               <= rx_dgram_wr_ptr + 12'd1;
+                                        if (frag_offset_8b == 13'd0 && rx_dgram_wr_ptr == 12'd0)
+                                            latched_dst_port <= s_axis_tdata[31:16];
+                                        if (frag_offset_8b == 13'd0 && rx_dgram_wr_ptr == 12'd1)
+                                            payload_words_cfg <= {4'd0, rx_prev_half[13:2]} - 16'd17;
                                     end
-                                    if (frag_offset_8b == 13'd0 && rx_dgram_wr_ptr == 12'd1) begin
-                                        // Extract UDP total length in words:rx_prev_half is UDP_Len
-                                        total_dgram_words <= rx_prev_half[13:2];
-                                        payload_words_cfg <= rx_prev_half[13:2] - 12'd17;
+                                end else begin
+                                    if (rx_pkt_wr_ptr < {1'b0, ip_payload_len[10:2]} && rx_pkt_wr_ptr < 10'd511) begin
+                                        rx_pkt_ram[rx_pkt_wr_ptr] <= {rx_prev_half, s_axis_tdata[31:16]};
+                                        rx_pkt_wr_ptr             <= rx_pkt_wr_ptr + 10'd1;
+                                        if (rx_pkt_wr_ptr == 10'd0)
+                                            latched_dst_port <= s_axis_tdata[31:16];
                                     end
                                 end
                                 rx_prev_half <= s_axis_tdata[15:0];
 
                                 if (s_axis_tlast) begin
                                     rx_beat_idx <= 12'd0;
-                                    // Check if reassembly of all fragments is complete
-                                    if (!frag_mf) begin
-                                        // Last fragment: total expected bytes = frag_offset*8 + ip_payload_len
+                                    if (!cur_is_ip_frag) begin
+                                        pkt_substate <= 3'd0;
+                                        pkt_rd_addr  <= 10'd8; // Prime INFO_TS sec
+                                        state        <= E_RX_PKT_STAGE;
+                                    end else if (!frag_mf) begin
                                         if ((rx_accum_bytes + ip_payload_len) == ({frag_offset_8b, 3'b000} + ip_payload_len)) begin
-                                            rx_accum_bytes   <= 16'd0;
-                                            peer_seq_num     <= fault_ctrl[3] ? ((peer_seq_num == 64'd0) ? 64'd1 : peer_seq_num)
-                                                                              : (peer_seq_num + 64'd1);
-                                            peer_ip_id       <= peer_ip_id + 16'd1;
-                                            build_idx        <= 12'd0;
-                                            csum_pipe_idx    <= 12'd0;
-                                            build_pipe_valid <= 1'b0;
-                                            rx_ram_rd_addr   <= 12'd1; // Prefetch Word 1 for build_idx == 1
-                                            state            <= E_BUILD_DGRAM;
+                                            rx_accum_bytes <= 16'd0;
+                                            peer_seq_num   <= fault_ctrl[3] ? ((peer_seq_num == 64'd0) ? 64'd1 : peer_seq_num)
+                                                                            : (peer_seq_num + 64'd1);
+                                            peer_ip_id     <= peer_ip_id + 16'd1;
+                                            build_idx      <= 12'd0;
+                                            build_prime    <= 1'b1;
+                                            rx_ram_rd_addr <= 12'd8; // Echo INFO_TS sec
+                                            state          <= E_BUILD_DGRAM;
                                         end else begin
                                             rx_accum_bytes    <= rx_accum_bytes + ip_payload_len;
                                             rx_expected_bytes <= {frag_offset_8b, 3'b000} + ip_payload_len;
@@ -423,9 +551,8 @@ module rtps_peer_emulator #(
                                                                               : (peer_seq_num + 64'd1);
                                             peer_ip_id       <= peer_ip_id + 16'd1;
                                             build_idx        <= 12'd0;
-                                            csum_pipe_idx    <= 12'd0;
-                                            build_pipe_valid <= 1'b0;
-                                            rx_ram_rd_addr   <= 12'd1; // Prefetch Word 1 for build_idx == 1
+                                            build_prime      <= 1'b1;
+                                            rx_ram_rd_addr   <= 12'd8;
                                             state            <= E_BUILD_DGRAM;
                                         end else begin
                                             rx_accum_bytes <= rx_accum_bytes + ip_payload_len;
@@ -440,92 +567,384 @@ module rtps_peer_emulator #(
                 end
 
                 // -------------------------------------------------------------
-                // 2. E_BUILD_DGRAM: Build Outgoing Feedback UDP+RTPS Datagram
+                // 2. E_RX_PKT_STAGE: Unpack DATA (0x15) or DATA_FRAG (0x16)
+                // -------------------------------------------------------------
+                E_RX_PKT_STAGE: begin
+                    case (pkt_substate)
+                        3'd0: begin
+                            // Wait 1 cycle for Word 8; prime Word 9
+                            pkt_rd_addr  <= 10'd9;
+                            pkt_substate <= 3'd1;
+                        end
+                        3'd1: begin
+                            // pkt_ram_dout = Word 8 (INFO_TS sec); prime Word 10 (SubmsgId)
+                            echo_ts_0    <= pkt_ram_dout;
+                            pkt_rd_addr  <= 10'd10;
+                            pkt_substate <= 3'd2;
+                        end
+                        3'd2: begin
+                            // pkt_ram_dout = Word 9 (INFO_TS frac); prime Word 14 (SeqNum Hi)
+                            echo_ts_1    <= pkt_ram_dout;
+                            pkt_rd_addr  <= 10'd14;
+                            pkt_substate <= 3'd3;
+                        end
+                        3'd3: begin
+                            // pkt_ram_dout = Word 10 (SubmsgId)
+                            pkt_submsg_id <= pkt_ram_dout[31:24];
+                            if (pkt_ram_dout[31:24] == 8'h15) begin
+                                // Single DATA packet: copy Words 17 .. ip_payload_len[13:2]-1
+                                payload_words_cfg <= {4'd0, ip_payload_len[13:2]} - 16'd17;
+                                copy_src_idx      <= 12'd17;
+                                copy_dst_idx      <= 12'd17;
+                                copy_end_idx      <= ip_payload_len[13:2];
+                                pkt_rd_addr       <= 10'd17;
+                                pkt_substate      <= 3'd7; // Single DATA copy wait
+                            end else if (pkt_ram_dout[31:24] == 8'h16) begin
+                                // DATA_FRAG: prime Word 15 (SeqNum Lo)
+                                pkt_rd_addr  <= 10'd15;
+                                pkt_substate <= 3'd4;
+                            end else begin
+                                state <= E_RX_FRAMES;
+                            end
+                        end
+                        3'd4: begin
+                            // pkt_ram_dout = Word 14 (SeqNum Hi); prime Word 16 (fragmentStartingNum)
+                            pkt_df_seq_num[63:32] <= bswap32(pkt_ram_dout);
+                            pkt_rd_addr           <= 10'd16;
+                            pkt_substate          <= 3'd5;
+                        end
+                        3'd5: begin
+                            // pkt_ram_dout = Word 15 (SeqNum Lo); prime Word 17 ({fragsInSubmsg, fragSize})
+                            pkt_df_seq_num[31:0] <= bswap32(pkt_ram_dout);
+                            pkt_rd_addr          <= 10'd17;
+                            pkt_substate         <= 3'd6;
+                        end
+                        3'd6: begin
+                            // pkt_ram_dout = Word 16 (fragmentStartingNum LE); prime Word 18 (sampleSize)
+                            pkt_df_frag_start <= bswap32(pkt_ram_dout);
+                            pkt_rd_addr       <= 10'd18;
+                            pkt_substate      <= 3'd7;
+                        end
+                        default: begin
+                            if (pkt_submsg_id == 8'h15) begin
+                                // Single DATA copy loop
+                                if (pkt_rd_addr == 10'd17 && copy_src_idx == 12'd17 && copy_dst_idx == 12'd17) begin
+                                    // Prime +1 for 1-cycle BRAM latency
+                                    pkt_rd_addr <= 10'd18;
+                                end else if (copy_src_idx < copy_end_idx) begin
+                                    rx_dgram_ram[copy_dst_idx] <= pkt_ram_dout;
+                                    copy_src_idx               <= copy_src_idx + 12'd1;
+                                    copy_dst_idx               <= copy_dst_idx + 12'd1;
+                                    pkt_rd_addr                <= pkt_rd_addr + 10'd1;
+                                end else begin
+                                    // Done copying single DATA payload!
+                                    rx_dgram_ram[8] <= echo_ts_0;
+                                    rx_dgram_ram[9] <= echo_ts_1;
+                                    peer_seq_num    <= fault_ctrl[3] ? ((peer_seq_num == 64'd0) ? 64'd1 : peer_seq_num)
+                                                                     : (peer_seq_num + 64'd1);
+                                    peer_ip_id      <= peer_ip_id + 16'd1;
+                                    build_idx       <= 12'd0;
+                                    build_prime     <= 1'b1;
+                                    rx_ram_rd_addr  <= 12'd8;
+                                    state           <= E_BUILD_DGRAM;
+                                end
+                            end else begin
+                                // DATA_FRAG multi-cycle handling using extra helper states via copy_src_idx
+                                if (pkt_rd_addr == 10'd18) begin
+                                    // pkt_ram_dout = Word 17 ({fragsInSubmsg, fragSize})
+                                    pkt_df_frag_size <= bswap16(pkt_ram_dout[15:0]);
+                                    pkt_rd_addr      <= 10'd19; // Next cycle gives Word 18 (sampleSize)
+                                end else if (pkt_rd_addr == 10'd19 && copy_src_idx == 12'd0) begin
+                                    // pkt_ram_dout = Word 18 (sampleSize LE)
+                                    pkt_df_sample_size <= bswap32(pkt_ram_dout);
+                                    df_rem_calc        <= bswap32(pkt_ram_dout[31:0]);
+                                    df_tot_cnt         <= 6'd0;
+                                    copy_src_idx       <= 12'd1; // Signal calc phase
+                                    if (!active_df_valid || active_df_seq != pkt_df_seq_num) begin
+                                        active_df_valid  <= 1'b1;
+                                        active_df_seq    <= pkt_df_seq_num;
+                                        active_df_bitmap <= 32'd0;
+                                    end
+                                end else if (copy_src_idx == 12'd1) begin
+                                    // Iterative total_frags = ceil(sampleSize / fragSize)
+                                    if (df_rem_calc > pkt_df_frag_size && df_tot_cnt < 6'd32) begin
+                                        df_rem_calc <= df_rem_calc - pkt_df_frag_size;
+                                        df_tot_cnt  <= df_tot_cnt + 6'd1;
+                                    end else begin
+                                        active_df_total_frags <= df_tot_cnt + 6'd1;
+                                        copy_src_idx          <= 12'd2;
+                                        copy_dst_idx          <= 12'd16 + ((pkt_df_frag_start[4:0] - 5'd1) * pkt_df_frag_size[13:2]);
+                                        copy_end_idx          <= ip_payload_len[13:2]; // Total UDP words in this packet
+                                        pkt_rd_addr           <= 10'd19;
+                                    end
+                                end else if (copy_src_idx == 12'd2) begin
+                                    // 1-cycle BRAM prime for Word 19
+                                    copy_src_idx <= 12'd19;
+                                    pkt_rd_addr  <= 10'd20;
+                                end else if (copy_src_idx < copy_end_idx) begin
+                                    rx_dgram_ram[copy_dst_idx] <= pkt_ram_dout;
+                                    copy_src_idx               <= copy_src_idx + 12'd1;
+                                    copy_dst_idx               <= copy_dst_idx + 12'd1;
+                                    pkt_rd_addr                <= pkt_rd_addr + 10'd1;
+                                end else begin
+                                    // Mark fragment bit & check completion
+                                    copy_src_idx <= 12'd0;
+                                    if ((active_df_bitmap | (32'd1 << (pkt_df_frag_start[4:0] - 5'd1))) ==
+                                        ((active_df_total_frags == 6'd32) ? 32'hFFFF_FFFF : ((32'd1 << active_df_total_frags) - 32'd1))) begin
+                                        active_df_valid   <= 1'b0;
+                                        active_df_bitmap  <= 32'd0;
+                                        payload_words_cfg <= pkt_df_sample_size[13:2] - 16'd1;
+                                        rx_dgram_ram[8]   <= echo_ts_0;
+                                        rx_dgram_ram[9]   <= echo_ts_1;
+                                        peer_seq_num      <= fault_ctrl[3] ? ((peer_seq_num == 64'd0) ? 64'd1 : peer_seq_num)
+                                                                           : (peer_seq_num + 64'd1);
+                                        peer_ip_id        <= peer_ip_id + 16'd1;
+                                        build_idx         <= 12'd0;
+                                        build_prime       <= 1'b1;
+                                        rx_ram_rd_addr    <= 12'd8;
+                                        state             <= E_BUILD_DGRAM;
+                                    end else begin
+                                        active_df_bitmap <= active_df_bitmap | (32'd1 << (pkt_df_frag_start[4:0] - 5'd1));
+                                        state            <= E_RX_FRAMES;
+                                    end
+                                end
+                            end
+                        end
+                    endcase
+                end
+
+                // -------------------------------------------------------------
+                // 3. E_BUILD_DGRAM: Transform FastSample into tx_sample_ram
                 // -------------------------------------------------------------
                 E_BUILD_DGRAM: begin
-                    // Stage 1: Generate build_word and write into tx_dgram_ram
-                    if (build_idx < total_dgram_words) begin
-                        tx_dgram_ram[build_idx] <= build_word;
-                        build_word_pipe         <= build_word;
-                        build_pipe_valid        <= 1'b1;
-                        build_idx               <= build_idx + 12'd1;
-                        rx_ram_rd_addr          <= build_idx + 12'd2;
+                    if (build_prime) begin
+                        rx_ram_rd_addr <= 12'd9;
+                        build_prime    <= 1'b0;
+                        build_idx      <= 12'd0;
+                    end else if (build_idx == 12'd0 && rx_ram_rd_addr == 12'd9) begin
+                        echo_ts_0      <= rx_ram_dout;
+                        rx_ram_rd_addr <= 12'd17;
+                    end else if (build_idx == 12'd0 && rx_ram_rd_addr == 12'd17) begin
+                        echo_ts_1      <= rx_ram_dout;
+                        rx_ram_rd_addr <= 12'd18;
+                        build_idx      <= 12'd1; // Signal payload loop
                     end else begin
-                        build_pipe_valid        <= 1'b0;
-                    end
-
-                    // Stage 2: Pipelined checksum accumulator from registered build_word_pipe
-                    if (build_pipe_valid) begin
-                        if (csum_pipe_idx == 12'd0)
-                            udp_csum_accum <= csum_add32(emu_pseudo_seed, build_word_pipe);
-                        else
-                            udp_csum_accum <= csum_add32(udp_csum_accum, build_word_pipe);
-                        csum_pipe_idx <= csum_pipe_idx + 12'd1;
-                    end
-
-                    // When all words have passed through Stage 2, latch checksum and proceed to TX
-                    if ((build_idx == total_dgram_words) && !build_pipe_valid && (csum_pipe_idx == total_dgram_words)) begin
-                        // Patch final UDP checksum into Word 1 of tx_dgram_ram
-                        // If fault_ctrl[2] == 1, corrupt UDP checksum deliberately
-                        udp_csum_final <= fault_ctrl[2] ? (~udp_csum_accum ^ 16'hDEAD) :
-                            ((~udp_csum_accum == 16'h0000) ? 16'hFFFF : ~udp_csum_accum);
-                        frag_step      <= 2'd0;
-                        state          <= E_TX_INIT;
+                        // Use copy_dst_idx as tx_sample_ram write pointer (starting at 0)
+                        if (build_idx == 12'd1) begin
+                            tx_sample_ram[0] <= bswap32(rx_ram_dout); // Word 0: host-LE cycle_id intact
+                            copy_dst_idx     <= 12'd1;
+                            rx_ram_rd_addr   <= 12'd19;
+                            build_idx        <= 12'd2;
+                        end else if (copy_dst_idx < payload_words_cfg[11:0]) begin
+                            if (copy_dst_idx < 12'd4)
+                                tx_sample_ram[copy_dst_idx] <= bswap32(rx_ram_dout);
+                            else
+                                tx_sample_ram[copy_dst_idx] <= (~bswap32(rx_ram_dout)) + {16'h0000, peer_seq_num[5:0], 10'h200};
+                            copy_dst_idx   <= copy_dst_idx + 12'd1;
+                            rx_ram_rd_addr <= rx_ram_rd_addr + 12'd1;
+                        end else begin
+                            copy_dst_idx         <= 12'd0;
+                            frag_step            <= 16'd0;
+                            tx_bytes_remaining   <= tx_ip_frag_mode ? ipfrag_udp_total_bytes : sample_total_bytes;
+                            tx_frag_offset_bytes <= 16'd0;
+                            tx_init_phase        <= 2'd0;
+                            // Compute total_frags_tx for DATA_FRAG (or 3 for IP-frag, 1 for single DATA)
+                            if (tx_ip_frag_mode) begin
+                                total_frags_tx <= 16'd3;
+                            end else if (use_single_data) begin
+                                total_frags_tx <= 16'd1;
+                            end else begin
+                                total_frags_tx <= (sample_total_bytes + eff_frag_bytes - 16'd1) / eff_frag_bytes;
+                            end
+                            state <= E_TX_INIT;
+                        end
                     end
                 end
 
                 // -------------------------------------------------------------
-                // 3. E_TX_INIT: Prepare IPv4 Fragment Parameters & Checksum
+                // 4. E_TX_INIT: Plan Fragment & Compute UDP Checksum
                 // -------------------------------------------------------------
                 E_TX_INIT: begin
-                    // Fault [0]: Drop Fragment #1 (skip directly from step 0 to step 2)
-                    // Fault [1]: Swap Fragment #0 and Fragment #1 order
-                    if (fault_ctrl[0] && frag_step == 2'd1) begin
-                        frag_step <= 2'd2;
-                    end else begin
-                        if (fault_ctrl[1]) begin
-                            active_frag_idx <= (frag_step == 2'd0) ? 2'd1 :
-                                               (frag_step == 2'd1) ? 2'd0 : 2'd2;
-                        end else begin
-                            active_frag_idx <= frag_step;
-                        end
-
-                        case (fault_ctrl[1] ? ((frag_step == 2'd0) ? 2'd1 : (frag_step == 2'd1) ? 2'd0 : 2'd2) : frag_step)
-                            2'd0: begin
-                                cur_frag_word_off <= 12'd0;
-                                cur_frag_words    <= 12'd368; // 1,472 bytes
-                                cur_frag_ip_len   <= 16'd1492;
-                                cur_frag_flags    <= {3'b001, 13'd0}; // MF=1, offset=0
-                                tx_ram_rd_addr    <= 12'd0;
-                            end
-                            2'd1: begin
-                                cur_frag_word_off <= 12'd368;
-                                cur_frag_words    <= 12'd368; // 1,472 bytes
-                                cur_frag_ip_len   <= 16'd1492;
-                                cur_frag_flags    <= {3'b001, 13'd184}; // MF=1, offset=184 (1472/8)
-                                tx_ram_rd_addr    <= 12'd368;
-                            end
-                            default: begin
-                                cur_frag_word_off <= 12'd736;
-                                cur_frag_words    <= total_dgram_words - 12'd736; // 305 words = 1,220 bytes
-                                cur_frag_ip_len   <= 16'd20 + {2'b00, (total_dgram_words - 12'd736), 2'b00};
-                                cur_frag_flags    <= {3'b000, 13'd368}; // MF=0, offset=368 (2944/8)
-                                tx_ram_rd_addr    <= 12'd736;
-                            end
-                        endcase
-
-                        tx_beat_idx   <= 12'd0;
+                    if (m_axis_tvalid && m_axis_tready) begin
                         m_axis_tvalid <= 1'b0;
                         m_axis_tlast  <= 1'b0;
-                        state         <= E_TX_STREAM;
+                    end
+
+                    if (!(m_axis_tvalid && !m_axis_tready)) begin
+                    // Fault [0]: Drop Fragment #1 when multiple fragments exist
+                    if (fault_ctrl[0] && (frag_step == 16'd1) && (total_frags_tx > 16'd1)) begin
+                        frag_step <= 16'd2;
+                    end else begin
+                        case (tx_init_phase)
+                            2'd0: begin
+                                // Determine active_frag_idx (Fault [1]: swap #0 and #1)
+                                if (fault_ctrl[1] && (total_frags_tx >= 16'd2)) begin
+                                    active_frag_idx <= (frag_step == 16'd0) ? 16'd1 :
+                                                       (frag_step == 16'd1) ? 16'd0 : frag_step;
+                                end else begin
+                                    active_frag_idx <= frag_step;
+                                end
+
+                                if (tx_ip_frag_mode) begin
+                                    // 3 IPv4 fragments: 0 (368W @ 0), 1 (368W @ 184), 2 (rem @ 368)
+                                    case (fault_ctrl[1] ? ((frag_step == 16'd0) ? 16'd1 : (frag_step == 16'd1) ? 16'd0 : frag_step) : frag_step)
+                                        16'd0: begin
+                                            cur_frag_words     <= 12'd368;
+                                            cur_frag_ip_len    <= 16'd1492;
+                                            cur_frag_flags     <= {3'b001, 13'd0};
+                                            cur_frag_bram_base <= 12'd0; // Word 0..367
+                                        end
+                                        16'd1: begin
+                                            cur_frag_words     <= 12'd368;
+                                            cur_frag_ip_len    <= 16'd1492;
+                                            cur_frag_flags     <= {3'b001, 13'd184};
+                                            cur_frag_bram_base <= 12'd351; // 368 - 17
+                                        end
+                                        default: begin
+                                            cur_frag_words     <= ipfrag_total_dgram_words[11:0] - 12'd736;
+                                            cur_frag_ip_len    <= 16'd20 + {2'b00, (ipfrag_total_dgram_words[11:0] - 12'd736), 2'b00};
+                                            cur_frag_flags     <= {3'b000, 13'd368};
+                                            cur_frag_bram_base <= 12'd719; // 736 - 17
+                                        end
+                                    endcase
+                                    cur_udp_len_bytes   <= ipfrag_udp_total_bytes;
+                                    cur_frag_bram_words <= payload_words_cfg[11:0]; // Full sample checksum on frag_step==0
+                                    if (frag_step == 16'd0) begin
+                                        scan_csum_accum   <= 16'd0;
+                                        scan_cnt          <= 12'd0;
+                                        tx_sample_rd_addr <= 12'd0;
+                                        tx_init_phase     <= 2'd1;
+                                    end else begin
+                                        // Already computed udp_csum_final on frag_step == 0
+                                        tx_sample_rd_addr <= (fault_ctrl[1] && frag_step == 16'd1) ? 12'd0 :
+                                                             (frag_step == 16'd1) ? 12'd351 : 12'd719;
+                                        tx_dgram_word_idx <= (fault_ctrl[1] && frag_step == 16'd1) ? 12'd0 :
+                                                             (frag_step == 16'd1) ? 12'd368 : 12'd736;
+                                        tx_beat_idx       <= 12'd0;
+                                        m_axis_tvalid     <= 1'b0;
+                                        m_axis_tlast      <= 1'b0;
+                                        state             <= E_TX_STREAM;
+                                    end
+                                end else if (use_single_data) begin
+                                    cur_frag_ser_bytes  <= sample_total_bytes;
+                                    cur_frag_ser_words  <= payload_words_cfg[11:0] + 12'd1;
+                                    cur_udp_len_bytes   <= ipfrag_udp_total_bytes;
+                                    cur_frag_words      <= ipfrag_total_dgram_words[11:0];
+                                    cur_frag_ip_len     <= 16'd20 + ipfrag_udp_total_bytes;
+                                    cur_frag_flags      <= 16'd0;
+                                    cur_frag_bram_base  <= 12'd0;
+                                    cur_frag_bram_words <= payload_words_cfg[11:0];
+                                    scan_csum_accum     <= 16'd0;
+                                    scan_cnt            <= 12'd0;
+                                    tx_sample_rd_addr   <= 12'd0;
+                                    tx_init_phase       <= 2'd1;
+                                end else begin
+                                    // DATA_FRAG (0x16)
+                                    // Compute active fragment's byte offset & size (handles Fault [1] swap cleanly!)
+                                    if (fault_ctrl[1] && (total_frags_tx >= 16'd2) && (frag_step == 16'd0)) begin
+                                        // Emitting Frag #1 first
+                                        cur_frag_ser_bytes  <= ((sample_total_bytes - eff_frag_bytes) > eff_frag_bytes) ?
+                                                               eff_frag_bytes : (sample_total_bytes - eff_frag_bytes);
+                                        cur_frag_bram_base  <= eff_frag_bytes[13:2] - 12'd1;
+                                        cur_frag_bram_words <= (((sample_total_bytes - eff_frag_bytes) > eff_frag_bytes) ?
+                                                                eff_frag_bytes[13:2] : ((sample_total_bytes - eff_frag_bytes) >> 2));
+                                        cur_frag_ser_words  <= (((sample_total_bytes - eff_frag_bytes) > eff_frag_bytes) ?
+                                                                eff_frag_bytes[13:2] : ((sample_total_bytes - eff_frag_bytes) >> 2));
+                                        cur_udp_len_bytes   <= 16'd76 + (((sample_total_bytes - eff_frag_bytes) > eff_frag_bytes) ?
+                                                               eff_frag_bytes : (sample_total_bytes - eff_frag_bytes));
+                                        cur_frag_words      <= 12'd19 + (((sample_total_bytes - eff_frag_bytes) > eff_frag_bytes) ?
+                                                               eff_frag_bytes[13:2] : ((sample_total_bytes - eff_frag_bytes) >> 2));
+                                        cur_frag_ip_len     <= 16'd96 + (((sample_total_bytes - eff_frag_bytes) > eff_frag_bytes) ?
+                                                               eff_frag_bytes : (sample_total_bytes - eff_frag_bytes));
+                                        scan_csum_accum     <= 16'd0;
+                                        tx_sample_rd_addr   <= eff_frag_bytes[13:2] - 12'd1;
+                                    end else if (fault_ctrl[1] && (total_frags_tx >= 16'd2) && (frag_step == 16'd1)) begin
+                                        // Emitting Frag #0 second
+                                        cur_frag_ser_bytes  <= eff_frag_bytes;
+                                        cur_frag_ser_words  <= eff_frag_bytes[13:2];
+                                        cur_frag_bram_base  <= 12'd0;
+                                        cur_frag_bram_words <= eff_frag_bytes[13:2] - 12'd1;
+                                        cur_udp_len_bytes   <= 16'd76 + eff_frag_bytes;
+                                        cur_frag_words      <= 12'd19 + eff_frag_bytes[13:2];
+                                        cur_frag_ip_len     <= 16'd96 + eff_frag_bytes;
+                                        scan_csum_accum     <= 16'h0001; // Include CDR_LE
+                                        tx_sample_rd_addr   <= 12'd0;
+                                    end else begin
+                                        // Normal in-order fragment (or frag_step >= 2)
+                                        if (tx_bytes_remaining > eff_frag_bytes) begin
+                                            cur_frag_ser_bytes  <= eff_frag_bytes;
+                                            cur_frag_ser_words  <= eff_frag_bytes[13:2];
+                                            cur_udp_len_bytes   <= 16'd76 + eff_frag_bytes;
+                                            cur_frag_words      <= 12'd19 + eff_frag_bytes[13:2];
+                                            cur_frag_ip_len     <= 16'd96 + eff_frag_bytes;
+                                            cur_frag_bram_words <= (frag_step == 16'd0) ? (eff_frag_bytes[13:2] - 12'd1) : eff_frag_bytes[13:2];
+                                        end else begin
+                                            cur_frag_ser_bytes  <= tx_bytes_remaining;
+                                            cur_frag_ser_words  <= tx_bytes_remaining[13:2];
+                                            cur_udp_len_bytes   <= 16'd76 + tx_bytes_remaining;
+                                            cur_frag_words      <= 12'd19 + tx_bytes_remaining[13:2];
+                                            cur_frag_ip_len     <= 16'd96 + tx_bytes_remaining;
+                                            cur_frag_bram_words <= (frag_step == 16'd0) ? (tx_bytes_remaining[13:2] - 12'd1) : tx_bytes_remaining[13:2];
+                                        end
+                                        cur_frag_bram_base <= (frag_step == 16'd0) ? 12'd0 : (tx_frag_offset_bytes[13:2] - 12'd1);
+                                        scan_csum_accum    <= (frag_step == 16'd0) ? 16'h0001 : 16'h0000;
+                                        tx_sample_rd_addr  <= (frag_step == 16'd0) ? 12'd0 : (tx_frag_offset_bytes[13:2] - 12'd1);
+                                    end
+                                    cur_frag_flags <= 16'd0;
+                                    scan_cnt       <= 12'd0;
+                                    tx_init_phase  <= 2'd1;
+                                end
+                            end
+                            2'd1: begin
+                                // 1-cycle BRAM read wait
+                                if (cur_frag_bram_words == 12'd0) begin
+                                    tx_frag_csum_seed <= scan_csum_accum;
+                                    csum_pipe_cnt     <= 3'd0;
+                                    tx_init_phase     <= 2'd3;
+                                end else begin
+                                    tx_sample_rd_addr <= tx_sample_rd_addr + 12'd1;
+                                    tx_init_phase     <= 2'd2;
+                                end
+                            end
+                            2'd2: begin
+                                scan_csum_accum <= csum_add32(scan_csum_accum, bswap32(tx_sample_dout));
+                                if (scan_cnt == (cur_frag_bram_words - 12'd1)) begin
+                                    tx_init_phase <= 2'd3;
+                                    csum_pipe_cnt <= 3'd0;
+                                end else begin
+                                    scan_cnt          <= scan_cnt + 12'd1;
+                                    tx_sample_rd_addr <= tx_sample_rd_addr + 12'd1;
+                                end
+                            end
+                            2'd3: begin
+                                // Latch scan_csum_accum into tx_frag_csum_seed on cycle 0, wait 4 cycles for emu_ucs_fold
+                                if (csum_pipe_cnt == 3'd0) begin
+                                    tx_frag_csum_seed <= scan_csum_accum;
+                                end
+                                if (csum_pipe_cnt < 3'd5) begin
+                                    csum_pipe_cnt <= csum_pipe_cnt + 3'd1;
+                                end else begin
+                                    udp_csum_final <= fault_ctrl[2] ? (~emu_ucs_fold ^ 16'hDEAD) :
+                                        ((~emu_ucs_fold == 16'h0000) ? 16'hFFFF : ~emu_ucs_fold);
+                                    tx_sample_rd_addr <= cur_frag_bram_base;
+                                    tx_dgram_word_idx <= (tx_ip_frag_mode && active_frag_idx == 16'd1) ? 12'd368 :
+                                                         (tx_ip_frag_mode && active_frag_idx == 16'd2) ? 12'd736 : 12'd0;
+                                    tx_beat_idx       <= 12'd0;
+                                    m_axis_tvalid     <= 1'b0;
+                                    m_axis_tlast      <= 1'b0;
+                                    tx_init_phase     <= 2'd0;
+                                    state             <= E_TX_STREAM;
+                                end
+                            end
+                        endcase
+                    end
                     end
                 end
 
                 // -------------------------------------------------------------
-                // 4. E_TX_STREAM: Stream Ethernet + IPv4 Fragment over m_axis
+                // 5. E_TX_STREAM: Stream Ethernet + IPv4 + Fragment over m_axis
                 // -------------------------------------------------------------
                 E_TX_STREAM: begin
-                    // Latch computed pipelined IPv4 header checksum on beat 3 (stable after beat 1, sent on beat 6)
                     if (tx_beat_idx == 12'd3) begin
                         cur_frag_hdr_csum <= emu_ipcs_stg1;
                     end
@@ -536,20 +955,42 @@ module rtps_peer_emulator #(
                         m_axis_tlast  <= (tx_beat_idx == (12'd8 + cur_frag_words));
 
                         if (tx_beat_idx == (12'd8 + cur_frag_words)) begin
-                            if (frag_step == 2'd2) begin
+                            if (frag_step >= (total_frags_tx - 16'd1)) begin
                                 state <= E_RX_FRAMES;
                             end else begin
-                                frag_step <= frag_step + 2'd1;
-                                state     <= E_TX_INIT;
+                                frag_step <= frag_step + 16'd1;
+                                if (!tx_ip_frag_mode) begin
+                                    if (fault_ctrl[1] && frag_step == 16'd0 && total_frags_tx >= 16'd2) begin
+                                        // Swapped #1 first, #0 next; after #0 completes, step 2 skips past both #0 and #1!
+                                        tx_bytes_remaining   <= sample_total_bytes - eff_frag_bytes;
+                                        tx_frag_offset_bytes <= eff_frag_bytes;
+                                    end else if (fault_ctrl[1] && frag_step == 16'd1 && total_frags_tx >= 16'd2) begin
+                                        tx_bytes_remaining   <= sample_total_bytes - {eff_frag_bytes[14:0], 1'b0};
+                                        tx_frag_offset_bytes <= {eff_frag_bytes[14:0], 1'b0};
+                                    end else begin
+                                        tx_bytes_remaining   <= tx_bytes_remaining - cur_frag_ser_bytes;
+                                        tx_frag_offset_bytes <= tx_frag_offset_bytes + cur_frag_ser_bytes;
+                                    end
+                                end
+                                tx_init_phase <= 2'd0;
+                                state         <= E_TX_INIT;
                             end
                         end else begin
                             tx_beat_idx <= tx_beat_idx + 12'd1;
-                            if (tx_beat_idx == 12'd7) begin
-                                tx_ram_rd_addr <= tx_ram_rd_addr + 12'd1;
+                            if (tx_beat_idx == 12'd7 && tx_dgram_word_idx >= (use_data_frag ? 12'd19 : 12'd17)) begin
+                                tx_sample_rd_addr <= tx_sample_rd_addr + 12'd1;
                             end else if (tx_beat_idx >= 12'd8) begin
-                                tx_prev_half <= tx_ram_dout[15:0];
-                                if (tx_beat_idx < (12'd7 + cur_frag_words)) begin
-                                    tx_ram_rd_addr <= tx_ram_rd_addr + 12'd1;
+                                tx_prev_half      <= cur_dgram_word[15:0];
+                                tx_dgram_word_idx <= tx_dgram_word_idx + 12'd1;
+                                if (use_data_frag) begin
+                                    if ((active_frag_idx == 16'd0 && tx_dgram_word_idx >= 12'd19) ||
+                                        (active_frag_idx != 16'd0 && tx_dgram_word_idx >= 12'd18)) begin
+                                        tx_sample_rd_addr <= tx_sample_rd_addr + 12'd1;
+                                    end
+                                end else begin
+                                    if (tx_dgram_word_idx >= 12'd16) begin
+                                        tx_sample_rd_addr <= tx_sample_rd_addr + 12'd1;
+                                    end
                                 end
                             end
                         end

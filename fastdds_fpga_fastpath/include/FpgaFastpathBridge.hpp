@@ -93,10 +93,14 @@ struct BridgeConfig {
     uint32_t    pl_ip{0xC0A801C9};         // 192.168.1.201 (dedicated PL RMII IP)
     uint8_t     pl_mac[6]{0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
     uint16_t    local_src_port{7411};
+    uint16_t    pl_rx_port{7511};          // Reader locator advertised via SEDP; must not collide with PS default ports 7410/7411
     uint16_t    default_dst_port{7410};
     uint32_t    fallback_dst_ip{0xC0A80164}; // 192.168.1.100
 
     bool        enable_peer_emu{false};    // false = Physical RMII wire (LAN8720), true = internal emulator
+    bool        tx_ip_frag_mode{false};    // false = Option C DATA_FRAG default (0x16), true = Legacy IPv4 frag
+    uint32_t    max_message_size{1468};    // Fast DDS UDP maxMessageSize (1468 - 68B RTPS/DATA_FRAG = 1400B)
+    uint32_t    frag_size_bytes{0};        // Optional explicit DATA_FRAG fragmentSize override (0 = derive from max_message_size)
     uint8_t     override_peer_mac[6]{0};
     bool        has_peer_mac_override{false};
     uint32_t    pacing_timer_ticks{0};     // 0 = wire line rate
@@ -109,6 +113,20 @@ public:
 
     ~FpgaFastpathBridge() {
         stop();
+    }
+
+    uint32_t effective_frag_size_bytes() const {
+        uint32_t sz = config_.frag_size_bytes;
+        if (sz == 0) {
+            constexpr uint32_t kRtpsDataFragUdpHdrBytes = 68U; // 20B RTPS + 12B INFO_TS + 36B DATA_FRAG
+            sz = (config_.max_message_size > kRtpsDataFragUdpHdrBytes)
+                     ? (config_.max_message_size - kRtpsDataFragUdpHdrBytes)
+                     : 1400U;
+        }
+        sz &= ~3U;
+        if (sz < 4U) sz = 4U;
+        if (sz > 1404U) sz = 1404U;
+        return sz;
     }
 
     bool init() {
@@ -207,6 +225,8 @@ public:
 
         fpga_->cfg.enable_peer_emu = config_.enable_peer_emu ? 1 : 0;
         fpga_->cfg.mode_pub_only   = config_.enable_peer_emu ? 0 : 1;
+        fpga_->cfg.tx_ip_frag_mode = config_.tx_ip_frag_mode ? 1 : 0;
+        fpga_->cfg.frag_size_bytes = effective_frag_size_bytes();
 
         uint32_t dst_ip = config_.fallback_dst_ip;
         uint8_t dst_mac[6] = {0, 0, 0, 0, 0, 0};
@@ -234,7 +254,7 @@ public:
         std::memset(&rep, 0, sizeof(rep));
         rep.slot_idx                = 0;
         rep.lifecycle_state         = FPGA_LIFECYCLE_ACTIVE;
-        rep.expected_dst_port       = config_.local_src_port;
+        rep.expected_dst_port       = config_.pl_rx_port;
         rep.remote_guid_prefix[0]   = 0x01; rep.remote_guid_prefix[1] = 0x01;
         rep.remote_guid_prefix[2]   = 0x00; rep.remote_guid_prefix[3] = 0x02;
         rep.remote_guid_prefix[4]   = 0xBB; rep.remote_guid_prefix[5] = 0x00;
@@ -378,17 +398,22 @@ private:
         DomainParticipantQos pqos = PARTICIPANT_QOS_DEFAULT;
         pqos.name("PYNQZ2_FPGA_Fastpath_Node");
 
-        // Optional: Restrict PS discovery to a specific Linux interface (e.g., eth0 IP)
-        if (!config_.ps_ip.empty()) {
+        // Configure UDPv4 transport for Discovery Plane (always apply maxMessageSize for DATA_FRAG alignment)
+        {
             pqos.transport().use_builtin_transports = false;
 #if FASTDDS_V3
             auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
 #else
             auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
 #endif
-            udp_transport->interfaceWhiteList.push_back(config_.ps_ip);
+            if (!config_.ps_ip.empty()) {
+                udp_transport->interfaceWhiteList.push_back(config_.ps_ip);
+                std::cout << "[FpgaBridge] Fast DDS Discovery bound to PS interface: " << config_.ps_ip << "\n";
+            }
+            if (config_.max_message_size >= 100 && config_.max_message_size <= 65500U) {
+                udp_transport->maxMessageSize = config_.max_message_size;
+            }
             pqos.transport().user_transports.push_back(udp_transport);
-            std::cout << "[FpgaBridge] Fast DDS Discovery bound to PS interface: " << config_.ps_ip << "\n";
         }
 
         // Optional: Add unicast SPDP peer locator (useful when multicast is filtered)
@@ -439,6 +464,8 @@ private:
                                           config_.pl_mac[5];
         fpga_->cfg.enable_peer_emu      = config_.enable_peer_emu ? 1 : 0;
         fpga_->cfg.mode_pub_only        = 1;
+        fpga_->cfg.tx_ip_frag_mode      = config_.tx_ip_frag_mode ? 1 : 0;
+        fpga_->cfg.frag_size_bytes      = effective_frag_size_bytes();
         fpga_->cfg.pacing_timer_ticks   = config_.pacing_timer_ticks;
         fpga_->cfg.local_identity_valid = 1;
 
@@ -464,6 +491,23 @@ private:
 
         DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
         rqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
+
+        // Remote writers send data to the PL RMII address, not the PS interface.
+        {
+#if FASTDDS_V3
+            eprosima::fastdds::rtps::Locator_t rx_loc;
+#else
+            eprosima::fastrtps::rtps::Locator_t rx_loc;
+#endif
+            rx_loc.kind    = 1; // LOCATOR_KIND_UDPv4
+            rx_loc.port    = config_.pl_rx_port;
+            rx_loc.address[12] = static_cast<uint8_t>((config_.pl_ip >> 24) & 0xFF);
+            rx_loc.address[13] = static_cast<uint8_t>((config_.pl_ip >> 16) & 0xFF);
+            rx_loc.address[14] = static_cast<uint8_t>((config_.pl_ip >> 8) & 0xFF);
+            rx_loc.address[15] = static_cast<uint8_t>(config_.pl_ip & 0xFF);
+            rqos.endpoint().unicast_locator_list.push_back(rx_loc);
+        }
+
         reader_ = subscriber_->create_datareader(topic_, rqos, &reader_listener_);
         if (!reader_) return false;
 
@@ -506,6 +550,8 @@ private:
 
         fpga_->cfg.enable_peer_emu = config_.enable_peer_emu ? 1 : 0;
         fpga_->cfg.mode_pub_only   = 1;
+        fpga_->cfg.tx_ip_frag_mode = config_.tx_ip_frag_mode ? 1 : 0;
+        fpga_->cfg.frag_size_bytes = effective_frag_size_bytes();
         fpga_configure_writer(fpga_, &wep);
         fpga_commit_endpoints(fpga_, generation_);
 
@@ -526,7 +572,7 @@ private:
         std::memset(&rep, 0, sizeof(rep));
         rep.slot_idx                = 0;
         rep.lifecycle_state         = FPGA_LIFECYCLE_ACTIVE;
-        rep.expected_dst_port       = config_.local_src_port;
+        rep.expected_dst_port       = config_.pl_rx_port;
         std::memcpy(rep.remote_guid_prefix, remote_guid_prefix, 12);
         rep.remote_writer_entity_id = remote_writer_entity_id;
         rep.expected_remote_src_ip  = remote_ip;

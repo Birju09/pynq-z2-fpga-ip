@@ -272,12 +272,6 @@ module arp_reply_generator #(
                             end else if (ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2) begin
                                 rx_target_ip_match <= 1'b1;
                                 matched_spa_ip     <= ARP_REPLY_IP_2;
-                            end else if ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_010A) begin // 192.168.1.10 (Primary IP)
-                                rx_target_ip_match <= 1'b1;
-                                matched_spa_ip     <= 32'hC0A8_010A;
-                            end else if ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_01C9) begin // 192.168.1.201 (Secondary IP)
-                                rx_target_ip_match <= 1'b1;
-                                matched_spa_ip     <= 32'hC0A8_01C9;
                             end else begin
                                 rx_target_ip_match <= 1'b0;
                             end
@@ -299,15 +293,12 @@ module arp_reply_generator #(
                     if (rx_is_arp_req &&
                         ((rx_wire_beat >= 4'd10 && rx_target_ip_match) ||
                          (rx_wire_beat == 4'd10 && ({rx_tpa_hi, rx_net_word[31:16]} == arp_reply_ip ||
-                                                    (ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2) ||
-                                                    ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_010A) ||
-                                                    ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_01C9))))) begin
+                                                    (ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2))))) begin
                         arp_reply_trigger     <= 1'b1;
                         latched_reply_dst_mac <= rx_sha_mac;
                         latched_reply_dst_ip  <= rx_spa_ip;
                         latched_reply_spa_ip  <= rx_target_ip_match ? matched_spa_ip :
-                                                 ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_010A) ? 32'hC0A8_010A :
-                                                 ({rx_tpa_hi, rx_net_word[31:16]} == 32'hC0A8_01C9) ? 32'hC0A8_01C9 :
+                                                 (ARP_REPLY_IP_2 != 32'd0 && {rx_tpa_hi, rx_net_word[31:16]} == ARP_REPLY_IP_2) ? ARP_REPLY_IP_2 :
                                                  arp_reply_ip;
 
                         if (remote_client_ip == 32'd0 || rx_spa_ip == remote_client_ip) begin

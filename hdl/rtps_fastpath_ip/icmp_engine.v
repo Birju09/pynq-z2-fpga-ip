@@ -140,8 +140,6 @@ module icmp_engine #(
     // Helper for target IP match
     wire [31:0] beat8_dst_ip = {rx_dst_ip[31:16], s_axis_rx_tdata[31:16]};
     wire        beat8_ip_ok  = (beat8_dst_ip == local_ip) ||
-                               (beat8_dst_ip == 32'hC0A8_010A) || // 192.168.1.10 (Primary IP)
-                               (beat8_dst_ip == 32'hC0A8_01C9) || // 192.168.1.201 (Secondary IP)
                                (SECONDARY_IP != 32'd0 && beat8_dst_ip == SECONDARY_IP);
 
     always @(posedge clk or negedge rst_n) begin
