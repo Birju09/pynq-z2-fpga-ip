@@ -1220,7 +1220,8 @@ module rtps_fastpath_ip #(
     reg [11:0]         tx_frag_bram_base;
     reg [11:0]         tx_frag_bram_words;
     reg [11:0]         tx_scan_cnt;
-    reg [15:0]         tx_scan_csum;
+    reg [31:0]         tx_scan_csum;
+    wire [31:0]        tx_scan_word_be = bswap32(tx_sample_dout);
     reg [15:0]         tx_frag_csum_seed;
 
     // Latch active Writer[0] fields
@@ -2714,7 +2715,7 @@ module rtps_fastpath_ip #(
                             end
                             2'd1: begin
                                 if (tx_frag_bram_words == 12'd0) begin
-                                    tx_frag_csum_seed <= tx_scan_csum;
+                                    tx_frag_csum_seed <= csum_add32(16'd0, tx_scan_csum);
                                     tx_init_phase     <= 2'd3;
                                 end else begin
                                     tx_sample_rd_addr <= tx_sample_rd_addr + 11'd1;
@@ -2722,7 +2723,7 @@ module rtps_fastpath_ip #(
                                 end
                             end
                             2'd2: begin
-                                tx_scan_csum <= csum_add32(tx_scan_csum, bswap32(tx_sample_dout));
+                                tx_scan_csum <= tx_scan_csum + {16'd0, tx_scan_word_be[31:16]} + {16'd0, tx_scan_word_be[15:0]};
                                 if (tx_scan_cnt == (tx_frag_bram_words - 12'd1)) begin
                                     tx_init_phase <= 2'd3;
                                 end else begin
@@ -2731,7 +2732,7 @@ module rtps_fastpath_ip #(
                                 end
                             end
                             default: begin
-                                tx_frag_csum_seed <= tx_scan_csum;
+                                tx_frag_csum_seed <= csum_add32(16'd0, tx_scan_csum);
                                 tx_sample_rd_addr <= tx_frag_bram_base[ADDR_WIDTH-1:0];
                                 tx_dgram_word_idx <= 12'd0;
                                 tx_beat_idx       <= 12'd0;

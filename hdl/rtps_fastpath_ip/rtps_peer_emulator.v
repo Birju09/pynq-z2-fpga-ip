@@ -211,7 +211,8 @@ module rtps_peer_emulator #(
     // TX Init UDP Checksum Scan
     reg [1:0]  tx_init_phase;
     reg [11:0] scan_cnt;
-    reg [15:0] scan_csum_accum;
+    reg [31:0] scan_csum_accum;
+    wire [31:0] scan_word_be = bswap32(tx_sample_dout);
     reg [2:0]  csum_pipe_cnt;
     reg [15:0] tx_frag_csum_seed;
 
@@ -928,7 +929,7 @@ module rtps_peer_emulator #(
                             2'd1: begin
                                 // 1-cycle BRAM read wait
                                 if (cur_frag_bram_words == 12'd0) begin
-                                    tx_frag_csum_seed <= scan_csum_accum;
+                                    tx_frag_csum_seed <= csum_add32(16'd0, scan_csum_accum);
                                     csum_pipe_cnt     <= 3'd0;
                                     tx_init_phase     <= 2'd3;
                                 end else begin
@@ -937,7 +938,7 @@ module rtps_peer_emulator #(
                                 end
                             end
                             2'd2: begin
-                                scan_csum_accum <= csum_add32(scan_csum_accum, bswap32(tx_sample_dout));
+                                scan_csum_accum <= scan_csum_accum + {16'd0, scan_word_be[31:16]} + {16'd0, scan_word_be[15:0]};
                                 if (scan_cnt == (cur_frag_bram_words - 12'd1)) begin
                                     tx_init_phase <= 2'd3;
                                     csum_pipe_cnt <= 3'd0;
@@ -947,9 +948,9 @@ module rtps_peer_emulator #(
                                 end
                             end
                             2'd3: begin
-                                // Latch scan_csum_accum into tx_frag_csum_seed on cycle 0, wait 4 cycles for emu_ucs_fold
+                                // Latch folded scan_csum_accum into tx_frag_csum_seed on cycle 0, wait 4 cycles for emu_ucs_fold
                                 if (csum_pipe_cnt == 3'd0) begin
-                                    tx_frag_csum_seed <= scan_csum_accum;
+                                    tx_frag_csum_seed <= csum_add32(16'd0, scan_csum_accum);
                                 end
                                 if (csum_pipe_cnt < 3'd5) begin
                                     csum_pipe_cnt <= csum_pipe_cnt + 3'd1;
