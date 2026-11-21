@@ -137,6 +137,16 @@ module rtps_fastpath_ip #(
 );
 
     // =========================================================================
+    // Local 2-stage reset pipeline to isolate global proc_sys_reset fanout
+    // =========================================================================
+    (* DONT_TOUCH = "yes" *) reg rst_n_pipe1;
+    (* max_fanout = 64 *)    reg rst_n_local;
+    always @(posedge clk) begin
+        rst_n_pipe1 <= rst_n;
+        rst_n_local <= rst_n_pipe1;
+    end
+
+    // =========================================================================
     // AXI4-Lite Register Word Indices (s_axi_a*addr[CFG_ADDR_WIDTH+1:2])
     // =========================================================================
     localparam [CFG_ADDR_WIDTH-1:0]
@@ -365,7 +375,7 @@ module rtps_fastpath_ip #(
     reg [15:0] payload_csum_accum;
 
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n_local) begin
             crc_accum          <= 32'd0;
             payload_csum_accum <= 16'h0000;
         end else if (axis_wr) begin
@@ -419,7 +429,7 @@ module rtps_fastpath_ip #(
         .MAX_DGRAM_W (REASM_DEPTH)
     ) u_rtps_peer_emulator (
         .clk              (clk),
-        .rst_n            (rst_n && emu_enable),
+        .rst_n            (rst_n_local && emu_enable),
         .fault_ctrl       (fault_inject_reg),
         .tx_ip_frag_mode  (tx_ip_frag_mode),
         .cfg_frag_size    (cfg_frag_size[15:0]),
@@ -442,7 +452,7 @@ module rtps_fastpath_ip #(
     // 1 ns = 2^32 / 10^9 = 4.294967296 fractional units; in Q32.16: 281,475 per ns
     wire [48:0] next_frac_acc = {1'b0, free_running_frac_acc} + ({33'd0, cfg_clk_period_ns} * 49'd281475);
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n_local) begin
             free_running_sec      <= 32'd1;
             free_running_frac_acc <= 48'd0;
             wdog_counter          <= 32'd0;
@@ -486,7 +496,7 @@ module rtps_fastpath_ip #(
 
     integer ep_i, w_i;
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n_local) begin
             s_axi_awready            <= 1'b1;
             s_axi_wready             <= 1'b1;
             s_axi_bvalid             <= 1'b0;
@@ -739,7 +749,7 @@ module rtps_fastpath_ip #(
     always @(posedge clk) lifecycle_ok_q <= lifecycle_ok;
 
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n_local) begin
             s_axi_arready <= 1'b0;
             s_axi_rvalid  <= 1'b0;
             s_axi_rdata   <= 32'd0;
@@ -987,7 +997,7 @@ module rtps_fastpath_ip #(
 
     // Header checksum accumulates one cycle after the beat is captured; tlast cannot occur before beat 9 for a valid UDP frame.
     always @(posedge clk) begin
-        if (!rst_n)
+        if (!rst_n_local)
             rx_hdr_csum_accum <= 16'd0;
         else if (rx_hdr_init)
             rx_hdr_csum_accum <= csum_add32(16'h0000, rx_hdr_word);
@@ -1044,7 +1054,7 @@ module rtps_fastpath_ip #(
     wire [15:0] rx_pseudo_fold2 = rx_pseudo_fold1[15:0] + {15'd0, rx_pseudo_fold1[16]};
 
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n_local) begin
             rx_ip_pseudo_sum   <= 20'd0;
             rx_pseudo_sum_pipe <= 20'd0;
             rx_pseudo_csum     <= 16'd0;
@@ -1059,14 +1069,14 @@ module rtps_fastpath_ip #(
 
     // Separate UDP payload checksum accumulators for IPv4-frag vs unfragmented staging
     always @(posedge clk) begin
-        if (!rst_n || rx_csum_clr)
+        if (!rst_n_local || rx_csum_clr)
             frag_udp_csum_accum <= 16'd0;
         else if ((rx_state == R_IDLE || rx_state == R_REASM_CHECK) && reasm_wr_en)
             frag_udp_csum_accum <= csum_add32(frag_udp_csum_accum, reasm_wr_data);
     end
 
     always @(posedge clk) begin
-        if (!rst_n || pkt_csum_clr)
+        if (!rst_n_local || pkt_csum_clr)
             pkt_udp_csum_accum <= 16'd0;
         else if (rx_pkt_wr_en)
             pkt_udp_csum_accum <= csum_add32(pkt_udp_csum_accum, rx_pkt_wr_data);
@@ -1242,7 +1252,7 @@ module rtps_fastpath_ip #(
     // Freeze tx_sample_dout when pacing_timer > 0 so multi-cycle beats don't lose prefetched data
     reg [DATA_WIDTH-1:0] tx_sample_buf;
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n_local) begin
             tx_sample_buf <= 32'd0;
         end else if (pacing_timer == cfg_pacing_timer[15:0]) begin
             tx_sample_buf <= tx_sample_dout;
@@ -1367,17 +1377,10 @@ module rtps_fastpath_ip #(
     wire [15:0] ucs_folded    = ucs_fold_tmp2[15:0] + {15'd0, ucs_fold_tmp2[16]};
 
     always @(posedge clk) begin
-        if (!rst_n) begin
-            ucs_tree_0     <= 24'd0;
-            ucs_tree_1     <= 24'd0;
-            ucs_tree_2     <= 24'd0;
-            ucs_final_fold <= 16'd0;
-        end else begin
-            ucs_tree_0     <= ucs_stg0_sum;
-            ucs_tree_1     <= ucs_stg1_sum;
-            ucs_tree_2     <= ucs_stg2_sum;
-            ucs_final_fold <= ucs_folded;
-        end
+        ucs_tree_0     <= ucs_stg0_sum;
+        ucs_tree_1     <= ucs_stg1_sum;
+        ucs_tree_2     <= ucs_stg2_sum;
+        ucs_final_fold <= ucs_folded;
     end
     wire [15:0] calc_tx_udp_csum = (~ucs_final_fold == 16'h0000) ? 16'hFFFF : ~ucs_final_fold;
 
@@ -1387,17 +1390,12 @@ module rtps_fastpath_ip #(
     wire [16:0] ipcs_fold1 = {1'b0, ipcs_stg0[15:0]} + {13'd0, ipcs_stg0[19:16]};
     wire [15:0] ipcs_fold2 = ipcs_fold1[15:0] + {15'd0, ipcs_fold1[16]};
     always @(posedge clk) begin
-        if (!rst_n) begin
-            ipcs_stg0 <= 20'd0;
-            ipcs_stg1 <= 16'd0;
-        end else begin
-            ipcs_stg0 <= {4'd0, 16'h4500} + {4'd0, tx_frag_ip_len} +
-                         {4'd0, tx_ip_id_counter} + {4'd0, tx_frag_flags} +
-                         {4'd0, 16'h4011} +
-                         {4'd0, local_src_ip[31:16]} + {4'd0, local_src_ip[15:0]} +
-                         {4'd0, wr0_dst_ip[31:16]}   + {4'd0, wr0_dst_ip[15:0]};
-            ipcs_stg1 <= ~ipcs_fold2;
-        end
+        ipcs_stg0 <= {4'd0, 16'h4500} + {4'd0, tx_frag_ip_len} +
+                     {4'd0, tx_ip_id_counter} + {4'd0, tx_frag_flags} +
+                     {4'd0, 16'h4011} +
+                     {4'd0, local_src_ip[31:16]} + {4'd0, local_src_ip[15:0]} +
+                     {4'd0, wr0_dst_ip[31:16]}   + {4'd0, wr0_dst_ip[15:0]};
+        ipcs_stg1 <= ~ipcs_fold2;
     end
     wire [15:0] calc_tx_ip_hdr_csum = ipcs_stg1;
 
@@ -1459,7 +1457,7 @@ module rtps_fastpath_ip #(
     // =========================================================================
     integer rst_ep;
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n_local) begin
             state                   <= S_IDLE;
             rx_ptr                  <= 0;
             pkt_len                 <= 0;
