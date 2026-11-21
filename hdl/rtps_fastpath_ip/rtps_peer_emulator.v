@@ -133,7 +133,12 @@ module rtps_peer_emulator #(
     reg [11:0] copy_dst_idx;
     reg [11:0] copy_end_idx;
 
+    // Single write port so rx_pkt_ram infers BRAM
+    wire rxp_we = (state == E_RX_FRAMES) && rx_fire && (rx_beat_idx > 12'd8) && !cur_is_ip_frag &&
+                  (rx_pkt_wr_ptr < {1'b0, ip_payload_len[10:2]}) && (rx_pkt_wr_ptr < 10'd511);
+
     always @(posedge clk) begin
+        if (rxp_we) rx_pkt_ram[rx_pkt_wr_ptr] <= {rx_prev_half, s_axis_tdata[31:16]};
         pkt_ram_dout <= rx_pkt_ram[pkt_rd_addr];
     end
 
@@ -147,13 +152,29 @@ module rtps_peer_emulator #(
     reg [15:0] payload_words_cfg; // e.g. 1024 words (4096 bytes)
     reg [31:0] echo_ts_0;
     reg [31:0] echo_ts_1;
+    reg        echo_keep; // echo_ts_0/1 already hold the INFO_TS words (staged path)
 
     reg [11:0] rx_ram_rd_addr;
     reg [31:0] rx_ram_dout;
     reg [11:0] tx_sample_rd_addr;
     reg [31:0] tx_sample_dout;
 
+    // Single write port so rx_dgram_ram infers BRAM (wire-frame writer or staging copy)
+    wire rxd_wire_we = (state == E_RX_FRAMES) && rx_fire && (rx_beat_idx > 12'd8) && cur_is_ip_frag &&
+                       (rx_dgram_wr_ptr < (frag_word_start + ip_payload_len[13:2]));
+    wire pkt_single_prime = (pkt_rd_addr == 10'd17) && (copy_src_idx == 12'd17) && (copy_dst_idx == 12'd17);
+    wire pkt_df_hold      = (pkt_rd_addr == 10'd18) ||
+                            (pkt_rd_addr == 10'd19 && copy_src_idx == 12'd0) ||
+                            (copy_src_idx == 12'd1) || (copy_src_idx == 12'd2);
+    wire rxd_copy_we = (state == E_RX_PKT_STAGE) && (pkt_substate == 3'd7) &&
+                       (copy_src_idx < copy_end_idx) &&
+                       ((pkt_submsg_id == 8'h15) ? !pkt_single_prime : !pkt_df_hold);
+    wire        rxd_we = rxd_wire_we || rxd_copy_we;
+    wire [11:0] rxd_wa = rxd_copy_we ? copy_dst_idx : rx_dgram_wr_ptr;
+    wire [31:0] rxd_wd = rxd_copy_we ? pkt_ram_dout : {rx_prev_half, s_axis_tdata[31:16]};
+
     always @(posedge clk) begin
+        if (rxd_we) rx_dgram_ram[rxd_wa] <= rxd_wd;
         rx_ram_dout <= rx_dgram_ram[rx_ram_rd_addr];
     end
 
@@ -167,6 +188,8 @@ module rtps_peer_emulator #(
     wire        use_data_frag      = (!tx_ip_frag_mode) && (sample_total_bytes > eff_frag_bytes);
 
     reg [15:0] total_frags_tx;
+    reg [15:0] tx_calc_rem;
+    reg [15:0] tx_calc_count;
     reg [15:0] frag_step;
     reg [15:0] active_frag_idx;
     reg [15:0] tx_bytes_remaining;
@@ -194,7 +217,17 @@ module rtps_peer_emulator #(
     reg [15:0] tx_prev_half;
 
     wire tx_beat_load = (state == E_TX_STREAM) && (!m_axis_tvalid || m_axis_tready);
+    // Single write port so tx_sample_ram infers BRAM
+    wire        tsr_we = (state == E_BUILD_DGRAM) && !build_prime &&
+                         !(build_idx == 12'd0 && rx_ram_rd_addr == 12'd9) &&
+                         !(build_idx == 12'd0 && rx_ram_rd_addr == 12'd17) &&
+                         (build_idx == 12'd1 || copy_dst_idx < payload_words_cfg[11:0]);
+    wire [11:0] tsr_wa = (build_idx == 12'd1) ? 12'd0 : copy_dst_idx;
+    wire [31:0] tsr_wd = (build_idx == 12'd1 || copy_dst_idx < 12'd4) ? bswap32(rx_ram_dout) :
+                         ((~bswap32(rx_ram_dout)) + {16'h0000, peer_seq_num[5:0], 10'h200});
+
     always @(posedge clk) begin
+        if (tsr_we) tx_sample_ram[tsr_wa] <= tsr_wd;
         if (state != E_TX_STREAM || tx_beat_load) begin
             tx_sample_dout <= tx_sample_ram[tx_sample_rd_addr];
         end
@@ -309,19 +342,11 @@ module rtps_peer_emulator #(
     wire [15:0] emu_ucs_f3    = emu_ucs_f2[15:0] + {15'd0, emu_ucs_f2[16]};
 
     always @(posedge clk) begin
-        if (!rst_n) begin
-            emu_ucs_tree0 <= 24'd0;
-            emu_ucs_tree1 <= 24'd0;
-            emu_ucs_tree2 <= 24'd0;
-            emu_ucs_pre   <= 24'd0;
-            emu_ucs_fold  <= 16'd0;
-        end else begin
-            emu_ucs_tree0 <= emu_ucs_stg0;
-            emu_ucs_tree1 <= emu_ucs_stg1;
-            emu_ucs_pre   <= emu_ucs_pre_sum;
-            emu_ucs_tree2 <= emu_ucs_stg2;
-            emu_ucs_fold  <= emu_ucs_f3;
-        end
+        emu_ucs_tree0 <= emu_ucs_stg0;
+        emu_ucs_tree1 <= emu_ucs_stg1;
+        emu_ucs_pre   <= emu_ucs_pre_sum;
+        emu_ucs_tree2 <= emu_ucs_stg2;
+        emu_ucs_fold  <= emu_ucs_f3;
     end
 
     // Pipelined IPv4 header checksum engine
@@ -330,17 +355,12 @@ module rtps_peer_emulator #(
     wire [16:0] emu_ipcs_fold1 = {1'b0, emu_ipcs_stg0[15:0]} + {13'd0, emu_ipcs_stg0[19:16]};
     wire [15:0] emu_ipcs_fold2 = emu_ipcs_fold1[15:0] + {15'd0, emu_ipcs_fold1[16]};
     always @(posedge clk) begin
-        if (!rst_n) begin
-            emu_ipcs_stg0 <= 20'd0;
-            emu_ipcs_stg1 <= 16'd0;
-        end else begin
-            emu_ipcs_stg0 <= {4'd0, 16'h4500} + {4'd0, cur_frag_ip_len} +
-                             {4'd0, peer_ip_id} + {4'd0, cur_frag_flags} +
-                             {4'd0, 16'h4011} +
-                             {4'd0, latched_dst_ip[31:16]} + {4'd0, latched_dst_ip[15:0]} +
-                             {4'd0, latched_src_ip[31:16]} + {4'd0, latched_src_ip[15:0]};
-            emu_ipcs_stg1 <= ~emu_ipcs_fold2;
-        end
+        emu_ipcs_stg0 <= {4'd0, 16'h4500} + {4'd0, cur_frag_ip_len} +
+                         {4'd0, peer_ip_id} + {4'd0, cur_frag_flags} +
+                         {4'd0, 16'h4011} +
+                         {4'd0, latched_dst_ip[31:16]} + {4'd0, latched_dst_ip[15:0]} +
+                         {4'd0, latched_src_ip[31:16]} + {4'd0, latched_src_ip[15:0]};
+        emu_ipcs_stg1 <= ~emu_ipcs_fold2;
     end
 
     // Outgoing Ethernet + IPv4 + Fragment word mux
@@ -380,8 +400,16 @@ module rtps_peer_emulator #(
         end
     endfunction
 
+    // Local 2-stage reset pipeline to isolate global proc_sys_reset fanout
+    (* DONT_TOUCH = "yes" *) reg rst_n_pipe1;
+    (* max_fanout = 64 *)    reg rst_n_local;
     always @(posedge clk) begin
-        if (!rst_n) begin
+        rst_n_pipe1 <= rst_n;
+        rst_n_local <= rst_n_pipe1;
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n_local) begin
             state                 <= E_RX_FRAMES;
             rx_beat_idx           <= 12'd0;
             latched_src_ip        <= 32'hC0A8_01C9;
@@ -423,6 +451,7 @@ module rtps_peer_emulator #(
             payload_words_cfg     <= 16'd1024;
             echo_ts_0             <= 32'd0;
             echo_ts_1             <= 32'd0;
+            echo_keep             <= 1'b0;
             rx_ram_rd_addr        <= 12'd0;
             tx_sample_rd_addr     <= 12'd0;
 
@@ -462,6 +491,7 @@ module rtps_peer_emulator #(
                 E_RX_FRAMES: begin
                     m_axis_tvalid <= 1'b0;
                     m_axis_tlast  <= 1'b0;
+                    echo_keep     <= 1'b0;
 
                     if (rx_fire) begin
                         case (rx_beat_idx)
@@ -505,7 +535,6 @@ module rtps_peer_emulator #(
                             default: begin
                                 if (cur_is_ip_frag) begin
                                     if (rx_dgram_wr_ptr < (frag_word_start + ip_payload_len[13:2])) begin
-                                        rx_dgram_ram[rx_dgram_wr_ptr] <= {rx_prev_half, s_axis_tdata[31:16]};
                                         rx_dgram_wr_ptr               <= rx_dgram_wr_ptr + 12'd1;
                                         if (frag_offset_8b == 13'd0 && rx_dgram_wr_ptr == 12'd0)
                                             latched_dst_port <= s_axis_tdata[31:16];
@@ -514,7 +543,6 @@ module rtps_peer_emulator #(
                                     end
                                 end else begin
                                     if (rx_pkt_wr_ptr < {1'b0, ip_payload_len[10:2]} && rx_pkt_wr_ptr < 10'd511) begin
-                                        rx_pkt_ram[rx_pkt_wr_ptr] <= {rx_prev_half, s_axis_tdata[31:16]};
                                         rx_pkt_wr_ptr             <= rx_pkt_wr_ptr + 10'd1;
                                         if (rx_pkt_wr_ptr == 10'd0)
                                             latched_dst_port <= s_axis_tdata[31:16];
@@ -632,14 +660,12 @@ module rtps_peer_emulator #(
                                     // Prime +1 for 1-cycle BRAM latency
                                     pkt_rd_addr <= 10'd18;
                                 end else if (copy_src_idx < copy_end_idx) begin
-                                    rx_dgram_ram[copy_dst_idx] <= pkt_ram_dout;
                                     copy_src_idx               <= copy_src_idx + 12'd1;
                                     copy_dst_idx               <= copy_dst_idx + 12'd1;
                                     pkt_rd_addr                <= pkt_rd_addr + 10'd1;
                                 end else begin
                                     // Done copying single DATA payload!
-                                    rx_dgram_ram[8] <= echo_ts_0;
-                                    rx_dgram_ram[9] <= echo_ts_1;
+                                    echo_keep       <= 1'b1;
                                     peer_seq_num    <= fault_ctrl[3] ? ((peer_seq_num == 64'd0) ? 64'd1 : peer_seq_num)
                                                                      : (peer_seq_num + 64'd1);
                                     peer_ip_id      <= peer_ip_id + 16'd1;
@@ -682,7 +708,6 @@ module rtps_peer_emulator #(
                                     copy_src_idx <= 12'd19;
                                     pkt_rd_addr  <= 10'd20;
                                 end else if (copy_src_idx < copy_end_idx) begin
-                                    rx_dgram_ram[copy_dst_idx] <= pkt_ram_dout;
                                     copy_src_idx               <= copy_src_idx + 12'd1;
                                     copy_dst_idx               <= copy_dst_idx + 12'd1;
                                     pkt_rd_addr                <= pkt_rd_addr + 10'd1;
@@ -694,8 +719,7 @@ module rtps_peer_emulator #(
                                         active_df_valid   <= 1'b0;
                                         active_df_bitmap  <= 32'd0;
                                         payload_words_cfg <= pkt_df_sample_size[13:2] - 16'd1;
-                                        rx_dgram_ram[8]   <= echo_ts_0;
-                                        rx_dgram_ram[9]   <= echo_ts_1;
+                                        echo_keep         <= 1'b1;
                                         peer_seq_num      <= fault_ctrl[3] ? ((peer_seq_num == 64'd0) ? 64'd1 : peer_seq_num)
                                                                            : (peer_seq_num + 64'd1);
                                         peer_ip_id        <= peer_ip_id + 16'd1;
@@ -721,28 +745,29 @@ module rtps_peer_emulator #(
                         rx_ram_rd_addr <= 12'd9;
                         build_prime    <= 1'b0;
                         build_idx      <= 12'd0;
+                        tx_calc_rem    <= sample_total_bytes;
+                        tx_calc_count  <= 16'd0;
                     end else if (build_idx == 12'd0 && rx_ram_rd_addr == 12'd9) begin
-                        echo_ts_0      <= rx_ram_dout;
+                        if (!echo_keep) echo_ts_0 <= rx_ram_dout;
                         rx_ram_rd_addr <= 12'd17;
                     end else if (build_idx == 12'd0 && rx_ram_rd_addr == 12'd17) begin
-                        echo_ts_1      <= rx_ram_dout;
+                        if (!echo_keep) echo_ts_1 <= rx_ram_dout;
                         rx_ram_rd_addr <= 12'd18;
                         build_idx      <= 12'd1; // Signal payload loop
                     end else begin
+                        if (tx_calc_rem > eff_frag_bytes) begin
+                            tx_calc_rem   <= tx_calc_rem - eff_frag_bytes;
+                            tx_calc_count <= tx_calc_count + 16'd1;
+                        end
                         // Use copy_dst_idx as tx_sample_ram write pointer (starting at 0)
                         if (build_idx == 12'd1) begin
-                            tx_sample_ram[0] <= bswap32(rx_ram_dout); // Word 0: host-LE cycle_id intact
                             copy_dst_idx     <= 12'd1;
                             rx_ram_rd_addr   <= 12'd19;
                             build_idx        <= 12'd2;
                         end else if (copy_dst_idx < payload_words_cfg[11:0]) begin
-                            if (copy_dst_idx < 12'd4)
-                                tx_sample_ram[copy_dst_idx] <= bswap32(rx_ram_dout);
-                            else
-                                tx_sample_ram[copy_dst_idx] <= (~bswap32(rx_ram_dout)) + {16'h0000, peer_seq_num[5:0], 10'h200};
                             copy_dst_idx   <= copy_dst_idx + 12'd1;
                             rx_ram_rd_addr <= rx_ram_rd_addr + 12'd1;
-                        end else begin
+                        end else if (tx_ip_frag_mode || use_single_data || tx_calc_rem <= eff_frag_bytes) begin
                             copy_dst_idx         <= 12'd0;
                             frag_step            <= 16'd0;
                             tx_bytes_remaining   <= tx_ip_frag_mode ? ipfrag_udp_total_bytes : sample_total_bytes;
@@ -754,7 +779,7 @@ module rtps_peer_emulator #(
                             end else if (use_single_data) begin
                                 total_frags_tx <= 16'd1;
                             end else begin
-                                total_frags_tx <= (sample_total_bytes + eff_frag_bytes - 16'd1) / eff_frag_bytes;
+                                total_frags_tx <= tx_calc_count + 16'd1;
                             end
                             state <= E_TX_INIT;
                         end
