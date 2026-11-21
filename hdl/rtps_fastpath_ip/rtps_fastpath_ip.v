@@ -1229,9 +1229,12 @@ module rtps_fastpath_ip #(
     wire [31:0] wr0_reader_id  = active_wr_edt[0][6];
 
     // Clamped 4B-aligned fragmentSize for TX DATA_FRAG (4..1404 bytes)
-    wire [15:0] tx_eff_frag_bytes = (cfg_frag_size[15:0] < 16'd4)          ? 16'd4 :
-                                    (cfg_frag_size[15:0] > TX_DF_FRAG_MAX) ? TX_DF_FRAG_MAX[15:0] :
-                                    {cfg_frag_size[15:2], 2'b00};
+    reg [15:0] tx_eff_frag_bytes;
+    always @(posedge clk) begin
+        tx_eff_frag_bytes <= (cfg_frag_size[15:0] < 16'd4)          ? 16'd4 :
+                             (cfg_frag_size[15:0] > TX_DF_FRAG_MAX) ? TX_DF_FRAG_MAX[15:0] :
+                             {cfg_frag_size[15:2], 2'b00};
+    end
     wire [15:0] tx_sample_total_bytes = {2'b00, pkt_len[11:0], 2'b00} + 16'd4; // CDR_LE (4B) + FastSample
     wire        tx_use_single_data    = (!tx_ip_frag_mode) && (tx_sample_total_bytes <= tx_eff_frag_bytes);
     wire        tx_use_data_frag      = (!tx_ip_frag_mode) && (tx_sample_total_bytes > tx_eff_frag_bytes);
@@ -1344,6 +1347,7 @@ module rtps_fastpath_ip #(
                                {8'd0, local_guid_prefix[63:48]} + {8'd0, local_guid_prefix[47:32]} +
                                {8'd0, local_guid_prefix[31:16]} + {8'd0, local_guid_prefix[15:0]};
 
+    reg  [23:0] ucs_submsg_r;
     wire [23:0] ucs_submsg_sum = tx_use_data_frag ?
         ({8'd0, 8'h16, 8'h01} + {8'd0, tx_df_octets_wire} + {8'd0, 16'h1C00} +
          {8'd0, tx_df_start_wire[31:16]} + {8'd0, tx_df_start_wire[15:0]} +
@@ -1365,8 +1369,11 @@ module rtps_fastpath_ip #(
                                {8'd0, cur_tx_seq[55:48], cur_tx_seq[63:56]} +
                                {8'd0, cur_tx_seq[7:0],   cur_tx_seq[15:8]}  +
                                {8'd0, cur_tx_seq[23:16], cur_tx_seq[31:24]} +
-                               ucs_submsg_sum;
-    always @(posedge clk) ucs_pre <= ucs_pre_sum;
+                               ucs_submsg_r;
+    always @(posedge clk) begin
+        ucs_submsg_r <= ucs_submsg_sum;
+        ucs_pre      <= ucs_pre_sum;
+    end
 
     // Stage 3: combine tree_1 with the pre-summed terms
     wire [23:0] ucs_stg2_sum = ucs_tree_1 + ucs_pre;
