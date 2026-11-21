@@ -179,9 +179,12 @@ module rtps_peer_emulator #(
     end
 
     // Effective TX fragment size (4B-aligned, 4..1404 bytes)
-    wire [15:0] eff_frag_bytes = (cfg_frag_size < 16'd4)    ? 16'd4 :
-                                 (cfg_frag_size > 16'd1404) ? 16'd1404 :
-                                 {cfg_frag_size[15:2], 2'b00};
+    reg [15:0] eff_frag_bytes;
+    always @(posedge clk) begin
+        eff_frag_bytes <= (cfg_frag_size < 16'd4)    ? 16'd4 :
+                           (cfg_frag_size > 16'd1404) ? 16'd1404 :
+                           {cfg_frag_size[15:2], 2'b00};
+    end
 
     wire [15:0] sample_total_bytes = {2'b00, payload_words_cfg[11:0], 2'b00} + 16'd4; // CDR_LE (4B) + payload
     wire        use_single_data    = (!tx_ip_frag_mode) && (sample_total_bytes <= eff_frag_bytes);
@@ -316,6 +319,7 @@ module rtps_peer_emulator #(
                                {8'd0, peer_guid_prefix[63:48]} + {8'd0, peer_guid_prefix[47:32]} +
                                {8'd0, peer_guid_prefix[31:16]} + {8'd0, peer_guid_prefix[15:0]};
 
+    reg [23:0] emu_ucs_submsg_sum_reg;
     wire [23:0] emu_ucs_submsg_sum = use_data_frag ?
         ({8'd0, 16'h1601} + {8'd0, df_octets_wire} + {8'd0, 16'h1C00} +
          {8'd0, df_frag_start_wire[31:16]} + {8'd0, df_frag_start_wire[15:0]} +
@@ -334,7 +338,7 @@ module rtps_peer_emulator #(
                                   {8'd0, peer_seq_num[55:48], peer_seq_num[63:56]} +
                                   {8'd0, peer_seq_num[7:0],   peer_seq_num[15:8]}  +
                                   {8'd0, peer_seq_num[23:16], peer_seq_num[31:24]} +
-                                  emu_ucs_submsg_sum;
+                                  emu_ucs_submsg_sum_reg;
 
     wire [23:0] emu_ucs_stg2  = emu_ucs_tree1 + emu_ucs_pre;
     wire [19:0] emu_ucs_f1    = {4'd0, emu_ucs_tree2[15:0]} + {12'd0, emu_ucs_tree2[23:16]};
@@ -345,6 +349,7 @@ module rtps_peer_emulator #(
         emu_ucs_tree0 <= emu_ucs_stg0;
         emu_ucs_tree1 <= emu_ucs_stg1;
         emu_ucs_pre   <= emu_ucs_pre_sum;
+        emu_ucs_submsg_sum_reg <= emu_ucs_submsg_sum;
         emu_ucs_tree2 <= emu_ucs_stg2;
         emu_ucs_fold  <= emu_ucs_f3;
     end
