@@ -1132,6 +1132,8 @@ module rtps_fastpath_ip #(
     reg [15:0] df_submsg_bytes;
     reg [15:0] df_chunk_bytes;
     reg [5:0]  df_total_frags;
+    reg [31:0] df_frag_mask_add_r;
+    reg [31:0] df_frag_mask_all_r;
 
     reg        df_active_valid;
     reg [1:0]  df_active_cam_idx;
@@ -1329,19 +1331,21 @@ module rtps_fastpath_ip #(
     reg [23:0] ucs_tree_0, ucs_tree_1, ucs_tree_2;
     reg [15:0] ucs_final_fold;
 
+    reg  [15:0] ucs_udp_len_r;
     wire [15:0] ucs_udp_len   = tx_use_data_frag ? tx_frag_payload_bytes : tx_udp_total_bytes;
+    always @(posedge clk) ucs_udp_len_r <= ucs_udp_len;
     wire [15:0] ucs_seed_csum = tx_ip_frag_mode  ? payload_csum_accum    : tx_frag_csum_seed;
 
     // Stage 1: Sum payload checksum, IPs, UDP len/proto, ports
     wire [23:0] ucs_stg0_sum = {8'd0, ucs_seed_csum} +
                                {8'd0, local_src_ip[31:16]} + {8'd0, local_src_ip[15:0]} +
                                {8'd0, wr0_dst_ip[31:16]}   + {8'd0, wr0_dst_ip[15:0]} +
-                               {8'd0, 16'h0011}            + {8'd0, ucs_udp_len} +
+                               {8'd0, 16'h0011}            + {8'd0, ucs_udp_len_r} +
                                {8'd0, wr0_src_port}        + {8'd0, wr0_dst_port};
 
     // Stage 2: Sum UDP len + RTPS magic, version/vendor, guidPrefix
     wire [23:0] ucs_stg1_sum = ucs_tree_0 +
-                               {8'd0, ucs_udp_len} + 24'd0 +
+                               {8'd0, ucs_udp_len_r} + 24'd0 +
                                {8'd0, 16'h5254} + {8'd0, 16'h5053} +
                                {8'd0, 16'h0201} + {8'd0, local_vendor_id} +
                                {8'd0, local_guid_prefix[95:80]} + {8'd0, local_guid_prefix[79:64]} +
@@ -2399,6 +2403,10 @@ module rtps_fastpath_ip #(
                 end
 
                 R_DF_COPY_PRIME: begin
+                    // Pre-compute fragment bitmasks in R_DF_COPY_PRIME so R_DF_COPY_LOOP has no barrel shifters
+                    df_frag_mask_add_r <= (((df_frags_in_submsg >= 16'd32) ? 32'hFFFF_FFFF : ((32'd1 << df_frags_in_submsg[4:0]) - 32'd1))
+                                           << (df_frag_start[4:0] - 5'd1));
+                    df_frag_mask_all_r <= (df_active_total_frags >= 6'd32) ? 32'hFFFF_FFFF : ((32'd1 << df_active_total_frags[4:0]) - 32'd1);
                     // Check packet isn't truncated past UDP length
                     if (({df_pay_start_word, 2'b00} + df_chunk_bytes) > walk_udp_len_bytes || df_chunk_bytes == 16'd0) begin
                         rx_state <= R_IDLE;
@@ -2415,8 +2423,6 @@ module rtps_fastpath_ip #(
                     reg [2:0]  cnt_bytes;
                     reg [3:0]  lane_be;
                     reg [31:0] shifted_word;
-                    reg [31:0] frag_mask_add;
-                    reg [31:0] frag_mask_all;
                     integer    bi;
 
                     s_byte      = df_first_beat ? df_shift : 2'd0;
@@ -2445,13 +2451,9 @@ module rtps_fastpath_ip #(
                     walker_rd_addr   <= walker_rd_addr + 12'd1;
 
                     if (df_rem_bytes <= {13'd0, cnt_bytes}) begin
-                        // Update received-fragment bitmask
-                        frag_mask_add = (((df_frags_in_submsg >= 16'd32) ? 32'hFFFF_FFFF : ((32'd1 << df_frags_in_submsg[4:0]) - 32'd1))
-                                         << (df_frag_start[4:0] - 5'd1));
-                        frag_mask_all = (df_active_total_frags >= 6'd32) ? 32'hFFFF_FFFF : ((32'd1 << df_active_total_frags[4:0]) - 32'd1);
-
-                        df_frag_bitmap <= df_frag_bitmap | frag_mask_add;
-                        if (((df_frag_bitmap | frag_mask_add) & frag_mask_all) == frag_mask_all) begin
+                        // Update received-fragment bitmask using pre-computed masks
+                        df_frag_bitmap <= df_frag_bitmap | df_frag_mask_add_r;
+                        if (((df_frag_bitmap | df_frag_mask_add_r) & df_frag_mask_all_r) == df_frag_mask_all_r) begin
                             df_synth_idx <= 4'd0;
                             rx_state     <= R_DF_SYNTH_HDR;
                         end else if (walk_next_submsg_word < walk_dgram_words) begin
