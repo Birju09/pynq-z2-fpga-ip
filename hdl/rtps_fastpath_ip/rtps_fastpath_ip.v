@@ -417,12 +417,52 @@ module rtps_fastpath_ip #(
     assign m_axis_wire_tlast  = eng_tx_tlast;
     assign eng_tx_tready      = emu_enable ? emu_tx_tready : m_axis_wire_tready;
 
+    // AXI4-Stream 1-stage skid buffer on s_axis_wire to isolate external FIFO timing
+    reg                   wire_in_valid, wire_skid_valid;
+    reg  [DATA_WIDTH-1:0] wire_in_data,  wire_skid_data;
+    reg                   wire_in_last,  wire_skid_last;
+
+    wire wire_in_accept = !emu_enable && s_axis_wire_tvalid && !wire_skid_valid;
+    wire wire_out_fire  = !emu_enable && wire_in_valid && eng_rx_tready;
+
+    always @(posedge clk) begin
+        if (!rst_n_local) begin
+            wire_in_valid   <= 1'b0;
+            wire_skid_valid <= 1'b0;
+            wire_in_data    <= {DATA_WIDTH{1'b0}};
+            wire_skid_data  <= {DATA_WIDTH{1'b0}};
+            wire_in_last    <= 1'b0;
+            wire_skid_last  <= 1'b0;
+        end else begin
+            if (wire_in_accept) begin
+                if (!wire_in_valid || wire_out_fire) begin
+                    wire_in_valid <= 1'b1;
+                    wire_in_data  <= s_axis_wire_tdata;
+                    wire_in_last  <= s_axis_wire_tlast;
+                end else begin
+                    wire_skid_valid <= 1'b1;
+                    wire_skid_data  <= s_axis_wire_tdata;
+                    wire_skid_last  <= s_axis_wire_tlast;
+                end
+            end else if (wire_out_fire) begin
+                if (wire_skid_valid) begin
+                    wire_in_valid   <= 1'b1;
+                    wire_in_data    <= wire_skid_data;
+                    wire_in_last    <= wire_skid_last;
+                    wire_skid_valid <= 1'b0;
+                end else begin
+                    wire_in_valid   <= 1'b0;
+                end
+            end
+        end
+    end
+
     assign eng_rx_tdata       = emu_enable ? emu_rx_tdata  :
-                                {s_axis_wire_tdata[7:0], s_axis_wire_tdata[15:8], s_axis_wire_tdata[23:16], s_axis_wire_tdata[31:24]};
-    assign eng_rx_tvalid      = emu_enable ? emu_rx_tvalid : s_axis_wire_tvalid;
-    assign eng_rx_tlast       = emu_enable ? emu_rx_tlast  : s_axis_wire_tlast;
+                                {wire_in_data[7:0], wire_in_data[15:8], wire_in_data[23:16], wire_in_data[31:24]};
+    assign eng_rx_tvalid      = emu_enable ? emu_rx_tvalid : wire_in_valid;
+    assign eng_rx_tlast       = emu_enable ? emu_rx_tlast  : wire_in_last;
     assign emu_rx_tready      = emu_enable ? eng_rx_tready : 1'b0;
-    assign s_axis_wire_tready = emu_enable ? 1'b1          : eng_rx_tready;
+    assign s_axis_wire_tready = emu_enable ? 1'b1          : !wire_skid_valid;
 
     rtps_peer_emulator #(
         .DATA_WIDTH  (DATA_WIDTH),
@@ -982,7 +1022,8 @@ module rtps_fastpath_ip #(
         R_DF_COPY_PRIME   = 6'd41, // DATA_FRAG: 1-cycle BRAM prime for barrel-shifted copy
         R_DF_COPY_LOOP    = 6'd42, // DATA_FRAG: barrel-shifted byte-enabled copy into reasm_ram[fill_slot]
         R_DF_SYNTH_HDR    = 6'd43, // DATA_FRAG: synthesize Words 2..15 (RTPS+INFO_TS+DATA) for Option B
-        R_UDP_CSUM_W2     = 6'd44; // Wait 3/3 for 3-stage rx_pseudo_csum pipeline flush
+        R_UDP_CSUM_W2     = 6'd44, // Wait 3/3 for 3-stage rx_pseudo_csum pipeline flush
+        R_CAM_WAIT        = 6'd45; // 1-cycle pipeline register for 4x96-bit Reader CAM comparison
 
     reg [5:0]  rx_state;
     reg [11:0] rx_wire_beat;
@@ -1179,6 +1220,11 @@ module rtps_fastpath_ip #(
     wire cam_hit_1 = rd1_active && rd1_port_ok && rd1_ip_ok && ({active_rd_edt[1][1], active_rd_edt[1][2], active_rd_edt[1][3]} == walk_guid_prefix);
     wire cam_hit_2 = rd2_active && rd2_port_ok && rd2_ip_ok && ({active_rd_edt[2][1], active_rd_edt[2][2], active_rd_edt[2][3]} == walk_guid_prefix);
     wire cam_hit_3 = rd3_active && rd3_port_ok && rd3_ip_ok && ({active_rd_edt[3][1], active_rd_edt[3][2], active_rd_edt[3][3]} == walk_guid_prefix);
+
+    reg [3:0] cam_hit_r;
+    always @(posedge clk) begin
+        cam_hit_r <= {cam_hit_3, cam_hit_2, cam_hit_1, cam_hit_0};
+    end
 
     // Helper for endian-aware 16-bit extraction
     wire        submsg_e_flag = walker_dout[16]; // Bit 0 of flags byte (walker_dout[23:16])
@@ -1998,23 +2044,28 @@ module rtps_fastpath_ip #(
                 R_RTPS_GUID_2: begin
                     walk_guid_prefix[31:0] <= walker_dout;
                     walk_cur_word          <= 12'd7;
-                    rx_state               <= R_CAM_MATCH;
+                    rx_state               <= R_CAM_WAIT;
+                end
+
+                R_CAM_WAIT: begin
+                    // 1-cycle wait for registered cam_hit_r
+                    rx_state <= R_CAM_MATCH;
                 end
 
                 R_CAM_MATCH: begin
-                    if (cam_hit_0) begin
+                    if (cam_hit_r[0]) begin
                         walk_cam_hit <= 1'b1;
                         walk_cam_idx <= 2'd0;
                         rx_state     <= R_SUBMSG_HDR;
-                    end else if (cam_hit_1) begin
+                    end else if (cam_hit_r[1]) begin
                         walk_cam_hit <= 1'b1;
                         walk_cam_idx <= 2'd1;
                         rx_state     <= R_SUBMSG_HDR;
-                    end else if (cam_hit_2) begin
+                    end else if (cam_hit_r[2]) begin
                         walk_cam_hit <= 1'b1;
                         walk_cam_idx <= 2'd2;
                         rx_state     <= R_SUBMSG_HDR;
-                    end else if (cam_hit_3) begin
+                    end else if (cam_hit_r[3]) begin
                         walk_cam_hit <= 1'b1;
                         walk_cam_idx <= 2'd3;
                         rx_state     <= R_SUBMSG_HDR;

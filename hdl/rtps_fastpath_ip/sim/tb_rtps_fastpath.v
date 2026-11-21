@@ -777,7 +777,7 @@ module tb_rtps_fastpath;
             s_axis_wire_tdata  <= rec_wire_data[k];
             s_axis_wire_tlast  <= rec_wire_last[k];
             s_axis_wire_tvalid <= 1'b1;
-            while (!s_axis_wire_tready) @(posedge clk);
+            #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
         end
         @(posedge clk);
         s_axis_wire_tvalid <= 1'b0;
@@ -872,7 +872,7 @@ module tb_rtps_fastpath;
             s_axis_wire_tdata  <= rec_wire_data[k];
             s_axis_wire_tlast  <= rec_wire_last[k];
             s_axis_wire_tvalid <= 1'b1;
-            while (!s_axis_wire_tready) @(posedge clk);
+            #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
         end
         @(posedge clk);
         s_axis_wire_tvalid <= 1'b0;
@@ -1164,7 +1164,7 @@ module tb_rtps_fastpath;
             s_axis_wire_tdata  <= rec_wire_data[k];
             s_axis_wire_tlast  <= rec_wire_last[k];
             s_axis_wire_tvalid <= 1'b1;
-            while (!s_axis_wire_tready) @(posedge clk);
+            #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
         end
         @(posedge clk);
         s_axis_wire_tvalid <= 1'b0;
@@ -1192,7 +1192,7 @@ module tb_rtps_fastpath;
             s_axis_wire_tdata  <= rec_wire_data[k];
             s_axis_wire_tlast  <= rec_wire_last[k];
             s_axis_wire_tvalid <= 1'b1;
-            while (!s_axis_wire_tready) @(posedge clk);
+            #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
         end
         @(posedge clk);
         s_axis_wire_tvalid <= 1'b0;
@@ -1218,7 +1218,7 @@ module tb_rtps_fastpath;
             s_axis_wire_tdata  <= rec_wire_data[k];
             s_axis_wire_tlast  <= rec_wire_last[k];
             s_axis_wire_tvalid <= 1'b1;
-            while (!s_axis_wire_tready) @(posedge clk);
+            #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
         end
         @(posedge clk);
         s_axis_wire_tvalid <= 1'b0;
@@ -1360,7 +1360,7 @@ module tb_rtps_fastpath;
                     s_axis_wire_tdata <= rec_wire_data[k];
                 s_axis_wire_tlast  <= (k == 29);
                 s_axis_wire_tvalid <= 1'b1;
-                while (!s_axis_wire_tready) @(posedge clk);
+                #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
             end
             @(posedge clk);
             s_axis_wire_tvalid <= 1'b0;
@@ -1402,7 +1402,7 @@ module tb_rtps_fastpath;
                     s_axis_wire_tdata <= rec_wire_data[k];
                 s_axis_wire_tlast  <= rec_wire_last[k];
                 s_axis_wire_tvalid <= 1'b1;
-                while (!s_axis_wire_tready) @(posedge clk);
+                #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
             end
             @(posedge clk);
             s_axis_wire_tvalid <= 1'b0;
@@ -1737,7 +1737,7 @@ module tb_rtps_fastpath;
                     s_axis_wire_tdata  <= {pkt_bytes[b_idx*4+3], pkt_bytes[b_idx*4+2], pkt_bytes[b_idx*4+1], pkt_bytes[b_idx*4+0]};
                     s_axis_wire_tlast  <= (b_idx == n_beats - 1);
                     s_axis_wire_tvalid <= 1'b1;
-                    while (!s_axis_wire_tready) @(posedge clk);
+                    #1; while (!s_axis_wire_tready) begin @(posedge clk); #1; end
                 end
                 @(posedge clk);
                 s_axis_wire_tvalid <= 1'b0;
