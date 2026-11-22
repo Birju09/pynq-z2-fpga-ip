@@ -290,19 +290,26 @@ public:
             echo_reader_      = nullptr;
         }
 
+        if (rx_participant_) {
+            if (subscriber_ && reader_) subscriber_->delete_datareader(reader_);
+            if (subscriber_) rx_participant_->delete_subscriber(subscriber_);
+            if (rx_topic_) rx_participant_->delete_topic(rx_topic_);
+            factory->delete_participant(rx_participant_);
+            rx_participant_ = nullptr;
+            subscriber_     = nullptr;
+            rx_topic_       = nullptr;
+            reader_         = nullptr;
+        }
+
         if (participant_) {
             if (publisher_ && writer_) publisher_->delete_datawriter(writer_);
-            if (subscriber_ && reader_) subscriber_->delete_datareader(reader_);
             if (publisher_) participant_->delete_publisher(publisher_);
-            if (subscriber_) participant_->delete_subscriber(subscriber_);
             if (topic_) participant_->delete_topic(topic_);
             factory->delete_participant(participant_);
             participant_ = nullptr;
             publisher_   = nullptr;
-            subscriber_  = nullptr;
             topic_       = nullptr;
             writer_      = nullptr;
-            reader_      = nullptr;
         }
     }
 
@@ -373,9 +380,36 @@ private:
         if (!writer_) return false;
 
         if (enable_rx_) {
-            subscriber_ = participant_->create_subscriber(SUBSCRIBER_QOS_DEFAULT);
-            if (!subscriber_) return false;
+            return init_rx_participant();
+        }
+        return true;
+    }
 
+    // Separate participant so our own writer's samples are never delivered to the RX reader.
+    bool init_rx_participant() {
+        using namespace eprosima::fastdds::dds;
+
+        DomainParticipantQos pqos = PARTICIPANT_QOS_DEFAULT;
+        pqos.name("PYNQZ2_PureDDS_RxNode");
+        configure_udp_transport(pqos, false);
+
+        rx_participant_ = DomainParticipantFactory::get_instance()->create_participant(
+            cfg_.domain_id, pqos);
+        if (!rx_participant_) return false;
+
+        participant_->ignore_participant(rx_participant_->get_instance_handle());
+        rx_participant_->ignore_participant(participant_->get_instance_handle());
+
+        rx_type_.reset(new FastSamplePubSubType());
+        rx_type_.register_type(rx_participant_);
+
+        rx_topic_ = rx_participant_->create_topic(cfg_.topic_name, rx_type_.get_type_name(), TOPIC_QOS_DEFAULT);
+        if (!rx_topic_) return false;
+
+        subscriber_ = rx_participant_->create_subscriber(SUBSCRIBER_QOS_DEFAULT);
+        if (!subscriber_) return false;
+
+        {
             DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
             rqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
             // Default pool is too small for 4 KB DATA_FRAG samples arriving faster than the ARM drains them.
@@ -387,7 +421,7 @@ private:
             rqos.resource_limits().max_samples_per_instance = 1024;
             rqos.endpoint().history_memory_policy =
                 eprosima::fastrtps::rtps::DYNAMIC_RESERVE_MEMORY_MODE;
-            reader_ = subscriber_->create_datareader(topic_, rqos, &reader_listener_);
+            reader_ = subscriber_->create_datareader(rx_topic_, rqos, &reader_listener_);
             if (!reader_) return false;
         }
         return true;
@@ -429,6 +463,11 @@ private:
 
         std::cout << "[PureDDS] Local UDPv4 Echo Peer Participant initialized (--sim-peer mode).\n";
         return true;
+    }
+
+    template <typename Prefix>
+    bool is_rx_prefix(const Prefix& prefix) const {
+        return rx_participant_ && prefix == rx_participant_->guid().guidPrefix;
     }
 
     void notify_remote_reader_matched() {
@@ -481,7 +520,8 @@ private:
             should_be_ignored = false;
             if (reason == eprosima::fastdds::rtps::ReaderDiscoveryStatus::DISCOVERED_READER &&
                 info.topic_name.to_string() == parent_->cfg_.topic_name &&
-                info.guid.guidPrefix != parent_->participant_->guid().guidPrefix) {
+                info.guid.guidPrefix != parent_->participant_->guid().guidPrefix &&
+                !parent_->is_rx_prefix(info.guid.guidPrefix)) {
                 parent_->notify_remote_reader_matched();
             }
         }
@@ -491,7 +531,8 @@ private:
             eprosima::fastrtps::rtps::ReaderDiscoveryInfo&& info) override {
             if (info.status == eprosima::fastrtps::rtps::ReaderDiscoveryInfo::DISCOVERED_READER &&
                 info.info.topicName().to_string() == parent_->cfg_.topic_name &&
-                info.info.guid().guidPrefix != parent_->participant_->guid().guidPrefix) {
+                info.info.guid().guidPrefix != parent_->participant_->guid().guidPrefix &&
+                !parent_->is_rx_prefix(info.info.guid().guidPrefix)) {
                 parent_->notify_remote_reader_matched();
             }
         }
@@ -536,6 +577,10 @@ private:
     eprosima::fastdds::dds::DataWriter* writer_{nullptr};
     eprosima::fastdds::dds::DataReader* reader_{nullptr};
     eprosima::fastdds::dds::TypeSupport type_;
+
+    eprosima::fastdds::dds::DomainParticipant* rx_participant_{nullptr};
+    eprosima::fastdds::dds::Topic* rx_topic_{nullptr};
+    eprosima::fastdds::dds::TypeSupport rx_type_;
 
     eprosima::fastdds::dds::DomainParticipant* echo_participant_{nullptr};
     eprosima::fastdds::dds::Publisher* echo_publisher_{nullptr};
