@@ -319,6 +319,9 @@ private:
         if (cfg_.max_message_size >= 100 && cfg_.max_message_size <= 65500U) {
             udp_transport->maxMessageSize = cfg_.max_message_size;
         }
+        // Capped by net.core.rmem_max / wmem_max.
+        udp_transport->receiveBufferSize = 4 * 1024 * 1024;
+        udp_transport->sendBufferSize = 4 * 1024 * 1024;
         pqos.transport().user_transports.push_back(udp_transport);
 
         if (!cfg_.peer_ip.empty() && !local_echo_peer_) {
@@ -375,6 +378,15 @@ private:
 
             DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
             rqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
+            // Default pool is too small for 4 KB DATA_FRAG samples arriving faster than the ARM drains them.
+            rqos.history().kind = KEEP_LAST_HISTORY_QOS;
+            rqos.history().depth = 512;
+            rqos.resource_limits().max_samples = 1024;
+            rqos.resource_limits().allocated_samples = 64;
+            rqos.resource_limits().max_instances = 1;
+            rqos.resource_limits().max_samples_per_instance = 1024;
+            rqos.endpoint().history_memory_policy =
+                eprosima::fastrtps::rtps::DYNAMIC_RESERVE_MEMORY_MODE;
             reader_ = subscriber_->create_datareader(topic_, rqos, &reader_listener_);
             if (!reader_) return false;
         }

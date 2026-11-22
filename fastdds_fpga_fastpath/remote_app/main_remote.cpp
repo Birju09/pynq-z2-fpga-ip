@@ -11,12 +11,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -78,6 +81,10 @@ public:
             pqos.transport().use_builtin_transports = false;
             auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
             udp_transport->interfaceWhiteList.push_back(interface_ip_);
+            // 4 KB samples at 1 kHz overflow the 208 KiB default; capped by net.core.rmem_max.
+            udp_transport->receiveBufferSize = 4 * 1024 * 1024;
+            // Match the FPGA's 1468 B limit so echoes use DATA_FRAG instead of IP fragmentation.
+            udp_transport->maxMessageSize = 1468;
             pqos.transport().user_transports.push_back(udp_transport);
             std::cout << "[RemoteNode] Bound Fast DDS to interface: " << interface_ip_ << "\n";
         }
@@ -136,6 +143,7 @@ public:
             wqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
             writer_ = publisher_->create_datawriter(topic_, wqos, &writer_listener_);
             if (!writer_) return false;
+            if (echo_mode_) echo_thread_ = std::thread(&RemoteNode::echo_loop, this);
         }
 
         return true;
@@ -158,6 +166,9 @@ public:
                   << "  Sequence Gaps      : " << seq_gaps_.load() << "\n";
         if (echo_mode_ || pub_mode_) {
             std::cout << "  Samples Sent/Echoed: " << samples_sent_.load() << "\n";
+            if (echo_dropped_.load() > 0) {
+                std::cout << "  Echo Dropped (queue full): " << echo_dropped_.load() << "\n";
+            }
         }
 
         std::lock_guard<std::mutex> lock(lat_mutex_);
@@ -169,7 +180,7 @@ public:
             double p95 = latencies_us_[latencies_us_.size() * 95 / 100];
             double p99 = latencies_us_[latencies_us_.size() * 99 / 100];
 
-            std::cout << "  One-Way Latency    : Min=" << latencies_us_.front() << " us | "
+            std::cout << "  Arrival Interval   : Min=" << latencies_us_.front() << " us | "
                       << "Avg=" << std::fixed << std::setprecision(1) << avg << " us | "
                       << "p50=" << p50 << " us | "
                       << "p95=" << p95 << " us | "
@@ -242,20 +253,23 @@ private:
         SampleInfo info;
 
         while (reader->take_next_sample(&sample, &info) == ReturnCode_t::RETCODE_OK) {
-            if (info.valid_data) {
+            // The echo writer shares this participant, so it matches our own reader.
+            const bool own_sample = writer_ && info.publication_handle == writer_->get_instance_handle();
+            if (info.valid_data && !own_sample) {
                 uint32_t cid = sample.cycle_id();
                 uint64_t tx_ns = sample.tx_timestamp_ns();
 
-                // Compute latency
+                // Cross-machine clocks are unrelated, so measure arrival spacing instead of one-way latency.
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 uint64_t now_ns = static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
 
-                if (tx_ns > 0 && now_ns >= tx_ns) {
-                    double lat_us = static_cast<double>(now_ns - tx_ns) / 1000.0;
+                if (last_arrival_ns_ > 0) {
+                    double gap_us = static_cast<double>(now_ns - last_arrival_ns_) / 1000.0;
                     std::lock_guard<std::mutex> lock(lat_mutex_);
-                    latencies_us_.push_back(lat_us);
+                    latencies_us_.push_back(gap_us);
                 }
+                last_arrival_ns_ = now_ns;
 
                 // Verify pattern integrity (Rule 4 Anti-Stale check)
                 bool pattern_ok = true;
@@ -266,7 +280,14 @@ private:
                         break;
                     }
                 }
-                if (!pattern_ok) corrupted_samples_++;
+                if (!pattern_ok) {
+                    if (corrupted_samples_++ < 3) {
+                        std::printf("[RemoteNode] Bad sample: cycle_id=%u flags=0x%08X ts=%llu payload[0..3]=%08X %08X %08X %08X (expected[0]=%08X)\n",
+                                    cid, sample.flags(), static_cast<unsigned long long>(tx_ns),
+                                    sample.payload()[0], sample.payload()[1], sample.payload()[2], sample.payload()[3],
+                                    static_cast<uint32_t>((cid << 16) ^ 0x5A000000U));
+                    }
+                }
 
                 // Sequence continuity check
                 if (last_seq_ > 0 && cid > last_seq_ + 1) {
@@ -275,13 +296,15 @@ private:
                 last_seq_ = cid;
                 samples_received_++;
 
-                // Echo back to FPGA if echo mode is enabled
+                // Echo from a worker thread: a blocking write() here would stall socket draining.
                 if (echo_mode_ && writer_) {
-#if FASTDDS_V3
-                    if (writer_->write(&sample) == RETCODE_OK) samples_sent_++;
-#else
-                    if (writer_->write(&sample)) samples_sent_++;
-#endif
+                    std::lock_guard<std::mutex> lock(echo_mutex_);
+                    if (echo_queue_.size() < kEchoQueueMax) {
+                        echo_queue_.push_back(sample);
+                        echo_cv_.notify_one();
+                    } else {
+                        echo_dropped_++;
+                    }
                 }
 
                 if (samples_received_ % 1000 == 0) {
@@ -292,7 +315,32 @@ private:
         }
     }
 
+    void echo_loop() {
+        std::unique_lock<std::mutex> lock(echo_mutex_);
+        while (true) {
+            echo_cv_.wait(lock, [this] { return echo_stop_ || !echo_queue_.empty(); });
+            if (echo_stop_) return;
+            FastSample sample = std::move(echo_queue_.front());
+            echo_queue_.pop_front();
+            lock.unlock();
+#if FASTDDS_V3
+            const bool ok = writer_->write(&sample) == RETCODE_OK;
+#else
+            const bool ok = writer_->write(&sample);
+#endif
+            if (ok) samples_sent_++;
+            lock.lock();
+        }
+    }
+
     void cleanup() {
+        {
+            std::lock_guard<std::mutex> lock(echo_mutex_);
+            echo_stop_ = true;
+        }
+        echo_cv_.notify_all();
+        if (echo_thread_.joinable()) echo_thread_.join();
+
         if (participant_) {
             if (publisher_ && writer_) publisher_->delete_datawriter(writer_);
             if (subscriber_ && reader_) subscriber_->delete_datareader(reader_);
@@ -338,11 +386,20 @@ private:
 
     std::atomic<uint32_t> samples_received_;
     std::atomic<uint32_t> samples_sent_;
+    std::atomic<uint32_t> echo_dropped_{0};
+
+    static constexpr size_t kEchoQueueMax = 256;
+    std::mutex echo_mutex_;
+    std::condition_variable echo_cv_;
+    std::deque<FastSample> echo_queue_;
+    std::thread echo_thread_;
+    bool echo_stop_{false};
     std::atomic<uint32_t> corrupted_samples_;
     std::atomic<uint32_t> seq_gaps_;
     uint32_t last_seq_;
 
     std::vector<double> latencies_us_;
+    uint64_t last_arrival_ns_{0};
     std::mutex lat_mutex_;
 
     DomainParticipant* participant_{nullptr};

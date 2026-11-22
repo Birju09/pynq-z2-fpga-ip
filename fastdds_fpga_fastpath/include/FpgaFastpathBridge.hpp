@@ -511,6 +511,21 @@ private:
         reader_ = subscriber_->create_datareader(topic_, rqos, &reader_listener_);
         if (!reader_) return false;
 
+        // Replay endpoints discovered while the writer/reader were still being created.
+        PendingMatches pending;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            entities_ready_ = true;
+            pending = pending_;
+            pending_ = PendingMatches{};
+        }
+        if (pending.has_reader) {
+            commit_discovered_remote_reader(pending.reader_ip, pending.reader_port, pending.reader_eid);
+        }
+        if (pending.has_writer) {
+            commit_discovered_remote_writer(pending.writer_ip, pending.writer_prefix, pending.writer_eid);
+        }
+
         return true;
     }
 
@@ -518,6 +533,16 @@ private:
         uint32_t remote_ip,
         uint16_t remote_port,
         uint32_t remote_reader_entity_id) {
+        {
+            std::lock_guard<std::mutex> plock(pending_mutex_);
+            if (!entities_ready_) {
+                pending_.has_reader  = true;
+                pending_.reader_ip   = remote_ip;
+                pending_.reader_port = remote_port;
+                pending_.reader_eid  = remote_reader_entity_id;
+                return;
+            }
+        }
         std::lock_guard<std::mutex> lock(hw_cfg_mutex_);
 
         uint8_t dst_mac[6];
@@ -566,6 +591,16 @@ private:
         uint32_t remote_ip,
         const uint8_t remote_guid_prefix[12],
         uint32_t remote_writer_entity_id) {
+        {
+            std::lock_guard<std::mutex> plock(pending_mutex_);
+            if (!entities_ready_) {
+                pending_.has_writer = true;
+                pending_.writer_ip  = remote_ip;
+                std::memcpy(pending_.writer_prefix, remote_guid_prefix, 12);
+                pending_.writer_eid = remote_writer_entity_id;
+                return;
+            }
+        }
         std::lock_guard<std::mutex> lock(hw_cfg_mutex_);
 
         struct fpga_reader_endpoint rep;
@@ -766,6 +801,20 @@ private:
     std::mutex match_mutex_;
     std::mutex hw_cfg_mutex_;
     std::condition_variable cv_match_;
+
+    struct PendingMatches {
+        bool has_reader{false};
+        uint32_t reader_ip{0};
+        uint16_t reader_port{0};
+        uint32_t reader_eid{0};
+        bool has_writer{false};
+        uint32_t writer_ip{0};
+        uint8_t writer_prefix[12]{};
+        uint32_t writer_eid{0};
+    };
+    std::mutex pending_mutex_;
+    bool entities_ready_{false};
+    PendingMatches pending_;
 
     struct fpga_fastpath* fpga_{nullptr};
     std::thread rx_thread_;
