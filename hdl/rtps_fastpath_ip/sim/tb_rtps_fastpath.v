@@ -252,15 +252,15 @@ module tb_rtps_fastpath;
     integer    rec_tlast_cnt;
 
     always @(posedge clk) begin
-        if (rst_n && dut.u_rtps_peer_emulator.m_axis_tvalid && dut.u_rtps_peer_emulator.m_axis_tready) begin
+        if (rst_n && dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tvalid && dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tready) begin
             if (rec_tlast_cnt < 3 && rec_wire_cnt < 1500) begin
-                rec_wire_data[rec_wire_cnt] <= {dut.u_rtps_peer_emulator.m_axis_tdata[7:0],
-                                                dut.u_rtps_peer_emulator.m_axis_tdata[15:8],
-                                                dut.u_rtps_peer_emulator.m_axis_tdata[23:16],
-                                                dut.u_rtps_peer_emulator.m_axis_tdata[31:24]};
-                rec_wire_last[rec_wire_cnt] <= dut.u_rtps_peer_emulator.m_axis_tlast;
+                rec_wire_data[rec_wire_cnt] <= {dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tdata[7:0],
+                                                dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tdata[15:8],
+                                                dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tdata[23:16],
+                                                dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tdata[31:24]};
+                rec_wire_last[rec_wire_cnt] <= dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tlast;
                 rec_wire_cnt <= rec_wire_cnt + 1;
-                if (dut.u_rtps_peer_emulator.m_axis_tlast)
+                if (dut.u_wire_mux.u_rtps_peer_emulator.m_axis_tlast)
                     rec_tlast_cnt <= rec_tlast_cnt + 1;
             end
         end
@@ -886,7 +886,7 @@ module tb_rtps_fastpath;
         end
         if (!ip_done_irq) begin
             $display("[-] TIMEOUT waiting for ip_done_irq in TEST 10! FSM state=%0d, rx_state=%0d, latest_valid=%b, latest_slot=%0d",
-                     dut.state, dut.rx_state, dut.latest_valid, dut.latest_slot);
+                     dut.u_tx_engine.state, dut.u_rx_reasm.rx_state, dut.latest_valid, dut.latest_slot);
             $fflush;
             $finish;
         end
