@@ -225,6 +225,9 @@ module rtps_rx_reasm #(
     reg [95:0] walk_guid_prefix;
     reg [1:0]  walk_cam_idx;
     reg        walk_cam_hit;
+    reg [31:0] cam_reader_id_r;
+    reg [31:0] cam_writer_id_r;
+    reg [63:0] cam_last_seq_r;
     reg [11:0] walk_cur_word;
     reg [11:0] walk_dgram_words;
     reg [7:0]  walk_submsg_id;
@@ -379,6 +382,9 @@ module rtps_rx_reasm #(
             walk_guid_prefix        <= 96'd0;
             walk_cam_idx            <= 2'd0;
             walk_cam_hit            <= 1'b0;
+            cam_reader_id_r         <= 32'd0;
+            cam_writer_id_r         <= 32'd0;
+            cam_last_seq_r          <= 64'd0;
             walk_cur_word           <= 12'd0;
             walk_dgram_words        <= 12'd0;
             walk_submsg_id          <= 8'd0;
@@ -769,21 +775,33 @@ module rtps_rx_reasm #(
 
                 R_CAM_MATCH: begin
                     if (cam_hit_r[0]) begin
-                        walk_cam_hit <= 1'b1;
-                        walk_cam_idx <= 2'd0;
-                        rx_state     <= R_SUBMSG_HDR;
+                        walk_cam_hit    <= 1'b1;
+                        walk_cam_idx    <= 2'd0;
+                        cam_reader_id_r <= active_rd_edt[0][5];
+                        cam_writer_id_r <= active_rd_edt[0][4];
+                        cam_last_seq_r  <= last_rx_seq_num_by_cam[0];
+                        rx_state        <= R_SUBMSG_HDR;
                     end else if (cam_hit_r[1]) begin
-                        walk_cam_hit <= 1'b1;
-                        walk_cam_idx <= 2'd1;
-                        rx_state     <= R_SUBMSG_HDR;
+                        walk_cam_hit    <= 1'b1;
+                        walk_cam_idx    <= 2'd1;
+                        cam_reader_id_r <= active_rd_edt[1][5];
+                        cam_writer_id_r <= active_rd_edt[1][4];
+                        cam_last_seq_r  <= last_rx_seq_num_by_cam[1];
+                        rx_state        <= R_SUBMSG_HDR;
                     end else if (cam_hit_r[2]) begin
-                        walk_cam_hit <= 1'b1;
-                        walk_cam_idx <= 2'd2;
-                        rx_state     <= R_SUBMSG_HDR;
+                        walk_cam_hit    <= 1'b1;
+                        walk_cam_idx    <= 2'd2;
+                        cam_reader_id_r <= active_rd_edt[2][5];
+                        cam_writer_id_r <= active_rd_edt[2][4];
+                        cam_last_seq_r  <= last_rx_seq_num_by_cam[2];
+                        rx_state        <= R_SUBMSG_HDR;
                     end else if (cam_hit_r[3]) begin
-                        walk_cam_hit <= 1'b1;
-                        walk_cam_idx <= 2'd3;
-                        rx_state     <= R_SUBMSG_HDR;
+                        walk_cam_hit    <= 1'b1;
+                        walk_cam_idx    <= 2'd3;
+                        cam_reader_id_r <= active_rd_edt[3][5];
+                        cam_writer_id_r <= active_rd_edt[3][4];
+                        cam_last_seq_r  <= last_rx_seq_num_by_cam[3];
+                        rx_state        <= R_SUBMSG_HDR;
                     end else begin
                         walk_cam_hit <= 1'b0;
                         rx_state     <= R_IDLE;
@@ -805,8 +823,7 @@ module rtps_rx_reasm #(
                             8'h09: begin // INFO_TS (0x09)
                                 if (walker_dout[17]) begin
                                     walk_cur_word  <= walk_cur_word + 12'd1 + submsg_octets[13:2];
-                                    walker_rd_addr <= walk_cur_word + 12'd1 + submsg_octets[13:2];
-                                    rx_state       <= R_SUBMSG_HDR_WAIT;
+                                    rx_state       <= R_SUBMSG_HDR_WAIT2;
                                 end else begin
                                     walker_rd_addr <= walk_cur_word + 12'd1;
                                     rx_state       <= R_INFO_TS_WAIT;
@@ -836,8 +853,7 @@ module rtps_rx_reasm #(
                                         rx_state <= R_IDLE;
                                     end else begin
                                         walk_cur_word  <= walk_cur_word + 12'd1 + submsg_octets[13:2];
-                                        walker_rd_addr <= walk_cur_word + 12'd1 + submsg_octets[13:2];
-                                        rx_state       <= R_SUBMSG_HDR_WAIT;
+                                        rx_state       <= R_SUBMSG_HDR_WAIT2;
                                     end
                                 end
                             end
@@ -847,12 +863,16 @@ module rtps_rx_reasm #(
                                     rx_state <= R_IDLE;
                                 end else begin
                                     walk_cur_word  <= walk_cur_word + 12'd1 + submsg_octets[13:2];
-                                    walker_rd_addr <= walk_cur_word + 12'd1 + submsg_octets[13:2];
-                                    rx_state       <= R_SUBMSG_HDR_WAIT;
+                                    rx_state       <= R_SUBMSG_HDR_WAIT2;
                                 end
                             end
                         endcase
                     end
+                end
+
+                R_SUBMSG_HDR_WAIT2: begin
+                    walker_rd_addr <= walk_cur_word;
+                    rx_state       <= R_SUBMSG_HDR_WAIT;
                 end
 
                 R_SUBMSG_HDR_WAIT: begin
@@ -912,8 +932,8 @@ module rtps_rx_reasm #(
                 R_DATA_READER_ID: begin
                     walk_reader_id <= walker_dout;
                     if ((walker_dout != 32'h0000_0000) &&
-                        (active_rd_edt[walk_cam_idx][5] != 32'h0000_0000) &&
-                        (walker_dout != active_rd_edt[walk_cam_idx][5])) begin
+                        (cam_reader_id_r != 32'h0000_0000) &&
+                        (walker_dout != cam_reader_id_r)) begin
                         walk_cur_word  <= walk_next_submsg_word;
                         walker_rd_addr <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT;
@@ -925,7 +945,7 @@ module rtps_rx_reasm #(
 
                 R_DATA_HDR_2: begin
                     walk_writer_id <= walker_dout;
-                    if (!info_dst_matches_local || (walker_dout != active_rd_edt[walk_cam_idx][4])) begin
+                    if (!info_dst_matches_local || (walker_dout != cam_writer_id_r)) begin
                         walk_cur_word  <= walk_next_submsg_word;
                         walker_rd_addr <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT;
@@ -963,7 +983,7 @@ module rtps_rx_reasm #(
 
                 // Copy unfragmented DATA packet from rx_pkt_ram into reasm_ram[fill_slot]
                 R_COPY_DATA_PRIME: begin
-                    if (walk_seq_num <= last_rx_seq_num_by_cam[walk_cam_idx]) begin
+                    if (walk_seq_num <= cam_last_seq_r) begin
                         stat_stale_drops <= stat_stale_drops + 32'd1;
                         rx_state         <= R_IDLE;
                     end else begin
@@ -999,8 +1019,8 @@ module rtps_rx_reasm #(
                 R_DF_READER_ID: begin
                     walk_reader_id <= walker_dout;
                     if ((walker_dout != 32'h0000_0000) &&
-                        (active_rd_edt[walk_cam_idx][5] != 32'h0000_0000) &&
-                        (walker_dout != active_rd_edt[walk_cam_idx][5])) begin
+                        (cam_reader_id_r != 32'h0000_0000) &&
+                        (walker_dout != cam_reader_id_r)) begin
                         walk_cur_word  <= walk_next_submsg_word;
                         walker_rd_addr <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT;
@@ -1012,7 +1032,7 @@ module rtps_rx_reasm #(
 
                 R_DF_WRITER_ID: begin
                     walk_writer_id <= walker_dout;
-                    if (!info_dst_matches_local || (walker_dout != active_rd_edt[walk_cam_idx][4])) begin
+                    if (!info_dst_matches_local || (walker_dout != cam_writer_id_r)) begin
                         walk_cur_word  <= walk_next_submsg_word;
                         walker_rd_addr <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT;
@@ -1069,7 +1089,7 @@ module rtps_rx_reasm #(
                 end
 
                 R_DF_VALIDATE: begin
-                    if (walk_seq_num <= last_rx_seq_num_by_cam[walk_cam_idx]) begin
+                    if (walk_seq_num <= cam_last_seq_r) begin
                         stat_stale_drops <= stat_stale_drops + 32'd1;
                         rx_state         <= R_IDLE;
                     end else if ((df_frag_start < 32'd1) || (df_frag_start > 32'd32) ||
@@ -1272,12 +1292,12 @@ module rtps_rx_reasm #(
 
                 // Unified Registered Commit State for all RX paths
                 R_COMMIT_SAMPLE: begin
-                    if (walk_seq_num > last_rx_seq_num_by_cam[walk_cam_idx]) begin
-                        if (last_rx_seq_num_by_cam[walk_cam_idx] != 64'd0 &&
-                            (walk_seq_num > (last_rx_seq_num_by_cam[walk_cam_idx] + 64'd1))) begin
+                    if (walk_seq_num > cam_last_seq_r) begin
+                        if (cam_last_seq_r != 64'd0 &&
+                            (walk_seq_num > (cam_last_seq_r + 64'd1))) begin
                             stat_seq_gaps <= stat_seq_gaps +
                                 (walk_seq_num[31:0] -
-                                 last_rx_seq_num_by_cam[walk_cam_idx][31:0] -
+                                 cam_last_seq_r[31:0] -
                                  32'd1);
                         end
 
@@ -1301,6 +1321,11 @@ module rtps_rx_reasm #(
                     rx_state <= R_IDLE;
                 end
 
+                R_SKIP_QOS_WAIT2: begin
+                    walker_rd_addr <= walk_cur_word;
+                    rx_state       <= R_SKIP_QOS_WAIT;
+                end
+
                 R_SKIP_QOS_WAIT: begin
                     rx_state <= R_SKIP_QOS;
                 end
@@ -1322,9 +1347,7 @@ module rtps_rx_reasm #(
                     end else begin
                         walk_cur_word  <= walk_cur_word + 12'd1 +
                                           (walk_submsg_flags[0] ? {walker_dout[3:0], walker_dout[15:10]} : walker_dout[13:2]);
-                        walker_rd_addr <= walk_cur_word + 12'd1 +
-                                          (walk_submsg_flags[0] ? {walker_dout[3:0], walker_dout[15:10]} : walker_dout[13:2]);
-                        rx_state       <= R_SKIP_QOS_WAIT;
+                        rx_state       <= R_SKIP_QOS_WAIT2;
                     end
                 end
 

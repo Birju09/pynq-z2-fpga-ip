@@ -148,6 +148,8 @@ module rtps_csr_edt #(
     reg [31:0] free_running_sec;
     reg [47:0] free_running_frac_acc; // Q32.16: [47:16] = RTPS 2^-32 s fraction
     reg [15:0] cfg_clk_period_ns;
+    reg [47:0] clk_frac_step;
+    reg        sec_inc_q;
     assign active_time_ns = (USE_EXT_TIMESTAMP) ? ext_timestamp_ns :
                             {free_running_sec, free_running_frac_acc[47:16]};
 
@@ -158,16 +160,20 @@ module rtps_csr_edt #(
     // -------------------------------------------------------------------------
     // Free-Running RTPS Time_t & 100 ms Watchdog
     // -------------------------------------------------------------------------
-    wire [48:0] next_frac_acc = {1'b0, free_running_frac_acc} + ({33'd0, cfg_clk_period_ns} * 49'd281475);
+    wire [48:0] next_frac_acc = {1'b0, free_running_frac_acc} + {1'b0, clk_frac_step};
     always @(posedge clk) begin
         if (!rst_n_local) begin
             free_running_sec      <= 32'd1;
             free_running_frac_acc <= 48'd0;
+            clk_frac_step         <= CLK_PERIOD_NS * 48'd281475;
+            sec_inc_q             <= 1'b0;
             wdog_counter          <= 32'd0;
             wdog_expired          <= 1'b0;
         end else begin
-            free_running_sec      <= free_running_sec + {31'd0, next_frac_acc[48]};
+            clk_frac_step         <= {32'd0, cfg_clk_period_ns} * 48'd281475;
             free_running_frac_acc <= next_frac_acc[47:0];
+            sec_inc_q             <= next_frac_acc[48];
+            free_running_sec      <= free_running_sec + {31'd0, sec_inc_q};
             if (wdog_pet_pulse) begin
                 wdog_counter <= 32'd0;
                 wdog_expired <= 1'b0;

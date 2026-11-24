@@ -121,4 +121,6 @@ localparam [5:0]
     R_DF_COPY_LOOP    = 6'd42,
     R_DF_SYNTH_HDR    = 6'd43,
     R_UDP_CSUM_W2     = 6'd44,
-    R_CAM_WAIT        = 6'd45;
+    R_CAM_WAIT        = 6'd45,
+    R_SUBMSG_HDR_WAIT2 = 6'd46,
+    R_SKIP_QOS_WAIT2   = 6'd47;
