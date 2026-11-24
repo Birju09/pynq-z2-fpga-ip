@@ -27,7 +27,7 @@
 
 ---
 
-## 2. Round-Trip with Remote Echo
+## 2. Round-Trip with Remote Echo (from a short test)
 
 | Metric | FPGA Fastpath (100 Mbps PL) | Pure Fast DDS (1 Gbps PS) |
 |---|---|---|
