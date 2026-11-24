@@ -6,7 +6,7 @@
 |---|---|
 | Target Board | PYNQ-Z2 (Zynq-7020, dual-core ARM Cortex-A9) |
 | Payload | 4,096 B (`FastSample`, 1,024 × 32-bit words) |
-| Target Rate & Volume | 2,000 Hz, 20,000 samples |
+| Target Rate & Volume | 2,000 Hz, 1,000,000 samples |
 | QoS | Best-Effort, UDPv4 transport |
 | Peer | Remote x86 workstation running standard Fast DDS (`remote_dds_node`) |
 | Network Interface | FPGA Fastpath: **100 Mbps** PL RMII PHY (`100BASE-TX`)<br>Pure Fast DDS: **1 Gbps** PS `eth0` (`1000BASE-T`) |
