@@ -1,4 +1,4 @@
-# Fast DDS + FPGA RTPS Fastpath (Option 3 Hybrid Architecture)
+# Fast DDS + FPGA RTPS Fastpath (Hybrid Architecture)
 
 This folder contains a complete demonstration of **Option 3: Hybrid Fast DDS Architecture** for the PYNQ-Z2 FPGA board:
 - **Control Plane**: Standard **eProsima Fast DDS** runs in software to handle discovery (**SPDP / SEDP**), participant matching, and endpoint lifecycle management.
