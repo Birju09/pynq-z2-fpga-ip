@@ -52,14 +52,14 @@ This folder contains a complete demonstration of **Option 3: Hybrid Fast DDS Arc
 
 ---
 
-## 2. Why Option 3 Achieves 0% CPU Load on Data Plane
+## 2. Way to reduce the CPU Usage for high frequency data exchange
 
 In traditional DDS implementations (Option 1 or Option 2):
 1. **CPU Serialization**: The ARM CPU must iterate through every field in the 4,096-byte struct to marshal it into CDR format.
 2. **Double Framing**: The CPU builds RTPS submessage headers and passes them to Linux `sendto()`, where the kernel allocates an `sk_buff`, performs routing/ARP table lookups, and calculates UDP checksums in software.
 3. **Context Switches & Copies**: 2–3 memory copies and kernel transitions per packet.
 
-In **Option 3**:
+In this implementation:
 - The application obtains a direct pointer into coherent non-cacheable DDR memory (`zero_copy_loan()`).
 - Data fields are written directly to memory in place.
 - A single write to `/dev/axi_dma_dev` kicks the AXI DMA engine (< 0.3 µs CPU time).
