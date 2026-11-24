@@ -127,6 +127,8 @@ module rtps_peer_emulator #(
     reg        active_df_valid;
     reg [31:0] active_df_bitmap;
     reg [5:0]  active_df_total_frags;
+    reg [31:0] active_df_mask_all;
+    reg [31:0] df_frag_bit;
     reg [15:0] df_rem_calc;
     reg [5:0]  df_tot_cnt;
     reg [11:0] copy_src_idx;
@@ -444,6 +446,8 @@ module rtps_peer_emulator #(
             active_df_valid       <= 1'b0;
             active_df_bitmap      <= 32'd0;
             active_df_total_frags <= 6'd0;
+            active_df_mask_all    <= 32'd0;
+            df_frag_bit           <= 32'd0;
             df_rem_calc           <= 16'd0;
             df_tot_cnt            <= 6'd0;
             copy_src_idx          <= 12'd0;
@@ -704,6 +708,8 @@ module rtps_peer_emulator #(
                                         df_tot_cnt  <= df_tot_cnt + 6'd1;
                                     end else begin
                                         active_df_total_frags <= df_tot_cnt + 6'd1;
+                                        active_df_mask_all    <= ((df_tot_cnt + 6'd1) == 6'd32) ? 32'hFFFF_FFFF :
+                                                                 ((32'd1 << (df_tot_cnt + 6'd1)) - 32'd1);
                                         copy_src_idx          <= 12'd2;
                                         copy_dst_idx          <= 12'd16 + ((pkt_df_frag_start[4:0] - 5'd1) * pkt_df_frag_size[13:2]);
                                         copy_end_idx          <= ip_payload_len[13:2]; // Total UDP words in this packet
@@ -711,6 +717,7 @@ module rtps_peer_emulator #(
                                     end
                                 end else if (copy_src_idx == 12'd2) begin
                                     // 1-cycle BRAM prime for Word 19
+                                    df_frag_bit  <= 32'd1 << (pkt_df_frag_start[4:0] - 5'd1);
                                     copy_src_idx <= 12'd19;
                                     pkt_rd_addr  <= 10'd20;
                                 end else if (copy_src_idx < copy_end_idx) begin
@@ -720,8 +727,7 @@ module rtps_peer_emulator #(
                                 end else begin
                                     // Mark fragment bit & check completion
                                     copy_src_idx <= 12'd0;
-                                    if ((active_df_bitmap | (32'd1 << (pkt_df_frag_start[4:0] - 5'd1))) ==
-                                        ((active_df_total_frags == 6'd32) ? 32'hFFFF_FFFF : ((32'd1 << active_df_total_frags) - 32'd1))) begin
+                                    if ((active_df_bitmap | df_frag_bit) == active_df_mask_all) begin
                                         active_df_valid   <= 1'b0;
                                         active_df_bitmap  <= 32'd0;
                                         payload_words_cfg <= pkt_df_sample_size[13:2] - 16'd1;
@@ -734,7 +740,7 @@ module rtps_peer_emulator #(
                                         rx_ram_rd_addr    <= 12'd8;
                                         state             <= E_BUILD_DGRAM;
                                     end else begin
-                                        active_df_bitmap <= active_df_bitmap | (32'd1 << (pkt_df_frag_start[4:0] - 5'd1));
+                                        active_df_bitmap <= active_df_bitmap | df_frag_bit;
                                         state            <= E_RX_FRAMES;
                                     end
                                 end

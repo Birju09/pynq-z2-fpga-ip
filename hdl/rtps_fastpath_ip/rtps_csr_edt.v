@@ -419,9 +419,17 @@ module rtps_csr_edt #(
 
     wire [47:0] wr0_configured_dst_mac = {active_wr_edt[0][4][15:0], active_wr_edt[0][3]};
     wire [47:0] wr0_learned_dst_mac    = (remote_client_mac != 48'd0) ? remote_client_mac : last_rx_src_mac;
-    assign wr0_dst_mac                 = (wr0_configured_dst_mac != 48'd0) ? wr0_configured_dst_mac :
+    wire [47:0] wr0_dst_mac_comb       = (wr0_configured_dst_mac != 48'd0) ? wr0_configured_dst_mac :
                                          (wr0_learned_dst_mac    != 48'd0) ? wr0_learned_dst_mac :
                                          (emu_enable ? 48'h0200_5E20_0002 : 48'hFFFF_FFFF_FFFF);
+    reg  [47:0] wr0_dst_mac_q;
+    always @(posedge clk) begin
+        if (!rst_n_local)
+            wr0_dst_mac_q <= 48'h0200_5E20_0002;
+        else
+            wr0_dst_mac_q <= wr0_dst_mac_comb;
+    end
+    assign wr0_dst_mac = wr0_dst_mac_q;
 
     genvar g_ep, g_w;
     generate
