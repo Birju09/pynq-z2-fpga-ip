@@ -25,7 +25,7 @@
  * ========================================================================= */
 #define RTPS_IP_TRIGGER_OFFSET           0x00 /* Word 0: Abort / Force Reset to S_IDLE */
 #define RTPS_IP_STATUS_OFFSET            0x04 /* Word 1: Read status / Write IRQ ACK & S2MM kick */
-#define RTPS_IP_CTRL_OFFSET              0x08 /* Word 2: [0]=enable, [3:1]=writers, [4]=emu_en, [5]=commit, [6]=wdog_en, [7]=plugin_rx_rtps_mode */
+#define RTPS_IP_CTRL_OFFSET              0x08 /* Word 2: [0]=enable, [3:1]=writers, [4]=emu_en, [5]=commit, [6]=wdog_en */
 #define RTPS_IP_CRC_OFFSET               0x0C /* Word 3: Write expected_crc / Read calc_crc */
 #define RTPS_IP_PACING_TIMER_OFFSET      0x10 /* Word 4: Wire pacing delay ticks (0 = sim/loopback max speed) */
 #define RTPS_IP_PAYLOAD_WORDS_OFFSET     0x14 /* Word 5: Sample payload words (1024 = 4,096 bytes) */
@@ -100,7 +100,6 @@
 #define RTPS_CTRL_EMU_EN                 (1U << 4)
 #define RTPS_CTRL_COMMIT_EDT             (1U << 5)
 #define RTPS_CTRL_WDOG_EN                (1U << 6)
-#define RTPS_CTRL_PLUGIN_RX_RTPS_MODE    (1U << 7) /* Option B: S2MM outputs full 4,156B RTPS message */
 #define RTPS_CTRL_PUB_ONLY               (1U << 8) /* Deprecated/ignored: IP is always async */
 #define RTPS_CTRL_SUB_ONLY               (1U << 9) /* Subscribe-only mode: unsolicited wire RX from S_IDLE */
 #define RTPS_CTRL_TX_IP_FRAG_MODE        (1U << 10) /* 0 = DATA_FRAG default, 1 = Legacy IPv4 fragmentation */
@@ -296,7 +295,6 @@ struct rtps_endpoint_cfg {
     __u16 local_mac_hi;         /* Local MAC [47:32] */
     __u16 local_vendor_id;      /* Local Vendor ID (0x0101 for RTI Connext) */
     __u8  num_writers;          /* Number of active TX writers (1..4) */
-    __u8  plugin_rx_rtps_mode;  /* 1 = Option B NDDS_Transport_Plugin mode (4,156 B RX) */
     __u8  local_identity_valid; /* 1 = local participant identity valid */
     __u8  writer_context_valid; /* 1 = writer route context valid */
     __u8  enable_peer_emu;      /* 0 = Physical Wire (LAN8720), 1 = Internal Peer Emulator */
@@ -390,7 +388,6 @@ struct rtps_cycle_diag {
 #define AXI_RTPS_IOC_CONFIG_ENDPOINTS    _IOW(AXI_RTPS_IOC_MAGIC, 1, struct rtps_endpoint_cfg)
 #define AXI_RTPS_IOC_GET_DIAG            _IOR(AXI_RTPS_IOC_MAGIC, 2, struct rtps_cycle_diag)
 #define AXI_RTPS_IOC_PET_WATCHDOG        _IOW(AXI_RTPS_IOC_MAGIC, 3, __u32)
-#define AXI_RTPS_IOC_SET_PLUGIN_MODE     _IOW(AXI_RTPS_IOC_MAGIC, 4, __u32)
 #define AXI_RTPS_IOC_SET_CRC_BYPASS      _IOW(AXI_RTPS_IOC_MAGIC, 5, __u32)
 #define AXI_RTPS_IOC_SET_FAULT_INJECT    _IOW(AXI_RTPS_IOC_MAGIC, 6, __u32)
 #define AXI_RTPS_IOC_CONFIGURE_WRITER    _IOW(AXI_RTPS_IOC_MAGIC, 7, struct fpga_writer_endpoint)

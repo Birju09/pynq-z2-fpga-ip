@@ -11,7 +11,7 @@
 localparam [7:0]
     TRIGGER_ADDR                = 8'h00, // 0x00: Write forces FSM abort/reset to S_IDLE
     STATUS_ADDR                 = 8'h01, // 0x04: Read status / Write ACK IRQ or kick
-    CTRL_ADDR                   = 8'h02, // 0x08: [0]=en, [3:1]=writers, [4]=emu_en, [5]=commit, [6]=wdog_en, [7]=plugin_rtps_rx_mode
+    CTRL_ADDR                   = 8'h02, // 0x08: [0]=en, [3:1]=writers, [4]=emu_en, [5]=commit, [6]=wdog_en, [7]=reserved
     EXPECTED_CRC_ADDR           = 8'h03, // 0x0C: Write expected DMA0 CRC / Read calc CRC
     PACING_TIMER_ADDR           = 8'h04, // 0x10: Wire pacing delay cycles per beat
     CFG_PAYLOAD_ADDR            = 8'h05, // 0x14: Sample size in 32-bit words (default 1024 = 4096B)

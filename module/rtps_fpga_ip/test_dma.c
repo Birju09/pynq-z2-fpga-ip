@@ -457,7 +457,6 @@ static int run_fastpath_endpoint_test(int iterations, int verbose, int enable_pe
     /* Step 4: Atomic Commit */
     fpga->cfg.enable_peer_emu     = enable_peer_emu ? 1 : 0;
     fpga->cfg.mode_pub_only       = async_mode ? 1 : 0;
-    fpga->cfg.plugin_rx_rtps_mode = 0; /* Option 1 FastSample direct mode */
     rc = fpga_commit_endpoints(fpga, 1);
     if (rc < 0) {
         fprintf(stderr, "[-] fpga_commit_endpoints failed: %s (%d)\n", strerror(-rc), rc);
@@ -1066,7 +1065,6 @@ int main(int argc, char* argv[]) {
     int iterations = DEFAULT_ITERATIONS;
     uint32_t timer_val = 0;
     uint32_t bypass_crc = 0;
-    int option_b_mode = 1; /* Default: Option B NDDS_Transport_Plugin mode (CTRL[7]=1) */
     int fastpath_mode = 0; /* Option 1 dedicated hardware RTPS endpoint mode */
     int async_mode = 1;    /* Default: True Asynchronous 1-2 kHz Pub/Sub benchmark */
     int target_rate_hz = 1000; /* Default 1000 Hz (1 kHz) */
@@ -1091,14 +1089,13 @@ int main(int argc, char* argv[]) {
     /* Parse both named flags (--iterations, --emulation, etc.) and positional arguments */
     for (int arg_i = 1; arg_i < argc; arg_i++) {
         if (strcmp(argv[arg_i], "-h") == 0 || strcmp(argv[arg_i], "--help") == 0) {
-            printf("Usage: %s [iterations] [timer_cycles] [bypass_crc] [option_b_plugin_mode]\n", argv[0]);
-            printf("   or: %s [--iterations N] [--timer N] [--bypass-crc] [--option-b (1|0)] [--verbose]\n", argv[0]);
+            printf("Usage: %s [iterations] [timer_cycles] [bypass_crc]\n", argv[0]);
+            printf("   or: %s [--iterations N] [--timer N] [--bypass-crc] [--verbose]\n", argv[0]);
             printf("   or: %s --fastpath [--iterations N] [--verbose]\n\n", argv[0]);
             printf("Options:\n");
             printf("  -n, --iterations N     Number of cyclic RTPS iterations (default: %d)\n", DEFAULT_ITERATIONS);
             printf("  -t, --timer N          Hardware wire pacing delay cycles per beat (default: 0)\n");
             printf("  --bypass-crc           Bypass CPU DMA0 CRC-32 check\n");
-            printf("  -b, --option-b (0|1)   1 for Option B 4,156B RTPS RX (default: 1), 0 for Option A 4,096B\n");
             printf("  --fastpath, --endpoint Option 1 Dedicated FPGA Hardware RTPS Endpoint Driver API test\n");
             printf("  --wire                 Use Physical Ethernet Wire (LAN8720 PHY, disables internal emulator)\n");
             printf("  --async                Enable True Asynchronous 1 kHz - 2 kHz Pub/Sub Pipeline\n");
@@ -1115,8 +1112,6 @@ int main(int argc, char* argv[]) {
             timer_val = (uint32_t)atoi(argv[++arg_i]);
         } else if (strcmp(argv[arg_i], "--bypass-crc") == 0) {
             bypass_crc = 1;
-        } else if ((strcmp(argv[arg_i], "-b") == 0 || strcmp(argv[arg_i], "--option-b") == 0) && arg_i + 1 < argc) {
-            option_b_mode = atoi(argv[++arg_i]) ? 1 : 0;
         } else if (strcmp(argv[arg_i], "--fastpath") == 0 || strcmp(argv[arg_i], "--endpoint") == 0 || strcmp(argv[arg_i], "--endpoint-api") == 0) {
             fastpath_mode = 1;
         } else if (strcmp(argv[arg_i], "-v") == 0 || strcmp(argv[arg_i], "--verbose") == 0) {
@@ -1154,8 +1149,6 @@ int main(int argc, char* argv[]) {
                 timer_val = (uint32_t)atoi(argv[arg_i]);
             } else if (arg_i == 3) {
                 bypass_crc = (uint32_t)atoi(argv[arg_i]);
-            } else if (arg_i == 4) {
-                option_b_mode = atoi(argv[arg_i]) ? 1 : 0;
             }
         }
     }
@@ -1201,7 +1194,7 @@ int main(int argc, char* argv[]) {
     }
 
     /* 1. Initialize Option B RTI Connext Transport Plugin (`NDDS_Transport_Plugin`) */
-    if (FpgaTransport_init_plugin(&plugin, fd, option_b_mode, timer_val) < 0) {
+    if (FpgaTransport_init_plugin(&plugin, fd, timer_val) < 0) {
         fprintf(stderr, "[-] Failed to initialize FPGA RTPS Transport Plugin\n");
         close(fd);
         free(latencies_roundtrip);
@@ -1282,10 +1275,7 @@ int main(int argc, char* argv[]) {
     printf("=================================================================\n");
     printf("  Hybrid PS+PL RTPS v2.x Fast-Path & Option B Transport Benchmark\n");
     printf("  Target        : %s\n", DEVICE_PATH);
-    printf("  Integration   : %s\n",
-           option_b_mode
-               ? "Option B (NDDS_Transport_Plugin: 4,096B TX -> 4,156B RTPS RX)"
-               : "Option A (Direct Zero-Copy FastSample: 4,096B TX / 4,096B RX)");
+    printf("  Integration   : Option B (NDDS_Transport_Plugin: 4,096B TX -> 4,156B RTPS RX)\n");
     printf("  Hardware Mode : %s\n",
            enable_peer_emu
                ? "Integrated RTI Peer Emulator (100 MHz Hardware Fabric Loopback)"
@@ -1415,7 +1405,7 @@ int main(int argc, char* argv[]) {
             }
 
             /* 2. Dump Received Wire RTPS message for RX (Feedback from Peer Emulator) */
-            if (option_b_mode && plugin.rx_mmap_buf) {
+            if (plugin.rx_mmap_buf) {
                 if (pcap_wire_frags) {
                     rtps_pcap_dump_fragments(&pcap_dumper, &t_rx_done, peer_mac, master_mac,
                                              peer_ip, master_ip, peer_port, master_port,
@@ -1525,7 +1515,7 @@ int main(int argc, char* argv[]) {
         double p50_pl_us = get_percentile(latencies_pl_hw, count, 50.0);
         double p95_pl_us = get_percentile(latencies_pl_hw, count, 95.0);
 
-        size_t rx_wire_bytes = option_b_mode ? RTPS_FULL_MSG_BYTES : RTPS_FAST_SAMPLE_BYTES;
+        size_t rx_wire_bytes = RTPS_FULL_MSG_BYTES;
         double total_mb =
             (double)((RTPS_FAST_SAMPLE_BYTES + rx_wire_bytes) * (uint64_t)count) /
             (1024.0 * 1024.0);
@@ -1537,9 +1527,8 @@ int main(int argc, char* argv[]) {
         printf("                      BENCHMARK RESULTS                          \n");
         printf("=================================================================\n");
         printf("  Iterations Completed : %d\n", count);
-        printf("  Sample Payload Size  : %u bytes TX / %zu bytes RX (%s)\n",
-               RTPS_FAST_SAMPLE_BYTES, rx_wire_bytes,
-               option_b_mode ? "60B RTPS + 4096B FastSample" : "4096B FastSample");
+        printf("  Sample Payload Size  : %u bytes TX / %zu bytes RX (60B RTPS + 4096B FastSample)\n",
+               RTPS_FAST_SAMPLE_BYTES, rx_wire_bytes);
         printf("  Total Data Processed : %.2f MB (bi-directional Pub/Sub)\n", total_mb);
         printf("  Total Elapsed Time   : %.3f s (%.1f cycles/sec, %.2f MB/s)\n",
                total_sec, ops_per_sec, throughput_mbps);

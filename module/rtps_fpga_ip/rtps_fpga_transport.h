@@ -104,7 +104,6 @@ typedef struct NDDS_Transport_PluginImpl {
     /* Hardware device & Zero-Copy Coherent Buffers (`mmap`) */
     int                        fd;
     int                        use_mmap;
-    int                        option_b_rtps_rx_mode; /* 1 = 4,156 B RTPS message on RX */
     uint32_t*                  tx_mmap_buf;
     uint32_t*                  rx_mmap_buf;
     size_t                     mmap_size;
@@ -212,7 +211,7 @@ static inline int32_t FpgaTransport_receive_rEA(
     if (!self || self->fd < 0 || !message_out || !buffer_in || !buffer_in->pointer)
         return 0;
 
-    size_t req_bytes = self->option_b_rtps_rx_mode ? RTPS_FULL_MSG_BYTES : RTPS_FAST_SAMPLE_BYTES;
+    size_t req_bytes = RTPS_FULL_MSG_BYTES;
     if ((size_t)buffer_in->length < req_bytes)
         return 0;
 
@@ -310,7 +309,6 @@ static inline int FpgaTransport_on_subscription_matched(
 static inline int FpgaTransport_init_plugin(
     NDDS_Transport_Plugin* plugin,
     int fd,
-    int enable_option_b_rtps_rx,
     uint32_t wire_pacing_ticks) {
     if (!plugin || fd < 0)
         return -EINVAL;
@@ -322,7 +320,6 @@ static inline int FpgaTransport_init_plugin(
     plugin->create_send_resource_srEA = FpgaTransport_create_send_resource_srEA;
     plugin->create_recv_resource_rrEA = FpgaTransport_create_recv_resource_rrEA;
     plugin->fd                        = fd;
-    plugin->option_b_rtps_rx_mode     = enable_option_b_rtps_rx ? 1 : 0;
     plugin->mmap_size                 = RTPS_IP_MAX_BYTES;
 
     /* Default Local Participant Identity (Cyclone DDS / RTI Connext Hybrid Node) */
@@ -334,7 +331,6 @@ static inline int FpgaTransport_init_plugin(
     plugin->edt_cfg.local_mac_hi         = 0x0200U;
     plugin->edt_cfg.local_vendor_id      = 0x0101U;     /* RTI Connext VendorId (0x0101) */
     plugin->edt_cfg.num_writers          = 1;
-    plugin->edt_cfg.plugin_rx_rtps_mode  = (uint8_t)plugin->option_b_rtps_rx_mode;
     plugin->edt_cfg.mode_pub_only        = 1;          /* Default to decoupled asynchronous mode */
     plugin->edt_cfg.local_identity_valid = 1;
     plugin->edt_cfg.writer_context_valid = 1;
@@ -455,7 +451,7 @@ static inline int DDS_DataReader_take(
     NDDS_Transport_Message_t msg;
 
     rx_buf_desc.pointer = (char*)plugin->rx_mmap_buf;
-    rx_buf_desc.length  = plugin->option_b_rtps_rx_mode ? RTPS_FULL_MSG_BYTES : RTPS_FAST_SAMPLE_BYTES;
+    rx_buf_desc.length  = RTPS_FULL_MSG_BYTES;
 
     int32_t ok = plugin->receive_rEA(plugin, &msg, &rx_buf_desc, &rr, NULL);
     if (!ok || !msg.buffer.pointer)
@@ -463,35 +459,31 @@ static inline int DDS_DataReader_take(
 
     const uint8_t*  bytes = (const uint8_t*)msg.buffer.pointer;
     const uint32_t* words = (const uint32_t*)msg.buffer.pointer;
-    if (plugin->option_b_rtps_rx_mode) {
-        /*
-         * Verify the 15-word (60-byte) RTPS v2.x wire message returned by S2MM:
-         *   Bytes 0..3   (Word 0):  "RTPS" (0x52, 0x54, 0x50, 0x53)
-         *   Bytes 4..7   (Word 1):  Version 2.x + VendorId
-         *   Bytes 20..23 (Word 5):  INFO_TS (0x09, 0x01, 0x08, 0x00)
-         *   Bytes 24..27 (Word 6):  INFO_TS seconds (LE)
-         *   Bytes 28..31 (Word 7):  INFO_TS fraction (LE)
-         *   Byte  32     (Word 8):  DATA submessageId (0x15)
-         *   Bytes 48..51 (Word 12): writerSN Hi (LE)
-         *   Bytes 52..55 (Word 13): writerSN Lo (LE)
-         *   Bytes 56..59 (Word 14): CDR_LE encapsulation (0x00, 0x01, 0x00, 0x00)
-         *   Words 15..1038:         4,096-byte FastSample payload (native LE)
-         */
-        if (memcmp(bytes, "RTPS", 4) != 0 || bytes[32] != 0x15U ||
-            bytes[56] != 0x00U || bytes[57] != 0x01U) {
-            errno = EBADMSG;
-            return -EBADMSG;
-        }
-        if (rx_source_ts_out) {
-            *rx_source_ts_out = ((uint64_t)words[6] << 32) | words[7];
-        }
-        if (rx_seq_num_out) {
-            *rx_seq_num_out = ((uint64_t)words[12] << 32) | words[13];
-        }
-        *sample_out = (const struct FastSample*)(&words[RTPS_WIRE_HEADER_WORDS]);
-    } else {
-        *sample_out = (const struct FastSample*)words;
+    /*
+     * Verify the 15-word (60-byte) RTPS v2.x wire message returned by S2MM:
+     *   Bytes 0..3   (Word 0):  "RTPS" (0x52, 0x54, 0x50, 0x53)
+     *   Bytes 4..7   (Word 1):  Version 2.x + VendorId
+     *   Bytes 20..23 (Word 5):  INFO_TS (0x09, 0x01, 0x08, 0x00)
+     *   Bytes 24..27 (Word 6):  INFO_TS seconds (LE)
+     *   Bytes 28..31 (Word 7):  INFO_TS fraction (LE)
+     *   Byte  32     (Word 8):  DATA submessageId (0x15)
+     *   Bytes 48..51 (Word 12): writerSN Hi (LE)
+     *   Bytes 52..55 (Word 13): writerSN Lo (LE)
+     *   Bytes 56..59 (Word 14): CDR_LE encapsulation (0x00, 0x01, 0x00, 0x00)
+     *   Words 15..1038:         4,096-byte FastSample payload (native LE)
+     */
+    if (memcmp(bytes, "RTPS", 4) != 0 || bytes[32] != 0x15U ||
+        bytes[56] != 0x00U || bytes[57] != 0x01U) {
+        errno = EBADMSG;
+        return -EBADMSG;
     }
+    if (rx_source_ts_out) {
+        *rx_source_ts_out = ((uint64_t)words[6] << 32) | words[7];
+    }
+    if (rx_seq_num_out) {
+        *rx_seq_num_out = ((uint64_t)words[12] << 32) | words[13];
+    }
+    *sample_out = (const struct FastSample*)(&words[RTPS_WIRE_HEADER_WORDS]);
 
     return 0;
 }

@@ -521,9 +521,9 @@ module rtps_fastpath_ip #(
         .rd_match_count_flat      (rd_match_count_flat)
     );
 
-    wire                  plugin_rx_rtps_mode = ctrl_reg[7];
-    wire [11:0]           egress_start_word   = plugin_rx_rtps_mode ? 12'd2 : latest_payload_word_off;
-    wire [ADDR_WIDTH:0]   egress_total_words  = plugin_rx_rtps_mode ? latest_rtps_words : cfg_payload_words[ADDR_WIDTH:0];
+    // S2MM Egress: Option B mode is standard (egress full RTPS wire message starting at "RTPS" magic)
+    wire [11:0]           egress_start_word   = 12'd2;
+    wire [ADDR_WIDTH:0]   egress_total_words  = latest_rtps_words;
 
     rtps_s2mm_egress #(
         .DATA_WIDTH (DATA_WIDTH),

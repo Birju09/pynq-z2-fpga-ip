@@ -37,72 +37,71 @@ struct axi_rtps_dev {
     bool ip_regs_allocated; /* True if manual ioremap was used */
 
     /* Coherent DMA buffers (Rule 2b) */
-    struct axi_dma_bd* tx_bd;
-    dma_addr_t tx_bd_phys;
-    void* tx_buf;
-    dma_addr_t tx_buf_phys;
+    struct axi_dma_bd* tx_bd;   /* Virtual address of MM2S Scatter-Gather buffer descriptor */
+    dma_addr_t tx_bd_phys;      /* Physical/DMA address of MM2S buffer descriptor */
+    void* tx_buf;               /* Virtual address of coherent MM2S TX payload buffer */
+    dma_addr_t tx_buf_phys;     /* Physical/DMA address of MM2S TX payload buffer */
 
-    struct axi_dma_bd* rx_bd;
-    dma_addr_t rx_bd_phys;
-    void* rx_buf;
-    dma_addr_t rx_buf_phys;
+    struct axi_dma_bd* rx_bd;   /* Virtual address of S2MM Scatter-Gather buffer descriptor */
+    dma_addr_t rx_bd_phys;      /* Physical/DMA address of S2MM buffer descriptor */
+    void* rx_buf;               /* Virtual address of coherent S2MM RX payload buffer */
+    dma_addr_t rx_buf_phys;     /* Physical/DMA address of S2MM RX payload buffer */
 
-    /* Zero-copy mmap user virtual addresses */
-    unsigned long tx_user_addr;
-    unsigned long rx_user_addr;
-    u32 bypass_crc;
-    u32 plugin_rx_rtps_mode;
-    u32 tx_ip_frag_mode;
-    u32 frag_size_bytes;
+    /* Zero-copy mmap user virtual addresses & runtime mode flags */
+    unsigned long tx_user_addr; /* User-space VMA start for mmap'd TX buffer (bypasses copy_from_user) */
+    unsigned long rx_user_addr; /* User-space VMA start for mmap'd RX buffer (bypasses copy_to_user) */
+    u32 bypass_crc;             /* 1 = skip software CRC-32 (write 0 to EXPECTED_CRC), 0 = compute CRC-32 */
+    u32 tx_ip_frag_mode;        /* 1 = legacy IPv4 fragmentation, 0 = RTPS DATA_FRAG (0x16) */
+    u32 frag_size_bytes;        /* Configured DATA_FRAG fragmentSize in bytes (default 1400) */
 
-    /* Synchronization & Diagnostics */
-    struct mutex tx_lock;
-    struct mutex rx_lock;
-    struct mutex dma_hw_lock;
-    wait_queue_head_t tx_waitq;
-    wait_queue_head_t rx_waitq;
-    wait_queue_head_t tx_ip_waitq;
-    wait_queue_head_t rx_packet_waitq;
-    volatile int tx_in_flight;
-    int tx_done;
-    int rx_done;
-    int tx_ip_done;
-    int rx_packet_avail;
-    int tx_err;
-    int rx_err;
-    int crc_err;
-    int no_match_err;
-    int csum_err;
-    u32 last_ip_status;
+    /* Synchronization & Completion State */
+    struct mutex tx_lock;           /* Serializes concurrent write() syscalls */
+    struct mutex rx_lock;           /* Serializes concurrent read() syscalls */
+    struct mutex dma_hw_lock;       /* Protects Xilinx AXI DMA dual-channel reset against in-flight MM2S */
+    wait_queue_head_t tx_waitq;     /* Woken when MM2S DMA IOC/error IRQ completes */
+    wait_queue_head_t rx_waitq;     /* Woken when S2MM DMA IOC/error IRQ completes */
+    wait_queue_head_t tx_ip_waitq;  /* Woken when PL TX FSM finishes wire TX & raises tx_done_irq */
+    wait_queue_head_t rx_packet_waitq; /* Woken when PL RX egress FSM has a sample ready (rx_done_irq) */
+    volatile int tx_in_flight;      /* 1 while MM2S DMA burst is active (guards S2MM reset fallback) */
+    int tx_done;                    /* 1 when MM2S DMA transfer has completed */
+    int rx_done;                    /* 1 when S2MM DMA transfer has completed */
+    int tx_ip_done;                 /* 1 when PL TX FSM has completed wire transmission */
+    int rx_packet_avail;            /* 1 when a validated RX sample is waiting in PL BRAM for read() */
+    int tx_err;                     /* 1 if MM2S DMA reported a hardware transfer error */
+    int rx_err;                     /* 1 if S2MM DMA reported a hardware transfer error */
+    int crc_err;                    /* 1 if PL IP reported MM2S ingress CRC-32 mismatch */
+    int no_match_err;               /* 1 if PL IP reported ERR_NO_MATCH (disabled/watchdog expired) */
+    int csum_err;                   /* 1 if PL IP reported an RX IPv4/UDP checksum error */
+    u32 last_ip_status;             /* Most recent STATUS_ADDR snapshot captured in ISR */
 
     /* Extended Phase & DMA Hardware Diagnostics */
-    u32 pre_write_ip_status;
-    u32 isr_pre_ack_ip_status;
-    u32 isr_post_ack_ip_status;
-    u32 isr_ack_polls;
-    u32 post_write_ip_status;
-    u32 pre_read_ip_status;
-    u32 post_kick_ip_status;
-    u32 post_50us_ip_status;
-    u32 post_50us_s2mm_dmasr;
-    u32 post_50us_bd_status;
-    u32 last_s2mm_dmacr;
-    u32 last_s2mm_dmasr;
-    u32 last_s2mm_curdesc;
-    u32 last_s2mm_taildesc;
-    u32 last_rx_bd_control;
-    u32 last_rx_bd_status;
-    u32 rx_buf_words_written;
-    u32 rx_buf_total_words;
-    u32 rx_buf_first_mod_idx;
-    u32 rx_buf_last_mod_idx;
-    u32 rx_buf_sample_words[7];
-    u32 irq_cnt_tx;
-    u32 irq_cnt_rx;
-    u32 irq_cnt_ip;
+    u32 pre_write_ip_status;        /* STATUS_ADDR read at start of write() before arming MM2S */
+    u32 isr_pre_ack_ip_status;      /* STATUS_ADDR read in ISR before writing IRQ ACK bits */
+    u32 isr_post_ack_ip_status;     /* STATUS_ADDR read in ISR after IRQ ACK flush */
+    u32 isr_ack_polls;              /* Number of AXI-Lite reads needed for ip_done_irq to clear in ISR */
+    u32 post_write_ip_status;       /* STATUS_ADDR read at end of write() after TX completion */
+    u32 pre_read_ip_status;         /* STATUS_ADDR read at start of read() before waiting/kicking */
+    u32 post_kick_ip_status;        /* STATUS_ADDR read immediately after writing KICK_EGRESS */
+    u32 post_50us_ip_status;        /* STATUS_ADDR snapshot after S2MM completion poll loop */
+    u32 post_50us_s2mm_dmasr;       /* S2MM_DMASR snapshot after S2MM completion poll loop */
+    u32 post_50us_bd_status;        /* rx_bd->status snapshot after S2MM completion poll loop */
+    u32 last_s2mm_dmacr;            /* S2MM_DMACR register snapshot for diagnostics */
+    u32 last_s2mm_dmasr;            /* S2MM_DMASR register snapshot for diagnostics */
+    u32 last_s2mm_curdesc;          /* S2MM_CURDESC register snapshot for diagnostics */
+    u32 last_s2mm_taildesc;         /* S2MM_TAILDESC register snapshot for diagnostics */
+    u32 last_rx_bd_control;         /* rx_bd->control snapshot from last read() */
+    u32 last_rx_bd_status;          /* rx_bd->status snapshot from last read() */
+    u32 rx_buf_words_written;       /* Diagnostic count of non-zero/modified words in rx_buf */
+    u32 rx_buf_total_words;         /* Total words expected in last read() */
+    u32 rx_buf_first_mod_idx;       /* First modified word index in rx_buf */
+    u32 rx_buf_last_mod_idx;        /* Last modified word index in rx_buf */
+    u32 rx_buf_sample_words[7];     /* First 7 words of rx_buf captured for debug */
+    u32 irq_cnt_tx;                 /* Cumulative MM2S DMA interrupts handled */
+    u32 irq_cnt_rx;                 /* Cumulative S2MM DMA interrupts handled */
+    u32 irq_cnt_ip;                 /* Cumulative RTPS Fast-Path IP interrupts handled */
 
     /* Learned Peer MAC Addresses */
-    u8 last_logged_ingress_mac[6];
+    u8 last_logged_ingress_mac[6];  /* Last remote peer MAC logged to dmesg (deduplicates prints) */
     u8 last_logged_arp_mac[6];
 
     /* Mapped Linux Virtual IRQs */
@@ -416,13 +415,11 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             }
 
             /* Atomically commit Shadow -> Active EDT at S_IDLE boundary */
-            dev->plugin_rx_rtps_mode = cfg.plugin_rx_rtps_mode ? 1 : 0;
             dev->tx_ip_frag_mode     = cfg.tx_ip_frag_mode ? 1U : 0U;
             ctrl_word = RTPS_CTRL_ENABLE |
                         ((cfg.num_writers & 0x07U) << RTPS_CTRL_NUM_WRITERS_SHIFT) |
                         (cfg.enable_peer_emu ? RTPS_CTRL_EMU_EN : 0U) |
                         RTPS_CTRL_COMMIT_EDT |
-                        (dev->plugin_rx_rtps_mode ? RTPS_CTRL_PLUGIN_RX_RTPS_MODE : 0U) |
                         (dev->tx_ip_frag_mode ? RTPS_CTRL_TX_IP_FRAG_MODE : 0U);
             iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
 
@@ -545,18 +542,6 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
 
         case AXI_RTPS_IOC_PET_WATCHDOG:
             iowrite32(1, dev->ip_regs + RTPS_IP_WDOG_HEARTBEAT_OFFSET);
-            return 0;
-
-        case AXI_RTPS_IOC_SET_PLUGIN_MODE:
-            if (copy_from_user(&val, (u32 __user*)arg, sizeof(u32)))
-                return -EFAULT;
-            dev->plugin_rx_rtps_mode = val ? 1 : 0;
-            ctrl_word = ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET);
-            if (dev->plugin_rx_rtps_mode)
-                ctrl_word |= RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
-            else
-                ctrl_word &= ~RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
-            iowrite32(ctrl_word, dev->ip_regs + RTPS_IP_CTRL_OFFSET);
             return 0;
 
         case AXI_RTPS_IOC_SET_CRC_BYPASS:
@@ -1365,33 +1350,6 @@ static const struct file_operations axi_rtps_fops = {
     .unlocked_ioctl = axi_rtps_unlocked_ioctl,
 };
 
-/* Sysfs attribute: /sys/class/axi_dma/axi_dma_dev/option_b_mode */
-static ssize_t option_b_mode_show(struct device* dev, struct device_attribute* attr, char* buf) {
-    struct axi_rtps_dev* dmadev = dev_get_drvdata(dev->parent);
-    if (!dmadev)
-        return -ENODEV;
-    return scnprintf(buf, PAGE_SIZE, "%u\n", dmadev->plugin_rx_rtps_mode);
-}
-
-static ssize_t option_b_mode_store(struct device* dev, struct device_attribute* attr, const char* buf, size_t count) {
-    struct axi_rtps_dev* dmadev = dev_get_drvdata(dev->parent);
-    unsigned int val;
-    u32 ctrl_word;
-    if (!dmadev || !dmadev->ip_regs)
-        return -ENODEV;
-    if (kstrtouint(buf, 0, &val))
-        return -EINVAL;
-    dmadev->plugin_rx_rtps_mode = val ? 1 : 0;
-    ctrl_word = ioread32(dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
-    if (dmadev->plugin_rx_rtps_mode)
-        ctrl_word |= RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
-    else
-        ctrl_word &= ~RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
-    iowrite32(ctrl_word, dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
-    return count;
-}
-static DEVICE_ATTR_RW(option_b_mode);
-
 /* Sysfs attribute: /sys/class/axi_dma/axi_dma_dev/learned_macs */
 static ssize_t learned_macs_show(struct device* dev, struct device_attribute* attr, char* buf) {
     struct axi_rtps_dev* dmadev = dev_get_drvdata(dev->parent);
@@ -1559,9 +1517,6 @@ static int axi_rtps_probe(struct platform_device* pdev) {
         goto err_class_destroy;
     }
 
-    if (device_create_file(dmadev->device, &dev_attr_option_b_mode))
-        dev_warn(dev, "failed to create option_b_mode sysfs attribute\n");
-
     if (device_create_file(dmadev->device, &dev_attr_learned_macs))
         dev_warn(dev, "failed to create learned_macs sysfs attribute\n");
 
@@ -1589,15 +1544,13 @@ static int axi_rtps_probe(struct platform_device* pdev) {
         goto err_free_ip_irq;
 
     /* Default to asynchronous decoupled Pub/Sub mode & Option B RTPS ingress */
-    dmadev->plugin_rx_rtps_mode = 1;
     dmadev->tx_ip_frag_mode     = 0;
     dmadev->frag_size_bytes     = 1400U;
     dmadev->bypass_crc          = 1;
     if (dmadev->ip_regs) {
         /* Default to physical wire enabled (RTPS_CTRL_EMU_EN = 0) so ARP and Ping work immediately */
         u32 default_ctrl = RTPS_CTRL_ENABLE |
-                           (1U << RTPS_CTRL_NUM_WRITERS_SHIFT) |
-                           RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
+                           (1U << RTPS_CTRL_NUM_WRITERS_SHIFT);
         iowrite32(default_ctrl, dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
         iowrite32(dmadev->frag_size_bytes, dmadev->ip_regs + RTPS_IP_FRAG_SIZE_OFFSET);
 
@@ -1623,7 +1576,6 @@ err_free_rx_irq:
     free_irq(dmadev->rx_virq, dmadev);
 err_device_destroy:
     device_remove_file(dmadev->device, &dev_attr_learned_macs);
-    device_remove_file(dmadev->device, &dev_attr_option_b_mode);
     device_destroy(dmadev->class, dmadev->dev_num);
 err_class_destroy:
     class_destroy(dmadev->class);
@@ -1664,7 +1616,6 @@ static int axi_rtps_remove(struct platform_device* pdev) {
         free_irq(dmadev->rx_virq, dmadev);
 
     device_remove_file(dmadev->device, &dev_attr_learned_macs);
-    device_remove_file(dmadev->device, &dev_attr_option_b_mode);
     device_destroy(dmadev->class, dmadev->dev_num);
     class_destroy(dmadev->class);
     cdev_del(&dmadev->cdev);

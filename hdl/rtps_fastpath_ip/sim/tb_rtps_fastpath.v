@@ -413,15 +413,15 @@ module tb_rtps_fastpath;
             errors = errors + 1;
         end
 
-        // Kick S2MM Egress & stress Skid Buffer under backpressure
+        // Kick S2MM Egress & stress Skid Buffer under backpressure (Option B: 15W RTPS + 1024W payload)
         axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
-        while (rx_cnt < PAYLOAD_WORDS) begin
+        while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
             @(posedge clk);
             m_axis_tready <= ((rx_cnt % 5) != 2);
             if (m_axis_tvalid && m_axis_tready) begin
                 rx_buf[rx_cnt] = m_axis_tdata;
-                if (rx_cnt == PAYLOAD_WORDS - 1 && !m_axis_tlast) begin
+                if (rx_cnt == (PAYLOAD_WORDS + 15 - 1) && !m_axis_tlast) begin
                     $display("[-] FAIL: Missing m_axis_tlast on final word %0d", rx_cnt);
                     errors = errors + 1;
                 end
@@ -438,9 +438,9 @@ module tb_rtps_fastpath;
             else
                 expected_word = (~tx_buf[i]) + {16'h0000, 6'd1, 10'h200};
 
-            if (rx_buf[i] !== expected_word) begin
+            if (rx_buf[15 + i] !== expected_word) begin
                 if (errors < 10) begin
-                    $display("[-] FAIL Word %0d: exp=0x%08X, got=0x%08X", i, expected_word, rx_buf[i]);
+                    $display("[-] FAIL Word %0d: exp=0x%08X, got=0x%08X", i, expected_word, rx_buf[15 + i]);
                 end
                 errors = errors + 1;
             end
@@ -483,7 +483,7 @@ module tb_rtps_fastpath;
         axi_write(10'h004, 32'h0000_0002);
         m_axis_tready <= 1'b1;
         rx_cnt = 0;
-        while (rx_cnt < PAYLOAD_WORDS) begin
+        while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
             @(posedge clk);
             if (m_axis_tvalid && m_axis_tready) begin
                 rx_buf[rx_cnt] = m_axis_tdata;
@@ -499,9 +499,9 @@ module tb_rtps_fastpath;
             else
                 expected_word = (~tx_buf[i]) + {16'h0000, 6'd2, 10'h200};
 
-            if (rx_buf[i] !== expected_word) begin
+            if (rx_buf[15 + i] !== expected_word) begin
                 if (errors < 10) begin
-                    $display("[-] FAIL Out-of-Order Word %0d: exp=0x%08X, got=0x%08X", i, expected_word, rx_buf[i]);
+                    $display("[-] FAIL Out-of-Order Word %0d: exp=0x%08X, got=0x%08X", i, expected_word, rx_buf[15 + i]);
                 end
                 errors = errors + 1;
             end
@@ -625,8 +625,8 @@ module tb_rtps_fastpath;
         $display("\n==================================================================");
         $display("  TEST 7: Option B NDDS_Transport_Plugin Mode (CTRL[7]=1, 1039W)");
         $display("==================================================================");
-        // Enable Option B Plugin Mode (CTRL_ADDR bit 7 = 1 -> 0x0000_0093)
-        axi_write(10'h008, 32'h0000_0093);
+        // Standard Option B mode (CTRL_ADDR = 0x0000_0013)
+        axi_write(10'h008, 32'h0000_0013);
         axi_write(10'h00C, 32'h0000_0000); // Bypass ingress CRC or use calc_crc
 
         // Stream 1,024-word (4,096 B) FastSample payload from FpgaTransport_send()
@@ -842,12 +842,12 @@ module tb_rtps_fastpath;
         // Kick S2MM DMA egress (driver read() writes bit 1 to STATUS_ADDR)
         axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
-        while (rx_cnt < PAYLOAD_WORDS) begin
+        while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
             @(posedge clk);
             m_axis_tready <= 1'b1;
             if (m_axis_tvalid && m_axis_tready) begin
                 rx_buf[rx_cnt] = m_axis_tdata;
-                if (rx_cnt == PAYLOAD_WORDS - 1 && !m_axis_tlast) begin
+                if (rx_cnt == (PAYLOAD_WORDS + 15 - 1) && !m_axis_tlast) begin
                     $display("[-] FAIL: Missing m_axis_tlast on final word %0d in Subscribe-only mode", rx_cnt);
                     errors = errors + 1;
                 end
@@ -941,15 +941,15 @@ module tb_rtps_fastpath;
             $display("[+] PASS: RX Egress FSM in RX_EGRESS_WAIT (2) while TX FSM remains S_IDLE (0, s_axis_tready=1)!");
         end
 
-        // S2MM Readout: Kick S2MM and read 1,024 words
+        // S2MM Readout: Kick S2MM and read 1,039 words
         axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
-        while (rx_cnt < PAYLOAD_WORDS) begin
+        while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
             @(posedge clk);
             m_axis_tready <= 1'b1;
             if (m_axis_tvalid && m_axis_tready) begin
                 rx_buf[rx_cnt] = m_axis_tdata;
-                if (rx_cnt == PAYLOAD_WORDS - 1 && !m_axis_tlast) begin
+                if (rx_cnt == (PAYLOAD_WORDS + 15 - 1) && !m_axis_tlast) begin
                     $display("[-] FAIL: Missing m_axis_tlast on final word %0d in TEST 10", rx_cnt);
                     errors = errors + 1;
                 end
@@ -1293,7 +1293,7 @@ module tb_rtps_fastpath;
         m_axis_tready <= 1'b1;
         rx_cnt = 0;
         sim_timeout = 0;
-        while (rx_cnt < PAYLOAD_WORDS && sim_timeout < 1500) begin
+        while (rx_cnt < (PAYLOAD_WORDS + 15) && sim_timeout < 1500) begin
             @(posedge clk);
             if (m_axis_tvalid && m_axis_tready) begin
                 rx_cnt = rx_cnt + 1;
@@ -1519,7 +1519,7 @@ module tb_rtps_fastpath;
             axi_write(10'h004, 32'h0000_0002);
             rx_cnt = 0;
             m_axis_tready = 1'b1;
-            while (rx_cnt < PAYLOAD_WORDS) begin
+            while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
                 @(posedge clk);
                 if (m_axis_tvalid && m_axis_tready) begin
                     rx_buf[rx_cnt] = m_axis_tdata;
@@ -1532,8 +1532,8 @@ module tb_rtps_fastpath;
 
             for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
                 expected_word = (i < 4) ? tx_buf[i] : ((~tx_buf[i]) + {16'h0000, last_seq_emu[5:0], 10'h200});
-                if (rx_buf[i] !== expected_word) begin
-                    if (errors < 10) $display("[-] FAIL TEST 19 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[i]);
+                if (rx_buf[15 + i] !== expected_word) begin
+                    if (errors < 10) $display("[-] FAIL TEST 19 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[15 + i]);
                     errors = errors + 1;
                 end
             end
@@ -1591,7 +1591,7 @@ module tb_rtps_fastpath;
             axi_write(10'h004, 32'h0000_0002);
             rx_cnt = 0;
             m_axis_tready = 1'b1;
-            while (rx_cnt < PAYLOAD_WORDS) begin
+            while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
                 @(posedge clk);
                 if (m_axis_tvalid && m_axis_tready) begin
                     rx_buf[rx_cnt] = m_axis_tdata;
@@ -1603,8 +1603,8 @@ module tb_rtps_fastpath;
 
             for (i = 0; i < PAYLOAD_WORDS; i = i + 1) begin
                 expected_word = (i < 4) ? tx_buf[i] : ((~tx_buf[i]) + {16'h0000, last_seq_emu[5:0], 10'h200});
-                if (rx_buf[i] !== expected_word) begin
-                    if (errors < 10) $display("[-] FAIL TEST 20 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[i]);
+                if (rx_buf[15 + i] !== expected_word) begin
+                    if (errors < 10) $display("[-] FAIL TEST 20 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[15 + i]);
                     errors = errors + 1;
                 end
             end
@@ -1659,7 +1659,7 @@ module tb_rtps_fastpath;
             axi_write(10'h004, 32'h0000_0002);
             rx_cnt = 0;
             m_axis_tready = 1'b1;
-            while (rx_cnt < 64) begin
+            while (rx_cnt < (64 + 15)) begin
                 @(posedge clk);
                 if (m_axis_tvalid && m_axis_tready) begin
                     rx_buf[rx_cnt] = m_axis_tdata;
@@ -1671,8 +1671,8 @@ module tb_rtps_fastpath;
 
             for (i = 0; i < 64; i = i + 1) begin
                 expected_word = (i < 4) ? tx_buf[i] : ((~tx_buf[i]) + {16'h0000, last_seq_emu[5:0], 10'h200});
-                if (rx_buf[i] !== expected_word) begin
-                    if (errors < 10) $display("[-] FAIL TEST 21 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[i]);
+                if (rx_buf[15 + i] !== expected_word) begin
+                    if (errors < 10) $display("[-] FAIL TEST 21 Word %0d: exp=0x%08X got=0x%08X", i, expected_word, rx_buf[15 + i]);
                     errors = errors + 1;
                 end
             end
@@ -1696,10 +1696,10 @@ module tb_rtps_fastpath;
             reg [15:0] ip_hdr_csum, oct_next;
 
             axi_write(10'h014, PAYLOAD_WORDS);
-            // Configure Subscribe-only + Option B (bit 9=1, bit 7=1, bit 0=1 -> 0x0000_0283), commit EDT
-            axi_write(10'h008, 32'h0000_02A3);
+            // Configure Subscribe-only (bit 9=1, bit 0=1 -> 0x0000_0203), commit EDT
+            axi_write(10'h008, 32'h0000_0223);
             repeat (5) @(posedge clk);
-            axi_write(10'h008, 32'h0000_0283);
+            axi_write(10'h008, 32'h0000_0203);
             repeat (5) @(posedge clk);
 
             // Populate ser_bytes: 4B CDR_LE + 1024 words (little-endian CDR byte order per word = tx_buf[i])
