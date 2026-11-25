@@ -60,17 +60,23 @@ localparam [7:0]
     CFG_FRAG_SIZE_ADDR          = 8'h70; // 0x1C0: TX DATA_FRAG fragmentSize in bytes (default 1400)
 
 // -----------------------------------------------------------------------------
-// Master FSM States (PART B)
+// Master TX FSM States (rtps_tx_engine, always asynchronous)
 // -----------------------------------------------------------------------------
 localparam [3:0]
     S_IDLE         = 4'd0,
     S_CHECK_CRC    = 4'd1,
     S_TX_FRAG_INIT = 4'd2,
     S_TX_FRAG_SEND = 4'd3,
-    S_WAIT_RX_FB   = 4'd4,
-    S_DONE_IRQ     = 4'd5,
-    S_WAIT_EGRESS  = 4'd6,
-    S_TX_RUN       = 4'd7;
+    S_DONE_IRQ     = 4'd5;
+
+// -----------------------------------------------------------------------------
+// Decoupled RX Egress FSM States (rtps_s2mm_egress)
+// -----------------------------------------------------------------------------
+localparam [1:0]
+    RX_EGRESS_IDLE = 2'd0,
+    RX_EGRESS_IRQ  = 2'd1,
+    RX_EGRESS_WAIT = 2'd2,
+    RX_EGRESS_RUN  = 2'd3;
 
 // -----------------------------------------------------------------------------
 // RX Reassembly & RTPS Submessage Walker FSM States (PART A)

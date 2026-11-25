@@ -158,6 +158,11 @@ module rtps_fastpath_ip #(
     wire [NUM_ENDPOINTS*7*32-1:0] rd_edt_flat;
 
     wire [3:0]                    state;
+    wire [1:0]                    rx_egress_state;
+    wire                          egress_active;
+    wire                          tx_done_irq;
+    wire                          rx_done_irq;
+    assign ip_done_irq = tx_done_irq | rx_done_irq;
     wire [5:0]                    rx_state;
     wire [31:0]                   crc_accum;
     wire [31:0]                   last_cycle_ticks;
@@ -165,9 +170,8 @@ module rtps_fastpath_ip #(
     wire [31:0]                   stat_tx_samples;
     wire                          err_crc;
     wire                          err_no_match;
-    wire                          err_rx_timeout;
     wire                          err_csum;
-    wire                          irq_is_rx;
+    wire                          irq_is_rx = rx_done_irq;
 
     wire [11:0]                   latest_payload_word_off;
     wire [11:0]                   latest_rtps_words;
@@ -221,9 +225,9 @@ module rtps_fastpath_ip #(
     wire [11:0] s2mm_rd_addr;
 
     reg  [31:0] reasm_dout_0, reasm_dout_1, reasm_dout_2;
-    wire [11:0] slot0_rd_addr = (state == S_TX_RUN && egress_slot == 2'd0) ? s2mm_rd_addr : walker_rd_addr;
-    wire [11:0] slot1_rd_addr = (state == S_TX_RUN && egress_slot == 2'd1) ? s2mm_rd_addr : walker_rd_addr;
-    wire [11:0] slot2_rd_addr = (state == S_TX_RUN && egress_slot == 2'd2) ? s2mm_rd_addr : walker_rd_addr;
+    wire [11:0] slot0_rd_addr = (egress_active && egress_slot == 2'd0) ? s2mm_rd_addr : walker_rd_addr;
+    wire [11:0] slot1_rd_addr = (egress_active && egress_slot == 2'd1) ? s2mm_rd_addr : walker_rd_addr;
+    wire [11:0] slot2_rd_addr = (egress_active && egress_slot == 2'd2) ? s2mm_rd_addr : walker_rd_addr;
 
     always @(posedge clk) begin
         if (reasm_wr_en) begin
@@ -274,7 +278,6 @@ module rtps_fastpath_ip #(
     wire rx_commit_pulse;
     wire rx_csum_err_pulse;
     wire slot_consume_pulse;
-    wire slot_clear_latest_pulse;
 
     always @(posedge clk) begin
         if (!rst_n_local) begin
@@ -294,8 +297,6 @@ module rtps_fastpath_ip #(
                 fill_slot    <= pick_free_slot(fill_slot, egress_slot);
             end else if (slot_consume_pulse) begin
                 egress_slot  <= latest_slot;
-                latest_valid <= 1'b0;
-            end else if (slot_clear_latest_pulse) begin
                 latest_valid <= 1'b0;
             end
         end
@@ -337,7 +338,6 @@ module rtps_fastpath_ip #(
         .cfg_pacing_timer         (cfg_pacing_timer),
         .cfg_payload_words        (cfg_payload_words),
         .cfg_frag_size            (cfg_frag_size),
-        .rx_timeout_limit         (rx_timeout_limit),
         .local_guid_prefix        (local_guid_prefix),
         .local_src_ip             (local_src_ip),
         .local_mac                (local_mac),
@@ -361,6 +361,7 @@ module rtps_fastpath_ip #(
         .wr_seq_seed_flat         (wr_seq_seed_flat),
         .rd_edt_flat              (rd_edt_flat),
         .state                    (state),
+        .rx_egress_state          (rx_egress_state),
         .crc_accum                (crc_accum),
         .last_cycle_ticks         (last_cycle_ticks),
         .completed_frags          (completed_frags),
@@ -368,7 +369,6 @@ module rtps_fastpath_ip #(
         .irq_is_rx                (irq_is_rx),
         .err_crc                  (err_crc),
         .err_no_match             (err_no_match),
-        .err_rx_timeout           (err_rx_timeout),
         .err_csum                 (err_csum),
         .stat_tx_samples          (stat_tx_samples),
         .stat_rx_samples          (stat_rx_samples),
@@ -425,11 +425,6 @@ module rtps_fastpath_ip #(
         .s_axis_wire_tlast  (s_axis_wire_tlast)
     );
 
-    wire                  start_egress;
-    wire                  abort_egress;
-    wire [ADDR_WIDTH:0]   egress_pkt_len;
-    wire                  egress_done;
-
     rtps_tx_engine #(
         .DATA_WIDTH    (DATA_WIDTH),
         .BRAM_DEPTH    (BRAM_DEPTH),
@@ -452,7 +447,6 @@ module rtps_fastpath_ip #(
         .cfg_pacing_timer         (cfg_pacing_timer),
         .cfg_payload_words        (cfg_payload_words),
         .cfg_frag_size            (cfg_frag_size),
-        .rx_timeout_limit         (rx_timeout_limit),
         .local_guid_prefix        (local_guid_prefix),
         .local_src_ip             (local_src_ip),
         .local_mac                (local_mac),
@@ -473,17 +467,8 @@ module rtps_fastpath_ip #(
         .wr0_reader_id            (wr0_reader_id),
         .wr_valid_vec             (wr_valid_vec),
         .wr_seq_seed_flat         (wr_seq_seed_flat),
-        .icmp_err_stb             (icmp_err_stb),
-        .icmp_err_info            (icmp_err_info),
         .rx_csum_err_pulse        (rx_csum_err_pulse),
-        .latest_valid             (latest_valid),
-        .slot_consume_pulse       (slot_consume_pulse),
-        .slot_clear_latest_pulse  (slot_clear_latest_pulse),
-        .start_egress             (start_egress),
-        .abort_egress             (abort_egress),
-        .egress_pkt_len           (egress_pkt_len),
-        .egress_done              (egress_done),
-        .ip_done_irq              (ip_done_irq),
+        .ip_done_irq              (tx_done_irq),
         .state                    (state),
         .crc_accum                (crc_accum),
         .last_cycle_ticks         (last_cycle_ticks),
@@ -491,9 +476,7 @@ module rtps_fastpath_ip #(
         .stat_tx_samples          (stat_tx_samples),
         .err_crc                  (err_crc),
         .err_no_match             (err_no_match),
-        .err_rx_timeout           (err_rx_timeout),
-        .err_csum                 (err_csum),
-        .irq_is_rx                (irq_is_rx)
+        .err_csum                 (err_csum)
     );
 
     rtps_rx_reasm #(
@@ -540,8 +523,7 @@ module rtps_fastpath_ip #(
 
     wire                  plugin_rx_rtps_mode = ctrl_reg[7];
     wire [11:0]           egress_start_word   = plugin_rx_rtps_mode ? 12'd2 : latest_payload_word_off;
-    wire [ADDR_WIDTH:0]   egress_total_words  = plugin_rx_rtps_mode ? latest_rtps_words :
-                                                ((egress_pkt_len > 0) ? egress_pkt_len : cfg_payload_words[ADDR_WIDTH:0]);
+    wire [ADDR_WIDTH:0]   egress_total_words  = plugin_rx_rtps_mode ? latest_rtps_words : cfg_payload_words[ADDR_WIDTH:0];
 
     rtps_s2mm_egress #(
         .DATA_WIDTH (DATA_WIDTH),
@@ -549,11 +531,16 @@ module rtps_fastpath_ip #(
     ) u_s2mm_egress (
         .clk                (clk),
         .rst_n_local        (rst_n_local),
-        .start_egress       (start_egress),
-        .abort_egress       (abort_egress),
+        .latest_valid       (latest_valid),
+        .status_write_pulse (status_write_pulse),
+        .status_write_data  (status_write_data),
+        .trigger_detected   (trigger_detected),
+        .slot_consume_pulse (slot_consume_pulse),
+        .rx_done_irq        (rx_done_irq),
+        .rx_egress_state    (rx_egress_state),
+        .egress_active      (egress_active),
         .egress_start_word  (egress_start_word),
         .egress_total_words (egress_total_words),
-        .egress_done        (egress_done),
         .s2mm_rd_addr       (s2mm_rd_addr),
         .s2mm_dout          (s2mm_dout),
         .m_axis_tdata       (m_axis_tdata),

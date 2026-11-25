@@ -37,7 +37,6 @@ module rtps_tx_engine #(
     input  wire [31:0]                 cfg_pacing_timer,
     input  wire [31:0]                 cfg_payload_words,
     input  wire [31:0]                 cfg_frag_size,
-    input  wire [31:0]                 rx_timeout_limit,
     input  wire [95:0]                 local_guid_prefix,
     input  wire [31:0]                 local_src_ip,
     input  wire [47:0]                 local_mac,
@@ -61,19 +60,8 @@ module rtps_tx_engine #(
     input  wire [NUM_ENDPOINTS-1:0]    wr_valid_vec,
     input  wire [NUM_ENDPOINTS*32-1:0] wr_seq_seed_flat,
 
-    // ICMP & RX Error Events
-    input  wire                        icmp_err_stb,
-    input  wire [31:0]                 icmp_err_info,
+    // RX Error Event
     input  wire                        rx_csum_err_pulse,
-
-    // 3-Slot Arbiter & S2MM Egress Handshake
-    input  wire                        latest_valid,
-    output wire                        slot_consume_pulse,
-    output wire                        slot_clear_latest_pulse,
-    output wire                        start_egress,
-    output wire                        abort_egress,
-    output wire [ADDR_WIDTH:0]         egress_pkt_len,
-    input  wire                        egress_done,
 
     // Interrupt & Status Outputs
     output reg                         ip_done_irq,
@@ -84,9 +72,7 @@ module rtps_tx_engine #(
     output reg  [31:0]                 stat_tx_samples,
     output reg                         err_crc,
     output reg                         err_no_match,
-    output reg                         err_rx_timeout,
-    output reg                         err_csum,
-    output reg                         irq_is_rx
+    output reg                         err_csum
 );
 
     `include "rtps_fastpath_defs.vh"
@@ -97,7 +83,6 @@ module rtps_tx_engine #(
     localparam integer IPV4_NONFINAL_PAYLOAD = 1472;
     localparam integer TX_DF_FRAG_MAX        = 1404;
 
-    wire mode_pub_only   = ctrl_reg[8];
     wire mode_sub_only   = ctrl_reg[9];
     wire tx_ip_frag_mode = ctrl_reg[10];
 
@@ -126,7 +111,7 @@ module rtps_tx_engine #(
     (* ram_style = "block" *) reg [DATA_WIDTH-1:0] tx_sample_bram [0:BRAM_DEPTH-1];
 
     reg [ADDR_WIDTH:0] rx_ptr;
-    assign s_axis_tready = (state == S_IDLE) && !mode_sub_only && (!latest_valid || (rx_ptr > 0));
+    assign s_axis_tready = (state == S_IDLE) && !mode_sub_only;
     wire   rx_handshake  = s_axis_tvalid && s_axis_tready;
     wire   axis_wr       = rx_handshake && (state == S_IDLE);
 
@@ -162,11 +147,9 @@ module rtps_tx_engine #(
     reg                err_icmp;
 
     reg [ADDR_WIDTH:0] pkt_len;
-    assign egress_pkt_len = pkt_len;
 
     reg [15:0]         pacing_timer;
     reg [31:0]         cycle_tick_cnt;
-    reg [31:0]         rx_wait_cnt;
 
     reg [15:0]         tx_ip_id_counter;
     reg [63:0]         latched_tx_ts;
@@ -344,24 +327,7 @@ module rtps_tx_engine #(
     end
 
     // -------------------------------------------------------------------------
-    // Combinational Handoff Pulses to 3-Slot Arbiter & S2MM Egress
-    // -------------------------------------------------------------------------
-    assign slot_consume_pulse =
-        ((state == S_IDLE)         && latest_valid && (rx_ptr == 0)) ||
-        ((state == S_TX_FRAG_SEND) && !trigger_detected && (!eng_tx_tvalid || eng_tx_tready) &&
-         (pacing_timer == 16'd0) && (tx_beat_idx == (12'd8 + tx_frag_words)) &&
-         !tx_frag_more && mode_pub_only && latest_valid) ||
-        ((state == S_WAIT_RX_FB)   && !trigger_detected && latest_valid);
-
-    assign slot_clear_latest_pulse =
-        (state == S_CHECK_CRC) && lifecycle_ok_q &&
-        ((crc_accum == expected_crc) || (expected_crc == 32'h0)) && !mode_pub_only;
-
-    assign start_egress = (state == S_WAIT_EGRESS) && status_write_pulse && status_write_data[1];
-    assign abort_egress = (state == S_TX_RUN) && trigger_detected;
-
-    // -------------------------------------------------------------------------
-    // Master Cycle Sequencer FSM
+    // Master Cycle Sequencer FSM (Always Asynchronous TX)
     // -------------------------------------------------------------------------
     integer rst_ep;
     always @(posedge clk) begin
@@ -372,15 +338,11 @@ module rtps_tx_engine #(
             pacing_timer         <= 16'd0;
             cycle_tick_cnt       <= 32'd0;
             last_cycle_ticks     <= 32'd0;
-            rx_wait_cnt          <= 32'd0;
 
             ip_done_irq          <= 1'b0;
             err_crc              <= 1'b0;
             err_no_match         <= 1'b0;
-            err_rx_timeout       <= 1'b0;
             err_csum             <= 1'b0;
-            err_icmp             <= 1'b0;
-            irq_is_rx            <= 1'b0;
             completed_frags      <= 16'd0;
 
             tx_ip_id_counter     <= 16'h1000;
@@ -445,13 +407,7 @@ module rtps_tx_engine #(
                     eng_tx_tvalid <= 1'b0;
                     eng_tx_tlast  <= 1'b0;
 
-                    if (latest_valid && (rx_ptr == 0)) begin
-                        // Asynchronous wire RX: Walker has verified a complete sample from remote publisher!
-                        irq_is_rx        <= 1'b1;
-                        last_cycle_ticks <= 32'd1;
-                        ip_done_irq      <= 1'b1; // Level-High IRQ to PS (IRQ_F2P)
-                        state            <= S_DONE_IRQ;
-                    end else if (rx_handshake && !mode_sub_only) begin
+                    if (rx_handshake && !mode_sub_only) begin
                         if (s_axis_tlast || (rx_ptr == cfg_payload_words - 1)) begin
                             pkt_len <= {1'b0, rx_ptr[ADDR_WIDTH-1:0]} + 1'b1;
                             rx_ptr  <= 0;
@@ -478,14 +434,11 @@ module rtps_tx_engine #(
                         // Q22: Disabled / watchdog expired / no valid writer match -> immediate ERR_NO_MATCH
                         err_no_match   <= 1'b1;
                         err_crc        <= 1'b0;
-                        err_rx_timeout <= 1'b0;
-                        irq_is_rx      <= 1'b0;
                         ip_done_irq    <= 1'b1;
                         state          <= S_DONE_IRQ;
                     end else if ((crc_accum == expected_crc) || (expected_crc == 32'h0)) begin
                         err_crc              <= 1'b0;
                         err_no_match         <= 1'b0;
-                        err_rx_timeout       <= 1'b0;
                         err_csum             <= 1'b0;
                         completed_frags      <= 16'd0;
                         tx_frag_idx          <= 16'd0;
@@ -494,12 +447,9 @@ module rtps_tx_engine #(
                         tx_init_phase        <= 2'd0;
                         tx_ip_id_counter     <= tx_ip_id_counter + 16'd1;
                         writer_seq_num[0]    <= writer_seq_num[0] + 64'd1;
-                        if (!mode_pub_only) begin
-                            end
                         state                <= S_TX_FRAG_INIT;
                     end else begin
                         err_crc     <= 1'b1;
-                        irq_is_rx   <= 1'b0;
                         ip_done_irq <= 1'b1;
                         state       <= S_DONE_IRQ;
                     end
@@ -637,20 +587,10 @@ module rtps_tx_engine #(
                                 if (tx_beat_idx == (12'd8 + tx_frag_words)) begin
                                     completed_frags <= completed_frags + 16'd1;
                                     if (!tx_frag_more) begin
-                                        stat_tx_samples <= stat_tx_samples + 32'd1;
-                                        if (mode_pub_only) begin
-                                            last_cycle_ticks <= cycle_tick_cnt + 32'd1;
-                                            if (latest_valid) begin
-                                                irq_is_rx    <= 1'b1;
-                                            end else begin
-                                                irq_is_rx    <= 1'b0;
-                                            end
-                                            ip_done_irq <= 1'b1;
-                                            state       <= S_DONE_IRQ;
-                                        end else begin
-                                            rx_wait_cnt <= 32'd0;
-                                            state       <= S_WAIT_RX_FB;
-                                        end
+                                        stat_tx_samples  <= stat_tx_samples + 32'd1;
+                                        last_cycle_ticks <= cycle_tick_cnt + 32'd1;
+                                        ip_done_irq      <= 1'b1;
+                                        state            <= S_DONE_IRQ;
                                     end else begin
                                         if (tx_use_data_frag) begin
                                             tx_bytes_remaining   <= tx_bytes_remaining - {4'd0, tx_frag_ser_bytes};
@@ -693,98 +633,19 @@ module rtps_tx_engine #(
                 end
 
                 // -------------------------------------------------------------
-                // 5. S_WAIT_RX_FB: Wait for Latest-Value RX Sample or Timeout
-                // -------------------------------------------------------------
-                S_WAIT_RX_FB: begin
-                    if (eng_tx_tvalid && eng_tx_tready) begin
-                        eng_tx_tvalid <= 1'b0;
-                        eng_tx_tlast  <= 1'b0;
-                    end
-
-                    if (trigger_detected) begin
-                        eng_tx_tvalid <= 1'b0;
-                        eng_tx_tlast  <= 1'b0;
-                        ip_done_irq   <= 1'b0;
-                        rx_ptr        <= 0;
-                        state         <= S_IDLE;
-                    end else if (latest_valid) begin
-                        // Lock the validated slot for S2MM Egress
-                        irq_is_rx        <= 1'b1;
-                        last_cycle_ticks <= cycle_tick_cnt + 32'd1;
-                        ip_done_irq      <= 1'b1; // Assert Level-High IRQ to PS!
-                        state            <= S_DONE_IRQ;
-                    end else if (icmp_err_stb && (icmp_err_info[31:24] == 8'd3 || icmp_err_info[31:24] == 8'd11)) begin
-                        err_icmp         <= 1'b1;
-                        err_rx_timeout   <= 1'b1;
-                        irq_is_rx        <= 1'b0;
-                        last_cycle_ticks <= cycle_tick_cnt + 32'd1;
-                        ip_done_irq      <= 1'b1; // Wake PS with ICMP error
-                        state            <= S_DONE_IRQ;
-                    end else if (rx_wait_cnt >= rx_timeout_limit) begin
-                        err_rx_timeout   <= 1'b1;
-                        irq_is_rx        <= 1'b0;
-                        last_cycle_ticks <= cycle_tick_cnt + 32'd1;
-                        ip_done_irq      <= 1'b1; // Wake PS with timeout error bit set
-                        state            <= S_DONE_IRQ;
-                    end else begin
-                        cycle_tick_cnt <= cycle_tick_cnt + 32'd1;
-                        rx_wait_cnt    <= rx_wait_cnt + 32'd1;
-                    end
-                end
-
-                // -------------------------------------------------------------
-                // 6. S_DONE_IRQ: Hold Level-High IRQ until PS Driver ACKs
+                // 5. S_DONE_IRQ: Hold Level-High TX IRQ until PS Driver ACKs
                 // -------------------------------------------------------------
                 S_DONE_IRQ: begin
                     if (eng_tx_tvalid && eng_tx_tready) begin
                         eng_tx_tvalid <= 1'b0;
                         eng_tx_tlast  <= 1'b0;
                     end
-                    if (status_write_pulse && status_write_data[0]) begin
-                        ip_done_irq <= 1'b0;
-                        if (err_crc || err_no_match || err_rx_timeout || err_icmp || (!irq_is_rx && mode_pub_only)) begin
-                            err_crc        <= 1'b0;
-                            err_no_match   <= 1'b0;
-                            err_rx_timeout <= 1'b0;
-                            err_icmp       <= 1'b0;
-                            irq_is_rx      <= 1'b0;
-                            rx_ptr         <= 0;
-                            state          <= S_IDLE;
-                        end else begin
-                            state     <= S_WAIT_EGRESS;
-                        end
-                    end else if (trigger_detected) begin
+                    if ((status_write_pulse && status_write_data[0]) || trigger_detected) begin
                         ip_done_irq    <= 1'b0;
                         err_crc        <= 1'b0;
                         err_no_match   <= 1'b0;
-                        err_rx_timeout <= 1'b0;
-                        err_icmp       <= 1'b0;
-                        irq_is_rx      <= 1'b0;
                         rx_ptr         <= 0;
                         state          <= S_IDLE;
-                    end
-                end
-
-                // -------------------------------------------------------------
-                // 7. S_WAIT_EGRESS: Wait for Driver read() to prime S2MM & kick
-                // -------------------------------------------------------------
-                S_WAIT_EGRESS: begin
-                    if (status_write_pulse && status_write_data[1]) begin
-                        state           <= S_TX_RUN;
-                    end else if (trigger_detected) begin
-                        rx_ptr <= 0;
-                        state  <= S_IDLE;
-                    end
-                end
-
-                S_TX_RUN: begin
-                    if (trigger_detected) begin
-                        rx_ptr <= 0;
-                        state  <= S_IDLE;
-                    end else if (egress_done) begin
-                        irq_is_rx <= 1'b0;
-                        rx_ptr    <= 0;
-                        state     <= S_IDLE;
                     end
                 end
 

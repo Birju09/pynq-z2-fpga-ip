@@ -85,6 +85,7 @@ module rtps_csr_edt #(
     // Status & Telemetry Inputs from Datapath & External Interfaces
     // -------------------------------------------------------------------------
     input  wire [3:0]                    state,
+    input  wire [1:0]                    rx_egress_state,
     input  wire [31:0]                   crc_accum,
     input  wire [31:0]                   last_cycle_ticks,
     input  wire [15:0]                   completed_frags,
@@ -92,7 +93,6 @@ module rtps_csr_edt #(
     input  wire                          irq_is_rx,
     input  wire                          err_crc,
     input  wire                          err_no_match,
-    input  wire                          err_rx_timeout,
     input  wire                          err_csum,
 
     input  wire [31:0]                   stat_tx_samples,
@@ -154,7 +154,6 @@ module rtps_csr_edt #(
                             {free_running_sec, free_running_frac_acc[47:16]};
 
     wire emu_enable    = ctrl_reg[4];
-    wire mode_pub_only = ctrl_reg[8];
     wire mode_sub_only = ctrl_reg[9];
 
     // -------------------------------------------------------------------------
@@ -492,14 +491,15 @@ module rtps_csr_edt #(
                     case (rd_word_idx)
                         STATUS_ADDR: begin
                             s_axi_rdata <= {
-                                stat_rx_samples[15:0],
+                                rx_egress_state,
+                                stat_rx_samples[13:0],
                                 lifecycle_ok,
                                 wdog_expired,
                                 completed_frags[2:0],
                                 irq_is_rx,
-                                mode_pub_only,
+                                1'b1,
                                 err_csum,
-                                err_rx_timeout,
+                                1'b0,
                                 err_no_match,
                                 err_crc,
                                 state,

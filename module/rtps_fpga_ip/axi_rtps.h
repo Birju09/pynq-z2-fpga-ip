@@ -101,13 +101,14 @@
 #define RTPS_CTRL_COMMIT_EDT             (1U << 5)
 #define RTPS_CTRL_WDOG_EN                (1U << 6)
 #define RTPS_CTRL_PLUGIN_RX_RTPS_MODE    (1U << 7) /* Option B: S2MM outputs full 4,156B RTPS message */
-#define RTPS_CTRL_PUB_ONLY               (1U << 8) /* Publish-only mode: do not wait for feedback */
+#define RTPS_CTRL_PUB_ONLY               (1U << 8) /* Deprecated/ignored: IP is always async */
 #define RTPS_CTRL_SUB_ONLY               (1U << 9) /* Subscribe-only mode: unsolicited wire RX from S_IDLE */
 #define RTPS_CTRL_TX_IP_FRAG_MODE        (1U << 10) /* 0 = DATA_FRAG default, 1 = Legacy IPv4 fragmentation */
 
 /* STATUS_ADDR (0x04) Bit Masks */
-#define RTPS_STATUS_ACK_IRQ              (1U << 0) /* Write Bit 0: Acknowledge Level-High IRQ */
+#define RTPS_STATUS_ACK_IRQ              (1U << 0) /* Write Bit 0: Acknowledge TX Level-High IRQ */
 #define RTPS_STATUS_KICK_EGRESS          (1U << 1) /* Write Bit 1: Kick S2MM Egress Streaming */
+#define RTPS_STATUS_ACK_RX_IRQ           (1U << 3) /* Write Bit 3: Acknowledge RX Level-High IRQ */
 #define RTPS_STATUS_IRQ_MASK             (1U << 0)
 #define RTPS_STATUS_STATE_MASK           0x0000001EU
 #define RTPS_STATUS_ERR_CRC              (1U << 5)
@@ -115,13 +116,20 @@
 #define RTPS_STATUS_ERR_RX_TIMEOUT       (1U << 7)
 #define RTPS_STATUS_ERR_CSUM             (1U << 8)
 #define RTPS_STATUS_PUB_ONLY             (1U << 9)
-#define RTPS_STATUS_IRQ_IS_RX            (1U << 10) /* 1 = RX sample ready in BRAM, 0 = TX done / err */
+#define RTPS_STATUS_IRQ_IS_RX            (1U << 10) /* 1 = RX sample ready in BRAM (rx_done_irq) */
 #define RTPS_STATUS_FRAGS_SHIFT          11
 #define RTPS_STATUS_FRAGS_MASK           0x00003800U
 #define RTPS_STATUS_WDOG_EXPIRED         (1U << 14)
 #define RTPS_STATUS_LIFECYCLE_OK         (1U << 15)
 #define RTPS_STATUS_RX_SAMPLES_SHIFT     16
+#define RTPS_STATUS_RX_EGRESS_STATE_SHIFT 30
+#define RTPS_STATUS_RX_EGRESS_STATE_MASK  0xC0000000U
 #define RTPS_STATUS_ERR_ALL_MASK         0x000001E0U
+
+#define RTPS_RX_EGRESS_IDLE              0U
+#define RTPS_RX_EGRESS_IRQ               1U
+#define RTPS_RX_EGRESS_WAIT              2U
+#define RTPS_RX_EGRESS_RUN               3U
 
 /* Shadow Endpoint Descriptor Table (EDT) Offsets */
 #define RTPS_MAX_ENDPOINTS               4

@@ -61,21 +61,17 @@ struct axi_rtps_dev {
     struct mutex dma_hw_lock;
     wait_queue_head_t tx_waitq;
     wait_queue_head_t rx_waitq;
-    wait_queue_head_t ip_waitq;
     wait_queue_head_t tx_ip_waitq;
     wait_queue_head_t rx_packet_waitq;
-    u32 mode_pub_only;
     volatile int tx_in_flight;
     int tx_done;
     int rx_done;
-    int ip_done;
     int tx_ip_done;
     int rx_packet_avail;
     int tx_err;
     int rx_err;
     int crc_err;
     int no_match_err;
-    int rx_timeout_err;
     int csum_err;
     u32 last_ip_status;
 
@@ -263,13 +259,21 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
         if (ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK)) {
             int ack_polls = 0;
             u32 post_ack = ip_status;
+            bool is_rx = (ip_status & RTPS_STATUS_IRQ_IS_RX) != 0;
+            bool is_tx = (((ip_status & RTPS_STATUS_STATE_MASK) >> 1) == 5) ||
+                         ((ip_status & RTPS_STATUS_ERR_ALL_MASK) != 0) ||
+                         ((ip_status & RTPS_STATUS_IRQ_MASK) && !is_rx);
+            u32 ack_bits = (is_tx ? RTPS_STATUS_ACK_IRQ : 0U) |
+                           (is_rx ? RTPS_STATUS_ACK_RX_IRQ : 0U);
+            if (ack_bits == 0U)
+                ack_bits = RTPS_STATUS_ACK_IRQ;
 
             dev->last_ip_status = ip_status;
             dev->isr_pre_ack_ip_status = ip_status;
             dev->irq_cnt_ip++;
 
-            /* Rule 2c: Acknowledge and drop PL Level-High interrupt line immediately (Bit 0) */
-            iowrite32(RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            /* Rule 2c: Acknowledge and drop PL Level-High interrupt lines immediately */
+            iowrite32(ack_bits, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
 
             /*
              * Flush posted AXI-Lite write across M_AXI_GP0 and wait for PL Level-High
@@ -294,25 +298,18 @@ static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
                 dev->crc_err = 0;
             }
 
-            dev->no_match_err   = (ip_status & RTPS_STATUS_ERR_NO_MATCH) ? 1 : 0;
-            dev->rx_timeout_err = (ip_status & RTPS_STATUS_ERR_RX_TIMEOUT) ? 1 : 0;
-            dev->csum_err       = (ip_status & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
+            dev->no_match_err = (ip_status & RTPS_STATUS_ERR_NO_MATCH) ? 1 : 0;
+            dev->csum_err     = (ip_status & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
 
-            if (ip_status & RTPS_STATUS_IRQ_IS_RX) {
+            if (is_rx) {
                 dev->rx_packet_avail = 1;
                 wake_up_interruptible(&dev->rx_packet_waitq);
-                /* In asynchronous mode, a completed TX may piggyback on an RX IRQ */
-                if (dev->mode_pub_only) {
-                    dev->tx_ip_done = 1;
-                    wake_up_interruptible(&dev->tx_ip_waitq);
-                }
-            } else {
+            }
+            if (is_tx) {
                 dev->tx_ip_done = 1;
                 wake_up_interruptible(&dev->tx_ip_waitq);
             }
 
-            dev->ip_done = 1;
-            wake_up_interruptible(&dev->ip_waitq);
             handled = IRQ_HANDLED;
         }
     }
@@ -413,18 +410,17 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             {
                 u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
                 u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
-                if (cur_state != 0)
+                u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
+                if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE)
                     iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
             }
 
             /* Atomically commit Shadow -> Active EDT at S_IDLE boundary */
             dev->plugin_rx_rtps_mode = cfg.plugin_rx_rtps_mode ? 1 : 0;
-            dev->mode_pub_only       = cfg.mode_pub_only ? 1 : 0;
-            dev->tx_ip_frag_mode = cfg.tx_ip_frag_mode ? 1U : 0U;
+            dev->tx_ip_frag_mode     = cfg.tx_ip_frag_mode ? 1U : 0U;
             ctrl_word = RTPS_CTRL_ENABLE |
                         ((cfg.num_writers & 0x07U) << RTPS_CTRL_NUM_WRITERS_SHIFT) |
                         (cfg.enable_peer_emu ? RTPS_CTRL_EMU_EN : 0U) |
-                        (cfg.mode_pub_only ? RTPS_CTRL_PUB_ONLY : 0U) |
                         RTPS_CTRL_COMMIT_EDT |
                         (dev->plugin_rx_rtps_mode ? RTPS_CTRL_PLUGIN_RX_RTPS_MODE : 0U) |
                         (dev->tx_ip_frag_mode ? RTPS_CTRL_TX_IP_FRAG_MODE : 0U);
@@ -493,7 +489,7 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                                             RTPS_STATUS_FRAGS_SHIFT);
             diag.err_crc             = (diag.status_reg & RTPS_STATUS_ERR_CRC) ? 1 : 0;
             diag.err_no_match        = (diag.status_reg & RTPS_STATUS_ERR_NO_MATCH) ? 1 : 0;
-            diag.err_rx_timeout      = (diag.status_reg & RTPS_STATUS_ERR_RX_TIMEOUT) ? 1 : 0;
+            diag.err_rx_timeout      = 0;
             diag.err_csum            = (diag.status_reg & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
             {
                 u32 icmp_info  = ioread32(dev->ip_regs + RTPS_IP_LAST_ICMP_ERR_INFO_OFFSET);
@@ -681,7 +677,8 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
             {
                 u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
                 u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
-                if (cur_state != 0)
+                u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
+                if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE)
                     iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
             }
 
@@ -715,7 +712,6 @@ static int axi_rtps_open(struct inode* inode, struct file* file) {
     file->private_data = dev;
     dev->crc_err        = 0;
     dev->no_match_err   = 0;
-    dev->rx_timeout_err = 0;
     dev->csum_err       = 0;
     dev->tx_err         = 0;
     dev->rx_err         = 0;
@@ -726,9 +722,10 @@ static int axi_rtps_open(struct inode* inode, struct file* file) {
     if (dev->ip_regs) {
         u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+        u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
         iowrite32(1, dev->ip_regs + RTPS_IP_WDOG_HEARTBEAT_OFFSET);
-        if (cur_state != 0) {
-            /* Single write to TRIGGER_OFFSET resets non-IDLE FSM back to S_IDLE */
+        if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
+            /* Single write to TRIGGER_OFFSET resets non-IDLE FSMs back to IDLE */
             iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
         }
     }
@@ -744,7 +741,8 @@ static int axi_rtps_release(struct inode* inode, struct file* file) {
         if (dev->ip_regs) {
             u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
             u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
-            if (cur_state != 0) {
+            u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
+            if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
                 iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
             }
         }
@@ -893,22 +891,21 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     dev->pre_read_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
 
     /*
-     * In asynchronous or decoupled subscriber mode, wait for an incoming packet
-     * if the IP is not already holding a completed sample in S_DONE_IRQ (5) or S_WAIT_EGRESS (6).
+     * In decoupled subscriber mode, wait for an incoming packet if the RX egress
+     * FSM is not already holding a completed sample in RX_EGRESS_IRQ (1) or RX_EGRESS_WAIT (2).
      */
     if (dev->ip_regs) {
         u32 initial_status = dev->pre_read_ip_status;
-        u8 initial_state = (initial_status & RTPS_STATUS_STATE_MASK) >> 1;
+        u8 initial_rx_st = (initial_status & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
         bool sample_ready = dev->rx_packet_avail ||
-                            (initial_state == 6) ||
-                            ((initial_state == 5) && (initial_status & RTPS_STATUS_IRQ_IS_RX));
+                            (initial_rx_st == RTPS_RX_EGRESS_WAIT) ||
+                            (initial_rx_st == RTPS_RX_EGRESS_IRQ);
         if (!sample_ready) {
             ret = wait_event_interruptible_timeout(
                 dev->rx_packet_waitq,
                 dev->rx_packet_avail != 0 ||
-                    (((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_STATE_MASK) >> 1) == 6) ||
-                    ((((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_STATE_MASK) >> 1) == 5) &&
-                     (ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_IRQ_IS_RX)),
+                    (((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT) == RTPS_RX_EGRESS_WAIT) ||
+                    (((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT) == RTPS_RX_EGRESS_IRQ),
                 msecs_to_jiffies(1000));
             if (ret == 0) {
                 mutex_unlock(&dev->rx_lock);
@@ -963,61 +960,48 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     if (dev->ip_regs) {
         int poll_us;
         u32 live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-        u8 cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
-        if (cur_state == 5 && (live_status & RTPS_STATUS_IRQ_IS_RX)) {
+        u8 cur_rx_st = (live_status & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
+        if (cur_rx_st == RTPS_RX_EGRESS_IRQ) {
             int ack_wait;
-            /* If IP is still holding S_DONE_IRQ for RX sample, ACK IRQ first to transition to S_WAIT_EGRESS */
-            iowrite32(RTPS_STATUS_ACK_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-            if (dev->mode_pub_only) {
-                dev->tx_ip_done = 1;
-                wake_up_interruptible(&dev->tx_ip_waitq);
-            }
+            /* If RX egress FSM is still holding RX_EGRESS_IRQ, ACK RX IRQ first to transition to RX_EGRESS_WAIT */
+            iowrite32(RTPS_STATUS_ACK_RX_IRQ, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
             for (ack_wait = 0; ack_wait < 32; ack_wait++) {
                 live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-                cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
-                if (cur_state != 5)
+                cur_rx_st = (live_status & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
+                if (cur_rx_st != RTPS_RX_EGRESS_IRQ)
                     break;
             }
         }
         /*
          * Kick egress streaming using strictly Bit 1 (RTPS_STATUS_KICK_EGRESS = 0x2).
-         * Never assert Bit 0 here so that if the IP is in S_IDLE it cannot accidentally
-         * trigger a new manual TX/RX cycle!
+         * Never assert Bit 0 here so that if the TX FSM is in S_IDLE it cannot accidentally
+         * trigger a new manual TX cycle!
          */
         iowrite32(RTPS_STATUS_KICK_EGRESS, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
         dev->post_kick_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
 
         /*
          * Poll for S2MM completion (up to 2000 us in 1 us steps; 1039 words @ 100MHz = 10.4 us).
-         * If m_axis_tlast is not wired to s_axis_s2mm_tlast in the Vivado Block Design,
-         * AXI DMA S2MM bursts all words into dev->rx_buf in DDR memory and the IP
-         * FSM returns from S_TX_RUN to S_IDLE (State 0), while S2MM SG awaits TLAST before
-         * setting BD_STS.CMPLT or firing S2MM IOC_Irq. We detect both normal BD completion
-         * and TLAST-unwired DDR completion cleanly.
-         *
-         * Under high-rate concurrent asynchronous traffic (e.g., 500-2000 Hz) or back-to-back wire frames,
-         * once S_TX_RUN completes and streams to DDR, the IP passes through S_IDLE and may immediately
-         * transition into S_DONE_IRQ (State 5) or S_WAIT_EGRESS (State 6) for the NEXT packet.
-         * Therefore, any state other than S_TX_RUN (State 7) indicates egress has completed!
+         * Any rx_egress_state other than RX_EGRESS_RUN (3) indicates egress has completed!
          */
         for (poll_us = 0; poll_us < 2000; poll_us++) {
             rmb();
             live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-            cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
+            cur_rx_st = (live_status & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
 
             if (dev->rx_done || (dev->rx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK)) {
                 dev->rx_done = 1;
                 break;
             }
-            if (cur_state != 7) {
-                /* IP has completed egress streaming (S_TX_RUN -> S_IDLE / S_WAIT_EGRESS) */
+            if (cur_rx_st != RTPS_RX_EGRESS_RUN) {
+                /* IP has completed egress streaming (RX_EGRESS_RUN -> RX_EGRESS_IDLE / RX_EGRESS_IRQ) */
                 break;
             }
             udelay(1);
         }
 
         live_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-        cur_state = (live_status & RTPS_STATUS_STATE_MASK) >> 1;
+        cur_rx_st = (live_status & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
         dev->post_50us_ip_status  = live_status;
         dev->post_50us_s2mm_dmasr = dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET);
         dev->post_50us_bd_status  = dev->rx_bd->status;
@@ -1028,11 +1012,9 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                 dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
                           dev->post_50us_s2mm_dmasr & XAXIDMA_SR_IRQ_ALL_MASK);
                 dev->rx_done = 1;
-            } else if (cur_state != 7) {
+            } else if (cur_rx_st != RTPS_RX_EGRESS_RUN) {
                 /*
                  * TLAST-unwired fallback: IP has completed egress streaming to DDR.
-                 * If an MM2S transfer was waiting at s_axis_tready while S_WAIT_EGRESS / S_TX_RUN
-                 * was active, it begins its 10.2 us burst the instant S_TX_RUN transitions to S_IDLE.
                  * Wait for any in-flight MM2S burst to complete before issuing XAXIDMA_CR_RESET_MASK
                  * (which is a global dual-channel reset in Xilinx AXI DMA hardware).
                  */
@@ -1054,7 +1036,7 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
             }
         }
 
-        if (cur_state == 6 || ((cur_state == 5) && (live_status & RTPS_STATUS_IRQ_IS_RX))) {
+        if (cur_rx_st == RTPS_RX_EGRESS_WAIT || cur_rx_st == RTPS_RX_EGRESS_IRQ) {
             dev->rx_packet_avail = 1;
         }
         axi_rtps_snapshot_s2mm_and_rxbuf(dev, transfer_len);
@@ -1206,26 +1188,6 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         crc = 0;
     }
 
-    /*
-     * If the IP is currently holding an RX sample in S_DONE_IRQ (5), S_WAIT_EGRESS (6),
-     * or S_TX_RUN (7), wait briefly for the subscriber thread in axi_rtps_read() to drain
-     * egress and return the IP to S_IDLE (0) before arming MM2S.
-     */
-    {
-        int egress_wait;
-        for (egress_wait = 0; egress_wait < 5000; egress_wait++) {
-            u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-            u8 cur_st = (st & RTPS_STATUS_STATE_MASK) >> 1;
-            if (cur_st != 5 && cur_st != 6 && cur_st != 7)
-                break;
-            if (cur_st == 6 || (cur_st == 5 && (st & RTPS_STATUS_IRQ_IS_RX))) {
-                dev->rx_packet_avail = 1;
-                wake_up_interruptible(&dev->rx_packet_waitq);
-            }
-            udelay(2);
-        }
-    }
-
     mutex_lock(&dev->dma_hw_lock);
 
     dev->last_ip_status        = 0;
@@ -1234,11 +1196,9 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     dev->isr_post_ack_ip_status= 0;
     dev->isr_ack_polls         = 0;
     dev->post_write_ip_status  = 0;
-    dev->ip_done               = 0;
     dev->tx_ip_done            = 0;
     dev->crc_err               = 0;
     dev->no_match_err          = 0;
-    dev->rx_timeout_err        = 0;
     dev->csum_err              = 0;
     dev->tx_done               = 0;
     dev->tx_err                = 0;
@@ -1274,28 +1234,15 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
 
     /*
      * Poll up to 50 us for the 10.2 us MM2S burst (1,024 words @ 100 MHz) to complete
-     * while holding dma_hw_lock. If an RX wire packet entered S_DONE_IRQ (5) or
-     * S_WAIT_EGRESS (6) in the nanosecond window before s_axis_tvalid, release
-     * dma_hw_lock so axi_rtps_read() can drain the RX packet first.
+     * while holding dma_hw_lock.
      */
     {
         int poll_us;
         for (poll_us = 0; poll_us < 50; poll_us++) {
-            u32 st;
-            u8 cur_st;
             rmb();
             if (dev->tx_done || (dev->tx_bd->status & XAXIDMA_BD_STS_CMPLT_MASK)) {
                 dev->tx_done = 1;
                 dev->tx_in_flight = 0;
-                break;
-            }
-            st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-            cur_st = (st & RTPS_STATUS_STATE_MASK) >> 1;
-            if (cur_st == 5 || cur_st == 6 || cur_st == 7) {
-                if (cur_st == 6 || (cur_st == 5 && (st & RTPS_STATUS_IRQ_IS_RX))) {
-                    dev->rx_packet_avail = 1;
-                    wake_up_interruptible(&dev->rx_packet_waitq);
-                }
                 break;
             }
             udelay(1);
@@ -1336,23 +1283,19 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         return -EIO;
     }
 
-    /* Wait for RTPS Fast-Path 3-Fragment Publication + Peer Reassembly & Validation */
-    if (dev->mode_pub_only) {
+    /* Wait for RTPS Fast-Path TX Fragmentation & Wire Transmission (Always Async) */
+    {
         u32 live_st = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
         u8 cur_st = (live_st & RTPS_STATUS_STATE_MASK) >> 1;
-        if (dev->tx_ip_done || cur_st == 0 || cur_st == 6) {
+        if (dev->tx_ip_done || cur_st == 0) {
             ret = 1;
         } else {
             ret = wait_event_interruptible_timeout(
                 dev->tx_ip_waitq,
                 dev->tx_ip_done != 0 ||
-                    (dev->ip_regs && ((((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_STATE_MASK) >> 1) == 0) ||
-                                     (((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_STATE_MASK) >> 1) == 6))),
+                    (dev->ip_regs && (((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_STATE_MASK) >> 1) == 0)),
                 msecs_to_jiffies(1000));
         }
-    } else {
-        ret = wait_event_interruptible_timeout(dev->ip_waitq, dev->ip_done != 0,
-                                               msecs_to_jiffies(3000));
     }
     dev->post_write_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
     if (ret == 0) {
@@ -1378,11 +1321,6 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         pr_err("axi_rtps: RTPS IP reported ERR_NO_MATCH (endpoint disabled or watchdog expired)\n");
         mutex_unlock(&dev->tx_lock);
         return -ENOTCONN;
-    }
-    if (dev->rx_timeout_err) {
-        pr_err("axi_rtps: RTPS IP reported ERR_RX_TIMEOUT waiting for peer Feedback\n");
-        mutex_unlock(&dev->tx_lock);
-        return -ETIMEDOUT;
     }
 
     mutex_unlock(&dev->tx_lock);
@@ -1508,7 +1446,6 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     mutex_init(&dmadev->dma_hw_lock);
     init_waitqueue_head(&dmadev->tx_waitq);
     init_waitqueue_head(&dmadev->rx_waitq);
-    init_waitqueue_head(&dmadev->ip_waitq);
     init_waitqueue_head(&dmadev->tx_ip_waitq);
     init_waitqueue_head(&dmadev->rx_packet_waitq);
 
@@ -1652,7 +1589,6 @@ static int axi_rtps_probe(struct platform_device* pdev) {
         goto err_free_ip_irq;
 
     /* Default to asynchronous decoupled Pub/Sub mode & Option B RTPS ingress */
-    dmadev->mode_pub_only       = 1;
     dmadev->plugin_rx_rtps_mode = 1;
     dmadev->tx_ip_frag_mode     = 0;
     dmadev->frag_size_bytes     = 1400U;
@@ -1661,7 +1597,6 @@ static int axi_rtps_probe(struct platform_device* pdev) {
         /* Default to physical wire enabled (RTPS_CTRL_EMU_EN = 0) so ARP and Ping work immediately */
         u32 default_ctrl = RTPS_CTRL_ENABLE |
                            (1U << RTPS_CTRL_NUM_WRITERS_SHIFT) |
-                           RTPS_CTRL_PUB_ONLY |
                            RTPS_CTRL_PLUGIN_RX_RTPS_MODE;
         iowrite32(default_ctrl, dmadev->ip_regs + RTPS_IP_CTRL_OFFSET);
         iowrite32(dmadev->frag_size_bytes, dmadev->ip_regs + RTPS_IP_FRAG_SIZE_OFFSET);

@@ -377,7 +377,7 @@ module tb_rtps_fastpath;
         s_axis_tvalid <= 1'b0;
         s_axis_tlast  <= 1'b0;
 
-        // Wait for Level-High ip_done_irq
+        // Wait for Level-High TX ip_done_irq
         wait (ip_done_irq == 1'b1);
         repeat (5) @(posedge clk);
         if (ip_done_irq !== 1'b1) begin
@@ -387,16 +387,26 @@ module tb_rtps_fastpath;
 
         axi_read(10'h004, status_val);
         axi_read(10'h024, ticks_val);
-        $display("[+] Cycle 1 Complete! STATUS=0x%08X (RX_Samples=%0d, Frags=%0d, Errors=%04b, Ticks=%0d)",
-                 status_val, status_val[31:16], status_val[13:11], status_val[8:5], ticks_val);
+        // ACK TX IRQ
+        axi_write(10'h004, 32'h0000_0001);
 
-        if (status_val[31:16] !== 16'd1 || status_val[8:5] !== 4'b0000) begin
+        // Wait for Peer Emulator RX sample to commit and raise RX_EGRESS_IRQ (rx_egress_state == 1)
+        sim_timeout = 0;
+        while (status_val[31:30] !== 2'd1 && sim_timeout < 5000) begin
+            @(posedge clk);
+            axi_read(10'h004, status_val);
+            sim_timeout = sim_timeout + 1;
+        end
+        $display("[+] Cycle 1 Complete! STATUS=0x%08X (RX_Samples=%0d, Frags=%0d, Errors=%04b, Ticks=%0d)",
+                 status_val, status_val[29:16], status_val[13:11], status_val[8:5], ticks_val);
+
+        if (status_val[29:16] !== 14'd1 || status_val[8:5] !== 4'b0000) begin
             $display("[-] FAIL: Expected RX_Samples=1 and zero error bits! status=0x%08X", status_val);
             errors = errors + 1;
         end
 
-        // Acknowledge Level-High IRQ
-        axi_write(10'h004, 32'h0000_0001);
+        // Acknowledge Level-High RX IRQ
+        axi_write(10'h004, 32'h0000_0008);
         @(posedge clk);
         if (ip_done_irq !== 1'b0) begin
             $display("[-] FAIL: ip_done_irq did not clear after ACK!");
@@ -450,19 +460,26 @@ module tb_rtps_fastpath;
         axi_write(10'h004, 32'h0000_0004); // Trigger cycle manually (Bit 2: MANUAL_TRIG)
 
         wait (ip_done_irq == 1'b1);
+        axi_write(10'h004, 32'h0000_0001); // ACK TX IRQ
         axi_read(10'h004, status_val);
+        sim_timeout = 0;
+        while (status_val[31:30] !== 2'd1 && sim_timeout < 5000) begin
+            @(posedge clk);
+            axi_read(10'h004, status_val);
+            sim_timeout = sim_timeout + 1;
+        end
         $display("[+] Out-of-Order Cycle STATUS=0x%08X (RX_Samples=%0d, Errors=%04b)",
-                 status_val, status_val[31:16], status_val[8:5]);
+                 status_val, status_val[29:16], status_val[8:5]);
 
-        if (status_val[31:16] !== 16'd2 || status_val[8:5] !== 4'b0000) begin
+        if (status_val[29:16] !== 14'd2 || status_val[8:5] !== 4'b0000) begin
             $display("[-] FAIL: Out-of-order reassembly failed! status=0x%08X", status_val);
             errors = errors + 1;
         end else begin
             $display("[+] PASS: 3-Slot Reassembly Engine reassembled out-of-order IPv4 fragments cleanly!");
         end
 
-        // ACK & drain S2MM and verify all 1,024 words from out-of-order reassembly (seq_num=2)
-        axi_write(10'h004, 32'h0000_0001);
+        // ACK RX IRQ & drain S2MM and verify all 1,024 words from out-of-order reassembly (seq_num=2)
+        axi_write(10'h004, 32'h0000_0008);
         axi_write(10'h004, 32'h0000_0002);
         m_axis_tready <= 1'b1;
         rx_cnt = 0;
@@ -503,18 +520,19 @@ module tb_rtps_fastpath;
         axi_write(10'h004, 32'h0000_0004); // Trigger cycle (Bit 2: MANUAL_TRIG)
 
         wait (ip_done_irq == 1'b1);
+        axi_write(10'h004, 32'h0000_0001); // ACK TX IRQ
+        repeat (4000) @(posedge clk);      // Allow emulator 3 fragments to finish & be rejected
         axi_read(10'h004, status_val);
         axi_read(10'h058, stat_val);       // STAT_STALE_DROPS
-        $display("[+] Stale Seq Cycle STATUS=0x%08X (ERR_RX_TIMEOUT=%b, STAT_STALE_DROPS=%0d)",
-                 status_val, status_val[7], stat_val);
+        $display("[+] Stale Seq Cycle STATUS=0x%08X (RX_Egress=%0d, STAT_STALE_DROPS=%0d)",
+                 status_val, status_val[31:30], stat_val);
 
-        if (status_val[7] !== 1'b1 || stat_val !== 32'd3) begin
-            $display("[-] FAIL: Expected ERR_RX_TIMEOUT=1 and STAT_STALE_DROPS=3 (1 per DATA_FRAG)!");
+        if (status_val[31:30] !== 2'd0 || stat_val !== 32'd3) begin
+            $display("[-] FAIL: Expected RX_Egress=0 and STAT_STALE_DROPS=3 (1 per DATA_FRAG)!");
             errors = errors + 1;
         end else begin
-            $display("[+] PASS: Master rejected duplicate seqNum across all 3 DATA_FRAG packets, incremented STAT_STALE_DROPS=3, and timed out cleanly!");
+            $display("[+] PASS: Master rejected duplicate seqNum across all 3 DATA_FRAG packets and incremented STAT_STALE_DROPS=3!");
         end
-        axi_write(10'h004, 32'h0000_0001); // ACK IRQ (returns directly to S_IDLE on error)
         repeat (5) @(posedge clk);
 
         // =====================================================================
@@ -527,18 +545,19 @@ module tb_rtps_fastpath;
         axi_write(10'h004, 32'h0000_0004); // Trigger cycle (Bit 2: MANUAL_TRIG)
 
         wait (ip_done_irq == 1'b1);
+        axi_write(10'h004, 32'h0000_0001); // ACK TX IRQ
+        repeat (4000) @(posedge clk);      // Allow emulator 3 fragments to finish & be rejected
         axi_read(10'h004, status_val);
         axi_read(10'h05C, stat_val);       // STAT_CSUM_ERRS
-        $display("[+] Bad UDP Csum STATUS=0x%08X (ERR_CSUM=%b, ERR_RX_TIMEOUT=%b, STAT_CSUM_ERRS=%0d)",
-                 status_val, status_val[8], status_val[7], stat_val);
+        $display("[+] Bad UDP Csum STATUS=0x%08X (ERR_CSUM=%b, RX_Egress=%0d, STAT_CSUM_ERRS=%0d)",
+                 status_val, status_val[8], status_val[31:30], stat_val);
 
-        if (status_val[8] !== 1'b1 || stat_val !== 32'd3) begin
-            $display("[-] FAIL: Expected ERR_CSUM=1 and STAT_CSUM_ERRS=3 (1 per DATA_FRAG)!");
+        if (status_val[8] !== 1'b1 || status_val[31:30] !== 2'd0 || stat_val !== 32'd3) begin
+            $display("[-] FAIL: Expected ERR_CSUM=1, RX_Egress=0, and STAT_CSUM_ERRS=3 (1 per DATA_FRAG)!");
             errors = errors + 1;
         end else begin
             $display("[+] PASS: Master detected corrupted UDP checksums across all 3 DATA_FRAG packets and dropped sample!");
         end
-        axi_write(10'h004, 32'h0000_0001); // ACK IRQ
         axi_write(10'h048, 32'h0000_0000); // Clear faults
         repeat (5) @(posedge clk);
 
@@ -623,7 +642,14 @@ module tb_rtps_fastpath;
         s_axis_tlast  <= 1'b0;
 
         wait (ip_done_irq == 1'b1);
+        axi_write(10'h004, 32'h0000_0001); // ACK TX IRQ
         axi_read(10'h004, status_val);
+        sim_timeout = 0;
+        while (status_val[31:30] !== 2'd1 && sim_timeout < 5000) begin
+            @(posedge clk);
+            axi_read(10'h004, status_val);
+            sim_timeout = sim_timeout + 1;
+        end
         axi_read(10'h074, stat_val);       // LAST_RX_RTPS_WORDS (0x74)
         $display("[+] Option B Cycle STATUS=0x%08X, LAST_RX_RTPS_WORDS=%0d (4,156 bytes)",
                  status_val, stat_val);
@@ -633,8 +659,8 @@ module tb_rtps_fastpath;
             errors = errors + 1;
         end
 
-        // ACK IRQ & Kick S2MM Egress for FpgaTransport_receive_rEA() (1,039 words = 4,156 B)
-        axi_write(10'h004, 32'h0000_0001);
+        // ACK RX IRQ & Kick S2MM Egress for FpgaTransport_receive_rEA() (1,039 words = 4,156 B)
+        axi_write(10'h004, 32'h0000_0008);
         axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
         while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
@@ -794,22 +820,22 @@ module tb_rtps_fastpath;
             errors = errors + 1;
         end
         axi_read(10'h004, status_val);
-        $display("[+] Subscribe-Only IRQ Triggered! STATUS=0x%08X (State=%0d, RX_Samples=%0d, irq_is_rx=%b, Errors=%04b)",
-                 status_val, status_val[4:1], status_val[31:16], status_val[10], status_val[8:5]);
+        $display("[+] Subscribe-Only IRQ Triggered! STATUS=0x%08X (TX_State=%0d, RX_Egress=%0d, RX_Samples=%0d, irq_is_rx=%b, Errors=%04b)",
+                 status_val, status_val[4:1], status_val[31:30], status_val[29:16], status_val[10], status_val[8:5]);
 
-        if (status_val[4:1] !== 4'd5 || status_val[8:5] !== 4'b0000 || status_val[10] !== 1'b1) begin
-            $display("[-] FAIL: Expected state=S_DONE_IRQ, irq_is_rx=1, and zero errors!");
+        if (status_val[31:30] !== 2'd1 || status_val[8:5] !== 4'b0000 || status_val[10] !== 1'b1) begin
+            $display("[-] FAIL: Expected rx_egress_state=RX_EGRESS_IRQ (1), irq_is_rx=1, and zero errors!");
             errors = errors + 1;
         end else begin
             $display("[+] PASS: Unsolicited wire frame validated directly from S_IDLE and asserted Level-High IRQ with irq_is_rx=1!");
         end
 
-        // Acknowledge IRQ (CPU ISR writes 1 to STATUS_ADDR -> moves to S_WAIT_EGRESS)
-        axi_write(10'h004, 32'h0000_0001);
+        // Acknowledge IRQ (CPU ISR writes 1 or 8 to STATUS_ADDR -> moves to RX_EGRESS_WAIT)
+        axi_write(10'h004, 32'h0000_0008);
         repeat (3) @(posedge clk);
         axi_read(10'h004, status_val);
-        if (status_val[4:1] !== 4'd6) begin
-            $display("[-] FAIL: Expected transition to S_WAIT_EGRESS (state=6), got state=%0d", status_val[4:1]);
+        if (status_val[31:30] !== 2'd2) begin
+            $display("[-] FAIL: Expected transition to RX_EGRESS_WAIT (2), got rx_egress_state=%0d", status_val[31:30]);
             errors = errors + 1;
         end
 
@@ -892,27 +918,27 @@ module tb_rtps_fastpath;
         end
 
         axi_read(10'h004, status_val);
-        $display("[+] Remote Publisher RX Triggered IRQ! STATUS=0x%08X (State=%0d, irq_is_rx=%b, RX_Samples=%0d)",
-                 status_val, status_val[4:1], status_val[10], status_val[31:16]);
+        $display("[+] Remote Publisher RX Triggered IRQ! STATUS=0x%08X (TX_State=%0d, RX_Egress=%0d, irq_is_rx=%b, RX_Samples=%0d)",
+                 status_val, status_val[4:1], status_val[31:30], status_val[10], status_val[29:16]);
         $fflush;
 
-        if (status_val[4:1] !== 4'd5 || status_val[10] !== 1'b1 || status_val[8:5] !== 4'b0000) begin
-            $display("[-] FAIL: Expected state=S_DONE_IRQ, irq_is_rx=1, zero errors! status=0x%08X", status_val);
+        if (status_val[31:30] !== 2'd1 || status_val[10] !== 1'b1 || status_val[8:5] !== 4'b0000) begin
+            $display("[-] FAIL: Expected rx_egress_state=RX_EGRESS_IRQ (1), irq_is_rx=1, zero errors! status=0x%08X", status_val);
             errors = errors + 1;
         end else begin
             $display("[+] PASS: Remote publisher frame asserted Level-High IRQ with irq_is_rx=1 despite CTRL[8]=1!");
         end
 
-        // CPU ACK IRQ: In True Asynchronous mode, because irq_is_rx == 1, FSM MUST move to S_WAIT_EGRESS (state=6), NOT S_IDLE!
-        axi_write(10'h004, 32'h0000_0001);
+        // CPU ACK RX IRQ: Decoupled RX egress FSM transitions to RX_EGRESS_WAIT (2), while TX stays S_IDLE (0)!
+        axi_write(10'h004, 32'h0000_0008);
         repeat (3) @(posedge clk);
         axi_read(10'h004, status_val);
-        if (status_val[4:1] !== 4'd6) begin
-            $display("[-] FAIL: Expected transition to S_WAIT_EGRESS (state=6), got state=%0d! (Premature return to S_IDLE)",
-                     status_val[4:1]);
+        if (status_val[31:30] !== 2'd2 || status_val[4:1] !== 4'd0 || !s_axis_tready) begin
+            $display("[-] FAIL: Expected rx_egress_state=2, tx_state=0, s_axis_tready=1! status=0x%08X s_axis_tready=%b",
+                     status_val, s_axis_tready);
             errors = errors + 1;
         end else begin
-            $display("[+] PASS: FSM transitioned to S_WAIT_EGRESS (state=6) allowing subscriber readout!");
+            $display("[+] PASS: RX Egress FSM in RX_EGRESS_WAIT (2) while TX FSM remains S_IDLE (0, s_axis_tready=1)!");
         end
 
         // S2MM Readout: Kick S2MM and read 1,024 words
@@ -1226,7 +1252,7 @@ module tb_rtps_fastpath;
 
         wait (ip_done_irq == 1'b1);
         axi_read(10'h004, status_val);
-        if (status_val[10] !== 1'b1 || status_val[4:1] !== 4'd5) begin
+        if (status_val[10] !== 1'b1 || status_val[31:30] !== 2'd1) begin
             $display("[-] FAIL: Expected valid CAM hit IRQ with irq_is_rx=1! status=0x%08X", status_val);
             errors = errors + 1;
         end else begin
@@ -1258,8 +1284,8 @@ module tb_rtps_fastpath;
             $display("[+] PASS: LAST_RX_META correctly captured matched reader cam_idx=0!");
         end
 
-        // ACK IRQ & drain egress to return to S_IDLE
-        axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+        // ACK RX IRQ & drain egress to return to RX_EGRESS_IDLE
+        axi_write(10'h004, 32'h0000_0008); // ACK RX IRQ
         repeat (3) @(posedge clk);
         axi_write(10'h004, 32'h0000_0002); // Kick S2MM Egress
         repeat (3) @(posedge clk);
@@ -1278,8 +1304,8 @@ module tb_rtps_fastpath;
         repeat (5) @(posedge clk);
 
         axi_read(10'h004, status_val);
-        if (status_val[4:1] !== 4'd0) begin
-            $display("[-] FAIL: Expected FSM to return to S_IDLE, got %0d", status_val[4:1]);
+        if (status_val[31:30] !== 2'd0) begin
+            $display("[-] FAIL: Expected RX Egress FSM to return to RX_EGRESS_IDLE, got %0d", status_val[31:30]);
             errors = errors + 1;
         end else begin
             $display("[+] PASS: Egress drained and FSM returned cleanly to S_IDLE!");
@@ -1421,7 +1447,7 @@ module tb_rtps_fastpath;
             axi_read(10'h004, status_val);
             axi_read(10'h05C, post_csum_errs);
 
-            if (status_val[4:1] === 4'd5 && post_csum_errs === initial_csum_errs) begin
+            if (status_val[31:30] === 2'd1 && post_csum_errs === initial_csum_errs) begin
                 $display("[+] PASS: RFC 768 Zero-Checksum frame validated cleanly with 0 checksum errors!");
             end else begin
                 $display("[-] FAIL: Zero-checksum frame rejected! status=0x%08X csum_errs=%0d", status_val, post_csum_errs);
@@ -1429,7 +1455,7 @@ module tb_rtps_fastpath;
             end
 
             // Drain egress to return FSM cleanly to S_IDLE
-            axi_write(10'h004, 32'h0000_0001); // ACK IRQ
+            axi_write(10'h004, 32'h0000_0008); // ACK RX IRQ
             repeat (2) @(posedge clk);
             axi_write(10'h004, 32'h0000_0002); // Kick S2MM egress
             m_axis_tready = 1'b1;
@@ -1473,6 +1499,13 @@ module tb_rtps_fastpath;
 
             wait (ip_done_irq == 1'b1);
             axi_read(10'h004, status_val);
+            axi_write(10'h004, 32'h0000_0001); // ACK TX IRQ
+            sim_timeout = 0;
+            while (status_val[31:30] !== 2'd1 && sim_timeout < 5000) begin
+                @(posedge clk);
+                axi_read(10'h004, status_val);
+                sim_timeout = sim_timeout + 1;
+            end
             axi_read(10'h064, last_seq_emu);
             $display("[+] IPv4-Frag Cycle STATUS=0x%08X (Frags=%0d, Errors=%04b, seq=%0d)",
                      status_val, status_val[13:11], status_val[8:5], last_seq_emu);
@@ -1482,7 +1515,7 @@ module tb_rtps_fastpath;
                 errors = errors + 1;
             end
 
-            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0008);
             axi_write(10'h004, 32'h0000_0002);
             rx_cnt = 0;
             m_axis_tready = 1'b1;
@@ -1538,6 +1571,13 @@ module tb_rtps_fastpath;
 
             wait (ip_done_irq == 1'b1);
             axi_read(10'h004, status_val);
+            axi_write(10'h004, 32'h0000_0001); // ACK TX IRQ
+            sim_timeout = 0;
+            while (status_val[31:30] !== 2'd1 && sim_timeout < 5000) begin
+                @(posedge clk);
+                axi_read(10'h004, status_val);
+                sim_timeout = sim_timeout + 1;
+            end
             axi_read(10'h064, last_seq_emu);
             $display("[+] 5-Frag DATA_FRAG STATUS=0x%08X (Frags=%0d, Errors=%04b)",
                      status_val, status_val[13:11], status_val[8:5]);
@@ -1547,7 +1587,7 @@ module tb_rtps_fastpath;
                 errors = errors + 1;
             end
 
-            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0008);
             axi_write(10'h004, 32'h0000_0002);
             rx_cnt = 0;
             m_axis_tready = 1'b1;
@@ -1599,6 +1639,13 @@ module tb_rtps_fastpath;
 
             wait (ip_done_irq == 1'b1);
             axi_read(10'h004, status_val);
+            axi_write(10'h004, 32'h0000_0001); // ACK TX IRQ
+            sim_timeout = 0;
+            while (status_val[31:30] !== 2'd1 && sim_timeout < 5000) begin
+                @(posedge clk);
+                axi_read(10'h004, status_val);
+                sim_timeout = sim_timeout + 1;
+            end
             axi_read(10'h064, last_seq_emu);
             $display("[+] Sub-MTU Single DATA STATUS=0x%08X (Frags=%0d, Errors=%04b)",
                      status_val, status_val[13:11], status_val[8:5]);
@@ -1608,7 +1655,7 @@ module tb_rtps_fastpath;
                 errors = errors + 1;
             end
 
-            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0008);
             axi_write(10'h004, 32'h0000_0002);
             rx_cnt = 0;
             m_axis_tready = 1'b1;
@@ -1754,12 +1801,12 @@ module tb_rtps_fastpath;
             axi_read(10'h074, rtps_words_rd);
             $display("[+] Unaligned DATA_FRAG RX STATUS=0x%08X, LAST_RX_RTPS_WORDS=%0d", status_val, rtps_words_rd);
 
-            if (status_val[4:1] !== 4'd5 || status_val[10] !== 1'b1 || rtps_words_rd !== 32'd1039) begin
+            if (status_val[31:30] !== 2'd1 || status_val[10] !== 1'b1 || rtps_words_rd !== 32'd1039) begin
                 $display("[-] FAIL: Unaligned DATA_FRAG RX failed! status=0x%08X words=%0d", status_val, rtps_words_rd);
                 errors = errors + 1;
             end
 
-            axi_write(10'h004, 32'h0000_0001);
+            axi_write(10'h004, 32'h0000_0008);
             axi_write(10'h004, 32'h0000_0002);
             m_axis_tready = 1'b1;
             rx_cnt = 0;
