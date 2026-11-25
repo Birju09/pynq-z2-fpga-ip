@@ -64,6 +64,25 @@
 | System CPU Busy (`/proc/stat`) | **10.19%** (SoftIRQ: **0.02%**) |
 | PL RTL Counters | `stat_tx_samples=102,023`, `stat_rx_samples=101,980`, `stat_stale_drops=0`, `stat_csum_errs=0` |
 
+### 2c. Pipelined TX Driver (100,000 samples @ 2,000 Hz)
+
+With `axi_rtps_write()` returning immediately after the MM2S DMA burst and gating subsequent writes on `tx_ip_done` (alongside separate DMA/IP ISRs and top-half/tasklet IP completion), publish call tail latency at 2,000 Hz drops from ~370 µs to **23.3 µs at p99**:
+
+| Metric | FPGA Fastpath (100 Mbps PL) | Pure Fast DDS (1 Gbps PS, 100k) |
+|---|---|---|
+| Effective Rate | **2,000.0 samples/s** (65.5 Mbps) | 2,000.0 samples/s (65.5 Mbps) |
+| Elapsed Time | 50,000.2 ms | 50,000.9 ms |
+| Publish Call Latency (Min / p50 / Avg) | **17.1 / 18.7 / 19.6 µs** | 261.5 / 341.8 / 416.0 µs |
+| Publish Call Latency (p95 / p99 / p99.9 / Max) | **23.0 / 23.3 / 29.0 / 789.8 µs** | 671.2 / 706.2 / 792.8 / 1,547.2 µs |
+| Inbound RX Samples | 1 *(Corrupted=1 in user-space; PL `stat_rx_samples=300,000`)* | 99,992 (0.01% loss, Corrupted=0, SeqGaps=0) |
+| Round-Trip Latency (Min / p50 / Avg / p99 / Max) | — | 929.4 / 1,822.1 / 1,824.3 / 2,527.1 / 4,371.9 µs |
+| Process CPU per Sample | **58.13 µs** (User 28.98 / Sys 29.15 µs) | 656.58 µs (User 261.42 / Sys 395.16 µs) |
+| Process CPU Usage (1-core norm.) | **11.63%** (5.81% system-wide) | 131.31% (65.66% system-wide) |
+| Context Switches | **1.02 / sample** (Vol=101,835, Invol=2) | 1.32 / sample (Vol=130,917, Invol=1,149) |
+| System CPU Busy (`/proc/stat`) | **0.15%** (SoftIRQ: **0.00%**) | 69.38% (SoftIRQ: 11.31%) |
+| Process RSS / Peak HWM | **8.88 → 9.62 MB** (Peak 9.62 MB) | 9.25 → 10.75 MB (Peak 10.75 MB) |
+| PL RTL Counters | `stat_tx_samples=300,000`, `stat_rx_samples=300,000`, `stat_seq_gaps=0`, `stat_stale_drops=0`, `stat_csum_errs=0`, `last_cycle_ticks=32,145` | — |
+
 ---
 
 ## Key Findings & Analysis

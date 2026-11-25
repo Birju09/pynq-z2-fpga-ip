@@ -16,13 +16,13 @@
                 interrupt-parent = <&intc>;
                 /* 
                  * 0 = SPI
-                 * 29 = SPI 29 (HW IRQ 61, RX/S2MM DMA done)
-                 * 30 = SPI 30 (HW IRQ 62, TX/MM2S DMA done)
+                 * 29 = SPI 29 (HW IRQ 61, TX/MM2S DMA done)
+                 * 30 = SPI 30 (HW IRQ 62, RX/S2MM DMA done)
                  * 31 = SPI 31 (HW IRQ 63, Custom BRAM IP compute done / error)
                  * 4 = IRQ_TYPE_LEVEL_HIGH
                  */
                 interrupts = <0 29 4>, <0 30 4>, <0 31 4>;
-                interrupt-names = "rx", "tx", "ip_done";
+                interrupt-names = "tx", "rx", "ip_done";
                 status = "okay";
             };
         };

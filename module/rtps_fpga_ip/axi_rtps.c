@@ -108,6 +108,16 @@ struct axi_rtps_dev {
     int tx_virq;
     int rx_virq;
     int ip_virq;
+
+    /* Bottom-half tasklets for RTPS IP TX/RX completion bookkeeping */
+    struct tasklet_struct tx_ip_tasklet;
+    struct tasklet_struct rx_ip_tasklet;
+    u32 tx_bh_ip_status;
+    u32 tx_bh_post_ack;
+    u32 tx_bh_ack_polls;
+    u32 rx_bh_ip_status;
+    u32 rx_bh_post_ack;
+    u32 rx_bh_ack_polls;
 };
 
 static struct axi_rtps_dev rtps_device;
@@ -217,103 +227,150 @@ static int axi_dma_reset(struct axi_rtps_dev* dev) {
 }
 
 /* Unified Interrupt Service Routine for S2MM, MM2S, and RTPS Fast-Path IP (Rule 2c) */
-static irqreturn_t axi_rtps_isr(int irq, void* dev_id) {
+/* Bottom-half tasklet for TX IP completion diagnostics & error logging */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+static void axi_rtps_tx_ip_tasklet(struct tasklet_struct* t) {
+    struct axi_rtps_dev* dev = from_tasklet(dev, t, tx_ip_tasklet);
+#else
+static void axi_rtps_tx_ip_tasklet(unsigned long data) {
+    struct axi_rtps_dev* dev = (struct axi_rtps_dev*)data;
+#endif
+    u32 ip_status = READ_ONCE(dev->tx_bh_ip_status);
+
+    dev->last_ip_status         = ip_status;
+    dev->isr_pre_ack_ip_status  = ip_status;
+    dev->isr_post_ack_ip_status = READ_ONCE(dev->tx_bh_post_ack);
+    dev->isr_ack_polls          = READ_ONCE(dev->tx_bh_ack_polls);
+    dev->irq_cnt_ip++;
+
+    if ((ip_status & RTPS_STATUS_ERR_CRC) && dev->ip_regs) {
+        u32 calc_crc = ioread32(dev->ip_regs + RTPS_IP_CRC_OFFSET);
+        pr_err("axi_rtps: DMA0 ingress CRC-32 mismatch! Calc: 0x%08x, Status: 0x%08x\n",
+               calc_crc, ip_status);
+    }
+}
+
+/* Bottom-half tasklet for RX IP completion diagnostics */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+static void axi_rtps_rx_ip_tasklet(struct tasklet_struct* t) {
+    struct axi_rtps_dev* dev = from_tasklet(dev, t, rx_ip_tasklet);
+#else
+static void axi_rtps_rx_ip_tasklet(unsigned long data) {
+    struct axi_rtps_dev* dev = (struct axi_rtps_dev*)data;
+#endif
+    u32 ip_status = READ_ONCE(dev->rx_bh_ip_status);
+
+    dev->last_ip_status         = ip_status;
+    dev->isr_pre_ack_ip_status  = ip_status;
+    dev->isr_post_ack_ip_status = READ_ONCE(dev->rx_bh_post_ack);
+    dev->isr_ack_polls          = READ_ONCE(dev->rx_bh_ack_polls);
+    dev->irq_cnt_ip++;
+}
+
+/* 1. MM2S DMA Completion ISR (SPI 29) */
+static irqreturn_t axi_rtps_dma_tx_isr(int irq, void* dev_id) {
     struct axi_rtps_dev* dev = (struct axi_rtps_dev*)dev_id;
     u32 tx_status = dev->regs ? dma_read(dev, XAXIDMA_MM2S_DMASR_OFFSET) : 0;
+
+    if (!(tx_status & XAXIDMA_SR_IRQ_ALL_MASK))
+        return IRQ_NONE;
+
+    dma_write(dev, XAXIDMA_MM2S_DMASR_OFFSET,
+              tx_status & XAXIDMA_SR_IRQ_ALL_MASK);
+    dev->irq_cnt_tx++;
+    if (tx_status & XAXIDMA_SR_ERR_ALL_MASK) {
+        dev->tx_err = 1;
+        pr_err("axi_rtps: MM2S error status: 0x%08x\n", tx_status);
+    }
+    smp_wmb();
+    dev->tx_done = 1;
+    wake_up_interruptible(&dev->tx_waitq);
+    return IRQ_HANDLED;
+}
+
+/* 2. S2MM DMA Completion ISR (SPI 30) */
+static irqreturn_t axi_rtps_dma_rx_isr(int irq, void* dev_id) {
+    struct axi_rtps_dev* dev = (struct axi_rtps_dev*)dev_id;
     u32 rx_status = dev->regs ? dma_read(dev, XAXIDMA_S2MM_DMASR_OFFSET) : 0;
-    irqreturn_t handled = IRQ_NONE;
 
-    /* 1. Handle TX (MM2S) interrupt if active */
-    if (tx_status & XAXIDMA_SR_IRQ_ALL_MASK) {
-        dma_write(dev, XAXIDMA_MM2S_DMASR_OFFSET,
-                  tx_status & XAXIDMA_SR_IRQ_ALL_MASK);
-        dev->irq_cnt_tx++;
-        if (tx_status & XAXIDMA_SR_ERR_ALL_MASK) {
-            dev->tx_err = 1;
-            pr_err("axi_rtps: MM2S error status: 0x%08x\n", tx_status);
-        }
-        dev->tx_done = 1;
-        wake_up_interruptible(&dev->tx_waitq);
-        handled = IRQ_HANDLED;
+    if (!(rx_status & XAXIDMA_SR_IRQ_ALL_MASK))
+        return IRQ_NONE;
+
+    dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
+              rx_status & XAXIDMA_SR_IRQ_ALL_MASK);
+    dev->irq_cnt_rx++;
+    if (rx_status & XAXIDMA_SR_ERR_ALL_MASK) {
+        dev->rx_err = 1;
+        pr_err("axi_rtps: S2MM error status: 0x%08x\n", rx_status);
+    }
+    smp_wmb();
+    dev->rx_done = 1;
+    wake_up_interruptible(&dev->rx_waitq);
+    return IRQ_HANDLED;
+}
+
+/* 3. RTPS Fast-Path IP Completion Top-Half ISR (SPI 31) */
+static irqreturn_t axi_rtps_ip_isr(int irq, void* dev_id) {
+    struct axi_rtps_dev* dev = (struct axi_rtps_dev*)dev_id;
+    u32 ip_status;
+    int ack_polls;
+    u32 post_ack;
+    bool is_rx;
+    bool is_tx;
+    u32 ack_bits;
+
+    if (!dev->ip_regs)
+        return IRQ_NONE;
+
+    ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+    if (!(ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK)))
+        return IRQ_NONE;
+
+    is_rx = (ip_status & RTPS_STATUS_IRQ_IS_RX) != 0;
+    is_tx = (((ip_status & RTPS_STATUS_STATE_MASK) >> 1) == 5) ||
+            ((ip_status & RTPS_STATUS_ERR_ALL_MASK) != 0) ||
+            ((ip_status & RTPS_STATUS_IRQ_MASK) && !is_rx);
+    ack_bits = (is_tx ? RTPS_STATUS_ACK_IRQ : 0U) |
+               (is_rx ? RTPS_STATUS_ACK_RX_IRQ : 0U);
+    if (ack_bits == 0U)
+        ack_bits = RTPS_STATUS_ACK_IRQ;
+
+    /* Rule 2c: Acknowledge and drop PL Level-High interrupt lines immediately */
+    iowrite32(ack_bits, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+
+    dev->crc_err      = (ip_status & RTPS_STATUS_ERR_CRC) ? 1 : 0;
+    dev->no_match_err = (ip_status & RTPS_STATUS_ERR_NO_MATCH) ? 1 : 0;
+    dev->csum_err     = (ip_status & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
+
+    if (is_rx) {
+        smp_wmb();
+        dev->rx_packet_avail = 1;
+        wake_up_interruptible(&dev->rx_packet_waitq);
+    }
+    if (is_tx) {
+        smp_wmb();
+        dev->tx_ip_done = 1;
+        wake_up_interruptible(&dev->tx_ip_waitq);
     }
 
-    /* 2. Handle RX (S2MM) interrupt if active */
-    if (rx_status & XAXIDMA_SR_IRQ_ALL_MASK) {
-        dma_write(dev, XAXIDMA_S2MM_DMASR_OFFSET,
-                  rx_status & XAXIDMA_SR_IRQ_ALL_MASK);
-        dev->irq_cnt_rx++;
-        if (rx_status & XAXIDMA_SR_ERR_ALL_MASK) {
-            dev->rx_err = 1;
-            pr_err("axi_rtps: S2MM error status: 0x%08x\n", rx_status);
-        }
-        dev->rx_done = 1;
-        wake_up_interruptible(&dev->rx_waitq);
-        handled = IRQ_HANDLED;
+    /* Single AXI-Lite read to flush the posted ACK write across M_AXI_GP0 before GIC EOI */
+    post_ack = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+    ack_polls = 1;
+
+    if (is_rx) {
+        WRITE_ONCE(dev->rx_bh_ip_status, ip_status);
+        WRITE_ONCE(dev->rx_bh_post_ack, post_ack);
+        WRITE_ONCE(dev->rx_bh_ack_polls, (u32)ack_polls);
+        tasklet_schedule(&dev->rx_ip_tasklet);
+    }
+    if (is_tx) {
+        WRITE_ONCE(dev->tx_bh_ip_status, ip_status);
+        WRITE_ONCE(dev->tx_bh_post_ack, post_ack);
+        WRITE_ONCE(dev->tx_bh_ack_polls, (u32)ack_polls);
+        tasklet_schedule(&dev->tx_ip_tasklet);
     }
 
-    /* 3. Handle Custom RTPS Fast-Path IP Level-High interrupt (Rule 1b & 2c) */
-    if (dev->ip_regs) {
-        u32 ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-
-        if (ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK)) {
-            int ack_polls = 0;
-            u32 post_ack = ip_status;
-            bool is_rx = (ip_status & RTPS_STATUS_IRQ_IS_RX) != 0;
-            bool is_tx = (((ip_status & RTPS_STATUS_STATE_MASK) >> 1) == 5) ||
-                         ((ip_status & RTPS_STATUS_ERR_ALL_MASK) != 0) ||
-                         ((ip_status & RTPS_STATUS_IRQ_MASK) && !is_rx);
-            u32 ack_bits = (is_tx ? RTPS_STATUS_ACK_IRQ : 0U) |
-                           (is_rx ? RTPS_STATUS_ACK_RX_IRQ : 0U);
-            if (ack_bits == 0U)
-                ack_bits = RTPS_STATUS_ACK_IRQ;
-
-            dev->last_ip_status = ip_status;
-            dev->isr_pre_ack_ip_status = ip_status;
-            dev->irq_cnt_ip++;
-
-            /* Rule 2c: Acknowledge and drop PL Level-High interrupt lines immediately */
-            iowrite32(ack_bits, dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-
-            /*
-             * Flush posted AXI-Lite write across M_AXI_GP0 and wait for PL Level-High
-             * ip_done_irq (Bit 0) to clear before returning IRQ_HANDLED to GIC.
-             * This prevents spurious GIC re-entry while the posted write is in flight.
-             */
-            for (ack_polls = 1; ack_polls <= 32; ack_polls++) {
-                post_ack = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-                if (!(post_ack & RTPS_STATUS_IRQ_MASK))
-                    break;
-            }
-            dev->isr_post_ack_ip_status = post_ack;
-            dev->isr_ack_polls = (u32)ack_polls;
-
-            /* Separate IP compute/validation error flags cleanly */
-            if (ip_status & RTPS_STATUS_ERR_CRC) {
-                u32 calc_crc = ioread32(dev->ip_regs + RTPS_IP_CRC_OFFSET);
-                dev->crc_err = 1;
-                pr_err("axi_rtps: DMA0 ingress CRC-32 mismatch! Calc: 0x%08x, Status: 0x%08x\n",
-                       calc_crc, ip_status);
-            } else {
-                dev->crc_err = 0;
-            }
-
-            dev->no_match_err = (ip_status & RTPS_STATUS_ERR_NO_MATCH) ? 1 : 0;
-            dev->csum_err     = (ip_status & RTPS_STATUS_ERR_CSUM) ? 1 : 0;
-
-            if (is_rx) {
-                dev->rx_packet_avail = 1;
-                wake_up_interruptible(&dev->rx_packet_waitq);
-            }
-            if (is_tx) {
-                dev->tx_ip_done = 1;
-                wake_up_interruptible(&dev->tx_ip_waitq);
-            }
-
-            handled = IRQ_HANDLED;
-        }
-    }
-
-    return handled;
+    return IRQ_HANDLED;
 }
 
 static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
@@ -410,8 +467,10 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                 u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
                 u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
                 u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
-                if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE)
+                if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
                     iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+                    dev->tx_ip_done = 1;
+                }
             }
 
             /* Atomically commit Shadow -> Active EDT at S_IDLE boundary */
@@ -663,8 +722,10 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                 u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
                 u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
                 u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
-                if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE)
+                if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
                     iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+                    dev->tx_ip_done = 1;
+                }
             }
 
             ctrl_word = ioread32(dev->ip_regs + RTPS_IP_CTRL_OFFSET);
@@ -701,6 +762,7 @@ static int axi_rtps_open(struct inode* inode, struct file* file) {
     dev->tx_err         = 0;
     dev->rx_err         = 0;
     dev->rx_packet_avail= 0;
+    dev->tx_ip_done     = 1; /* Ready for first write() */
     dev->tx_in_flight   = 0;
     dev->bypass_crc     = 1;
 
@@ -1028,7 +1090,6 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
     }
 
     mutex_unlock(&dev->dma_hw_lock);
-    wake_up_interruptible(&dev->tx_ip_waitq);
 
     /* Wait for S2MM completion interrupt if not already completed above */
     if (!dev->rx_done) {
@@ -1167,6 +1228,28 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         return -ENODEV;
     }
 
+    /* Block subsequent writes until the previous PL TX wire cycle completes (tx_ip_done) */
+    if (!READ_ONCE(dev->tx_ip_done)) {
+        ret = wait_event_interruptible_timeout(
+            dev->tx_ip_waitq,
+            READ_ONCE(dev->tx_ip_done) != 0,
+            msecs_to_jiffies(1000));
+        if (ret == 0) {
+            u32 status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            u8 cur_st = (status & RTPS_STATUS_STATE_MASK) >> 1;
+            pr_err("axi_rtps: previous RTPS cycle wait timed out (status: 0x%08x [State %u], pre_write: 0x%08x)\n",
+                   status, cur_st, dev->pre_write_ip_status);
+            if (cur_st != 0)
+                iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+            dev->tx_ip_done = 1;
+            mutex_unlock(&dev->tx_lock);
+            return -ETIMEDOUT;
+        } else if (ret < 0) {
+            mutex_unlock(&dev->tx_lock);
+            return ret;
+        }
+    }
+
     if (!dev->bypass_crc) {
         crc = calc_crc32((const u32*)dev->tx_buf, num_words);
     } else {
@@ -1255,47 +1338,24 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
         mutex_lock(&dev->dma_hw_lock);
         axi_dma_reset_mm2s(dev);
         mutex_unlock(&dev->dma_hw_lock);
+        dev->tx_ip_done = 1;
         mutex_unlock(&dev->tx_lock);
         return -ETIMEDOUT;
     } else if (ret < 0) {
+        dev->tx_ip_done = 1;
         mutex_unlock(&dev->tx_lock);
         return ret;
     }
 
     if (dev->tx_err || (dev->tx_bd->status & XAXIDMA_BD_STS_ERROR_MASK)) {
         pr_err("axi_rtps: MM2S hardware transfer error\n");
+        dev->tx_ip_done = 1;
         mutex_unlock(&dev->tx_lock);
         return -EIO;
     }
 
-    /* Wait for RTPS Fast-Path TX Fragmentation & Wire Transmission (Always Async) */
-    {
-        u32 live_st = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
-        u8 cur_st = (live_st & RTPS_STATUS_STATE_MASK) >> 1;
-        if (dev->tx_ip_done || cur_st == 0) {
-            ret = 1;
-        } else {
-            ret = wait_event_interruptible_timeout(
-                dev->tx_ip_waitq,
-                dev->tx_ip_done != 0 ||
-                    (dev->ip_regs && (((ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) & RTPS_STATUS_STATE_MASK) >> 1) == 0)),
-                msecs_to_jiffies(1000));
-        }
-    }
+    /* Return immediately after MM2S DMA completes; next write() waits on tx_ip_done */
     dev->post_write_ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-    if (ret == 0) {
-        u32 status = dev->post_write_ip_status;
-        u8 cur_st = (status & RTPS_STATUS_STATE_MASK) >> 1;
-        pr_err("axi_rtps: RTPS cycle wait timed out (status: 0x%08x [State %u], pre_write: 0x%08x)\n",
-               status, cur_st, dev->pre_write_ip_status);
-        if (cur_st != 0)
-            iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
-        mutex_unlock(&dev->tx_lock);
-        return -ETIMEDOUT;
-    } else if (ret < 0) {
-        mutex_unlock(&dev->tx_lock);
-        return ret;
-    }
 
     if (dev->crc_err) {
         pr_err("axi_rtps: RTPS IP reported DMA0 CRC-32 error\n");
@@ -1520,20 +1580,28 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     if (device_create_file(dmadev->device, &dev_attr_learned_macs))
         dev_warn(dev, "failed to create learned_macs sysfs attribute\n");
 
-    ret = request_irq(dmadev->rx_virq, axi_rtps_isr, IRQF_SHARED, "axi_rtps_rx",
-                      dmadev);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    tasklet_setup(&dmadev->tx_ip_tasklet, axi_rtps_tx_ip_tasklet);
+    tasklet_setup(&dmadev->rx_ip_tasklet, axi_rtps_rx_ip_tasklet);
+#else
+    tasklet_init(&dmadev->tx_ip_tasklet, axi_rtps_tx_ip_tasklet, (unsigned long)dmadev);
+    tasklet_init(&dmadev->rx_ip_tasklet, axi_rtps_rx_ip_tasklet, (unsigned long)dmadev);
+#endif
+
+    ret = request_irq(dmadev->rx_virq, axi_rtps_dma_rx_isr, IRQF_SHARED,
+                      "axi_rtps_dma_rx", dmadev);
     if (ret)
         goto err_device_destroy;
 
     if (dmadev->tx_virq > 0) {
-        ret = request_irq(dmadev->tx_virq, axi_rtps_isr, IRQF_SHARED,
-                          "axi_rtps_tx", dmadev);
+        ret = request_irq(dmadev->tx_virq, axi_rtps_dma_tx_isr, IRQF_SHARED,
+                          "axi_rtps_dma_tx", dmadev);
         if (ret)
             dev_warn(dev, "could not request TX IRQ %d\n", dmadev->tx_virq);
     }
 
     if (dmadev->ip_virq > 0) {
-        ret = request_irq(dmadev->ip_virq, axi_rtps_isr, IRQF_SHARED,
+        ret = request_irq(dmadev->ip_virq, axi_rtps_ip_isr, IRQF_SHARED,
                           "rtps_ip_done", dmadev);
         if (ret)
             goto err_free_rx_irq;
@@ -1547,6 +1615,7 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     dmadev->tx_ip_frag_mode     = 0;
     dmadev->frag_size_bytes     = 1400U;
     dmadev->bypass_crc          = 1;
+    dmadev->tx_ip_done          = 1;
     if (dmadev->ip_regs) {
         /* Default to physical wire enabled (RTPS_CTRL_EMU_EN = 0) so ARP and Ping work immediately */
         u32 default_ctrl = RTPS_CTRL_ENABLE |
@@ -1574,6 +1643,8 @@ err_free_rx_irq:
     if (dmadev->tx_virq > 0)
         free_irq(dmadev->tx_virq, dmadev);
     free_irq(dmadev->rx_virq, dmadev);
+    tasklet_kill(&dmadev->tx_ip_tasklet);
+    tasklet_kill(&dmadev->rx_ip_tasklet);
 err_device_destroy:
     device_remove_file(dmadev->device, &dev_attr_learned_macs);
     device_destroy(dmadev->class, dmadev->dev_num);
@@ -1614,6 +1685,9 @@ static int axi_rtps_remove(struct platform_device* pdev) {
         free_irq(dmadev->tx_virq, dmadev);
     if (dmadev->rx_virq > 0)
         free_irq(dmadev->rx_virq, dmadev);
+
+    tasklet_kill(&dmadev->tx_ip_tasklet);
+    tasklet_kill(&dmadev->rx_ip_tasklet);
 
     device_remove_file(dmadev->device, &dev_attr_learned_macs);
     device_destroy(dmadev->class, dmadev->dev_num);

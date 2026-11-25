@@ -16,8 +16,8 @@
 #define RTPS_IP_DEFAULT_REG_SIZE     0x1000 /* 4 KB CSR & Endpoint Descriptor Table aperture */
 
 /* Interrupt numbers (ARM GIC SPI numbers) */
-#define XAXIDMA_DEFAULT_RX_IRQ       29 /* SPI 29 -> HW IRQ 61 (S2MM) */
-#define XAXIDMA_DEFAULT_TX_IRQ       30 /* SPI 30 -> HW IRQ 62 (MM2S) */
+#define XAXIDMA_DEFAULT_TX_IRQ       29 /* SPI 29 -> HW IRQ 61 (MM2S) */
+#define XAXIDMA_DEFAULT_RX_IRQ       30 /* SPI 30 -> HW IRQ 62 (S2MM) */
 #define RTPS_IP_DEFAULT_IRQ          31 /* SPI 31 -> HW IRQ 63 (IP Done / Error) */
 
 /* =========================================================================
