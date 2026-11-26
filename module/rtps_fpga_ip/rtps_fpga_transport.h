@@ -92,7 +92,7 @@ typedef int32_t (*NDDS_Transport_CreateRecvResource_rrEA_Fcn)(
     int32_t reserved);
 
 /* =========================================================================
- * 3. Option B FPGA Transport Plugin Instance State
+ * 3. FPGA RTPS Transport Plugin Instance State
  * ========================================================================= */
 typedef struct NDDS_Transport_PluginImpl {
     NDDS_Transport_ClassId_t                   class_id;
@@ -113,7 +113,7 @@ typedef struct NDDS_Transport_PluginImpl {
 } NDDS_Transport_Plugin;
 
 /* =========================================================================
- * 4. Option B Transport Plugin Callback Implementations
+ * 4. FPGA RTPS Transport Plugin Callback Implementations
  * ========================================================================= */
 
 static inline int32_t FpgaTransport_create_send_resource_srEA(
@@ -147,11 +147,11 @@ static inline int32_t FpgaTransport_create_recv_resource_rrEA(
 }
 
 /*
- * Option B `FpgaTransport_send()`:
+ * `FpgaTransport_send()`:
  *   RTI Connext's `DataWriter::write()` passes a scatter-gather `iov[]` array:
  *     - iov[0 .. iov_count-2]: CPU-formatted RTPS Header, INFO_TS, DATA, CDR_LE
  *     - iov[iov_count-1]:      4,096-byte serialized `FastSample` payload
- *   In Option B, the plugin strips the CPU-built headers and DMAs ONLY the
+ *   The plugin strips the CPU-built headers and DMAs ONLY the
  *   4,096-byte serialized `FastSample` payload (`iov[iov_count - 1]`) over MM2S
  *   (zero-copy if loaned via `get_loan()` from `tx_mmap_buf`).
  *   The FPGA prepends the wire RTPS v2.4 header + hardware-timestamped INFO_TS +
@@ -186,9 +186,8 @@ static inline int32_t FpgaTransport_send(
 }
 
 /*
- * Option B `FpgaTransport_receive_rEA()`:
- *   In Option B (`CTRL_ADDR[7] == 1`), the FPGA still performs 100% of RX hardware
- *   offload:
+ * `FpgaTransport_receive_rEA()`:
+ *   The FPGA performs 100% of RX hardware offload:
  *     1. 3-slot IPv4 fragment reassembly (including out-of-order fragments)
  *     2. Hardware IPv4 header + reassembled UDP 1's-complement checksum validation
  *     3. 4-entry `guidPrefix` CAM lookup + `writerEntityId` verification
@@ -229,7 +228,7 @@ static inline int32_t FpgaTransport_receive_rEA(
 }
 
 /* =========================================================================
- * 5. Option B Control-Plane Hook (`on_publication_matched` / `on_subscription_matched`)
+ * 5. Control-Plane Hook (`on_publication_matched` / `on_subscription_matched`)
  * ========================================================================= */
 
 static inline int FpgaTransport_on_publication_matched(
@@ -397,7 +396,7 @@ static inline struct FastSample* DDS_DataWriter_get_loan(NDDS_Transport_Plugin* 
 }
 
 /*
- * Standard `FooDataWriter::write()` backed by Option B `NDDS_Transport_Plugin::send()`:
+ * Standard `FooDataWriter::write()` backed by `NDDS_Transport_Plugin::send()`:
  *   Constructs the scatter-gather `iov[2]` array identical to RTI Connext's preserialized
  *   writer path (`iov[0]` = 60B dummy RTPS header, `iov[1]` = 4,096B `FastSample`) and
  *   invokes `plugin->send()`.
@@ -423,7 +422,7 @@ static inline int DDS_DataWriter_write(
     memset(&dst_addr, 0, sizeof(dst_addr));
 
     iov[0].pointer = (char*)dummy_rtps_hdr;
-    iov[0].length  = RTPS_WIRE_HEADER_BYTES; /* 60B stripped by Option B plugin->send() */
+    iov[0].length  = RTPS_WIRE_HEADER_BYTES; /* 60B stripped by plugin->send() */
     iov[1].pointer = (char*)tx_ptr;
     iov[1].length  = sizeof(struct FastSample); /* 4,096B DMA'd directly to FPGA */
 
@@ -432,11 +431,11 @@ static inline int DDS_DataWriter_write(
 }
 
 /*
- * Standard `FooDataReader::take()` backed by Option B `NDDS_Transport_Plugin::receive_rEA()`:
+ * Standard `FooDataReader::take()` backed by `NDDS_Transport_Plugin::receive_rEA()`:
  *   Invokes `plugin->receive_rEA()` into the coherent `mmap` RX buffer.
- *   In Option B (`option_b_rtps_rx_mode == 1`), verifies the 60-byte hardware-validated
- *   RTPS v2.x wire header (`"RTPS"` magic, `INFO_TS`, `DATA`, `CDR_LE`) and returns a
- *   zero-copy pointer to the 4,096-byte `FastSample` payload at `Words 15..1038`!
+ *   Verifies the 60-byte hardware-validated RTPS v2.x wire header (`"RTPS"` magic,
+ *   `INFO_TS`, `DATA`, `CDR_LE`) and returns a zero-copy pointer to the 4,096-byte
+ *   `FastSample` payload at `Words 15..1038`!
  */
 static inline int DDS_DataReader_take(
     NDDS_Transport_Plugin* plugin,

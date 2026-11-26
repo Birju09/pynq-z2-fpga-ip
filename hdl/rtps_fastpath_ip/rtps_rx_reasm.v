@@ -1248,7 +1248,7 @@ module rtps_rx_reasm #(
                     end
                 end
 
-                // Synthesize Words 2..15 (RTPS + INFO_TS + DATA 0x15) for Option B compatibility
+                // Synthesize Words 2..15 (RTPS + INFO_TS + DATA 0x15) for full RTPS wire-message egress
                 R_DF_SYNTH_HDR: begin : df_synth_blk
                     reg [15:0] synth_oct_le;
                     reg [15:0] synth_oct_wire;

@@ -1039,7 +1039,7 @@ static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int
         printf("    - Latest RX SeqNum   : %llu (Gaps=%u, StaleDrops=%u, CsumErrs=%u)\n",
                (unsigned long long)d.last_rx_seq_num,
                d.stat_seq_gaps, d.stat_stale_drops, d.stat_csum_errs);
-        printf("    - Option B RTPS Len  : %u words (%u bytes)\n",
+        printf("    - Full RTPS Msg Len  : %u words (%u bytes)\n",
                d.last_rx_rtps_words, d.last_rx_rtps_words * 4);
         printf("    - Status Reg         : 0x%08x (State=%u, IRQ_IS_RX=%u)\n",
                d.status_reg, (d.status_reg >> 1) & 0xF, (d.status_reg >> 10) & 1);
@@ -1193,7 +1193,7 @@ int main(int argc, char* argv[]) {
         perror("[-] Warning: AXI_RTPS_IOC_SET_CRC_BYPASS failed");
     }
 
-    /* 1. Initialize Option B RTI Connext Transport Plugin (`NDDS_Transport_Plugin`) */
+    /* 1. Initialize FPGA RTPS Transport Plugin (`NDDS_Transport_Plugin`) */
     if (FpgaTransport_init_plugin(&plugin, fd, timer_val) < 0) {
         fprintf(stderr, "[-] Failed to initialize FPGA RTPS Transport Plugin\n");
         close(fd);
@@ -1207,7 +1207,7 @@ int main(int argc, char* argv[]) {
     plugin.edt_cfg.mode_pub_only   = async_mode ? 1 : 0;
 
     /*
-     * 2. Simulate SEDP Discovery Handoff via Option B Control-Plane Hooks:
+     * 2. Simulate SEDP Discovery Handoff via Control-Plane Hooks:
      *    - `on_publication_matched()`: Programs Shadow Writer EDT[0] for Peer 192.168.1.100:7410
      *    - `on_subscription_matched()`: Programs Shadow Reader CAM[0] for RTI Connext Peer
      *      guidPrefix = 0101_0002_BB00_0002_0000_0002, writerEntityId = 0x00000202
@@ -1273,9 +1273,9 @@ int main(int argc, char* argv[]) {
     uint16_t peer_port   = 7410;
 
     printf("=================================================================\n");
-    printf("  Hybrid PS+PL RTPS v2.x Fast-Path & Option B Transport Benchmark\n");
+    printf("  Hybrid PS+PL RTPS v2.x Fast-Path Transport Benchmark\n");
     printf("  Target        : %s\n", DEVICE_PATH);
-    printf("  Integration   : Option B (NDDS_Transport_Plugin: 4,096B TX -> 4,156B RTPS RX)\n");
+    printf("  Integration   : NDDS_Transport_Plugin (4,096B TX -> 4,156B Full RTPS RX)\n");
     printf("  Hardware Mode : %s\n",
            enable_peer_emu
                ? "Integrated RTI Peer Emulator (100 MHz Hardware Fabric Loopback)"
@@ -1469,7 +1469,7 @@ int main(int argc, char* argv[]) {
         printf("    - Latest RX SeqNum   : %llu (Gaps=%u, StaleDrops=%u, CsumErrs=%u)\n",
                (unsigned long long)diag.last_rx_seq_num,
                diag.stat_seq_gaps, diag.stat_stale_drops, diag.stat_csum_errs);
-        printf("    - Option B RTPS Len  : %u words (%u bytes)\n",
+        printf("    - Full RTPS Msg Len  : %u words (%u bytes)\n",
                diag.last_rx_rtps_words, diag.last_rx_rtps_words * 4);
         printf("    - Peer Wire Identity : IP=%u.%u.%u.%u:%u (Reader CAM Slot %u)\n",
                (diag.last_rx_src_ip >> 24) & 0xFF,

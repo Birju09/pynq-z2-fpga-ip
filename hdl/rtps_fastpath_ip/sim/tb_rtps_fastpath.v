@@ -237,7 +237,7 @@ module tb_rtps_fastpath;
     endtask
 
     reg [31:0] tx_buf [0:PAYLOAD_WORDS-1];
-    reg [31:0] rx_buf [0:PAYLOAD_WORDS+15-1]; // Up to 1,039 words (4,156 B) for Option B RTPS Plugin Mode
+    reg [31:0] rx_buf [0:PAYLOAD_WORDS+15-1]; // Up to 1,039 words (4,156 B) for full RTPS wire-message egress
     reg [31:0] calc_crc;
     reg [31:0] status_val;
     reg [31:0] ticks_val;
@@ -413,7 +413,7 @@ module tb_rtps_fastpath;
             errors = errors + 1;
         end
 
-        // Kick S2MM Egress & stress Skid Buffer under backpressure (Option B: 15W RTPS + 1024W payload)
+        // Kick S2MM Egress & stress Skid Buffer under backpressure (15W RTPS header + 1024W payload)
         axi_write(10'h004, 32'h0000_0002);
         rx_cnt = 0;
         while (rx_cnt < (PAYLOAD_WORDS + 15)) begin
@@ -620,12 +620,12 @@ module tb_rtps_fastpath;
         repeat (5) @(posedge clk);
 
         // =====================================================================
-        // TEST 7: Option B RTI NDDS_Transport_Plugin Full RTPS RX Mode (CTRL[7]=1)
+        // TEST 7: Full RTPS Wire-Message RX Egress (60B RTPS Header + 4,096B Payload = 1039W)
         // =====================================================================
         $display("\n==================================================================");
-        $display("  TEST 7: Option B NDDS_Transport_Plugin Mode (CTRL[7]=1, 1039W)");
+        $display("  TEST 7: Full RTPS Wire-Message Egress Mode (1039W = 60B RTPS + 4096B Payload)");
         $display("==================================================================");
-        // Standard Option B mode (CTRL_ADDR = 0x0000_0013)
+        // Enable fast-path + internal peer emulator (CTRL_ADDR = 0x0000_0013)
         axi_write(10'h008, 32'h0000_0013);
         axi_write(10'h00C, 32'h0000_0000); // Bypass ingress CRC or use calc_crc
 
@@ -651,7 +651,7 @@ module tb_rtps_fastpath;
             sim_timeout = sim_timeout + 1;
         end
         axi_read(10'h074, stat_val);       // LAST_RX_RTPS_WORDS (0x74)
-        $display("[+] Option B Cycle STATUS=0x%08X, LAST_RX_RTPS_WORDS=%0d (4,156 bytes)",
+        $display("[+] Full RTPS Cycle STATUS=0x%08X, LAST_RX_RTPS_WORDS=%0d (4,156 bytes)",
                  status_val, stat_val);
 
         if (stat_val !== 32'd1039 || status_val[8:5] !== 4'b0000) begin
@@ -682,11 +682,11 @@ module tb_rtps_fastpath;
         if (rx_buf[0] !== 32'h5350_5452 || rx_buf[1] !== 32'h0101_0302 ||
             rx_buf[5] !== 32'h0008_0109 || rx_buf[8] !== 32'h1018_0515 ||
             rx_buf[14] !== 32'h0000_0100) begin
-            $display("[-] FAIL: Option B RTPS Header mismatch! w0=0x%08X w1=0x%08X w5=0x%08X w8=0x%08X w14=0x%08X",
+            $display("[-] FAIL: Full RTPS Header mismatch! w0=0x%08X w1=0x%08X w5=0x%08X w8=0x%08X w14=0x%08X",
                      rx_buf[0], rx_buf[1], rx_buf[5], rx_buf[8], rx_buf[14]);
             errors = errors + 1;
         end else begin
-            $display("[+] PASS: Option B 60-byte RTPS v2.3 Header ('RTPS' + INFO_TS + DATA + CDR_LE) verified!");
+            $display("[+] PASS: 60-byte RTPS v2.3 Header ('RTPS' + INFO_TS + DATA + CDR_LE) verified!");
         end
 
         // Verify all 1,024 payload words following the 15-word RTPS header (seq_num=3 in emulator after Test 1 & 2)
@@ -698,13 +698,13 @@ module tb_rtps_fastpath;
 
             if (rx_buf[15 + i] !== expected_word) begin
                 if (errors < 10) begin
-                    $display("[-] FAIL Option B Payload Word %0d: exp=0x%08X, got=0x%08X", i, expected_word, rx_buf[15 + i]);
+                    $display("[-] FAIL Full RTPS Payload Word %0d: exp=0x%08X, got=0x%08X", i, expected_word, rx_buf[15 + i]);
                 end
                 errors = errors + 1;
             end
         end
         if (errors == 0) begin
-            $display("[+] PASS: Option B receive_rEA() delivered all 1,039 words (60B RTPS + 4,096B FastSample) with 0 errors!");
+            $display("[+] PASS: S2MM egress delivered all 1,039 words (60B RTPS + 4,096B FastSample) with 0 errors!");
         end
 
         // =====================================================================
@@ -1684,7 +1684,7 @@ module tb_rtps_fastpath;
         // TEST 22: Non-4B-Aligned RX DATA_FRAG (fragmentSize=1397, Out-of-Order)
         // ==================================================================
         $display("\n==================================================================");
-        $display("  TEST 22: Unaligned RX DATA_FRAG (fragmentSize=1397, OOO + Opt B)");
+        $display("  TEST 22: Unaligned RX DATA_FRAG (fragmentSize=1397, OOO + RTPS Header Synthesis)");
         $display("==================================================================");
         begin : test22_blk
             // Build 4,100 bytes of SerializedPayload (Word 0 = CDR_LE 0x00010000, Words 1..1024 = payload)
@@ -1821,7 +1821,7 @@ module tb_rtps_fastpath;
             m_axis_tready = 1'b0;
 
             if (rx_buf[0] !== 32'h5350_5452 || rx_buf[8] !== 32'h1018_0515 || rx_buf[14] !== 32'h0000_0100) begin
-                $display("[-] FAIL: Synthesized Option B header mismatch! w0=0x%08X w8=0x%08X w14=0x%08X",
+                $display("[-] FAIL: Synthesized RTPS header mismatch! w0=0x%08X w8=0x%08X w14=0x%08X",
                          rx_buf[0], rx_buf[8], rx_buf[14]);
                 errors = errors + 1;
             end
@@ -1833,7 +1833,7 @@ module tb_rtps_fastpath;
                 end
             end
             if (errors == 0)
-                $display("[+] PASS: Unaligned non-4B-multiple (fragmentSize=1397) OOO DATA_FRAG + Option B synthesis verified!");
+                $display("[+] PASS: Unaligned non-4B-multiple (fragmentSize=1397) OOO DATA_FRAG + RTPS header synthesis verified!");
         end
 
         $display("\n==================================================================");

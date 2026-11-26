@@ -22,7 +22,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Birju Vachhani");
 MODULE_DESCRIPTION(
-    "Hybrid PS+PL RTPS v2.x Cyclic Fast-Path & Option B RTI Transport Plugin DMA Driver for PYNQ-Z2");
+    "Hybrid PS+PL RTPS v2.x Cyclic Fast-Path & RTI Transport Plugin DMA Driver for PYNQ-Z2");
 MODULE_VERSION("1.0");
 
 struct axi_rtps_dev {
@@ -903,10 +903,9 @@ static void axi_rtps_check_learned_macs(struct axi_rtps_dev* dev) {
 
 /*
  * S2MM Egress Transfer:
- *   - In Option A (raw FastSample mode): streams 4,096 B (1,024 words) from latest_slot.
- *   - In Option B (NDDS_Transport_Plugin mode, CTRL[7]=1): streams 4,156 B (1,039 words)
- *     containing the hardware-validated 60B RTPS header + 4,096B FastSample payload
- *     directly into FpgaTransport_receive_rEA().
+ *   Streams the full hardware-validated RTPS wire message starting at the "RTPS"
+ *   magic (Word 2 of the reassembly BRAM) — e.g., 4,156 B (1,039 words: 60B RTPS
+ *   header + 4,096B FastSample payload) — directly into the RX DMA buffer.
  */
 static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                              loff_t* ppos) {
@@ -1611,7 +1610,7 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     if (ret)
         goto err_free_ip_irq;
 
-    /* Default to asynchronous decoupled Pub/Sub mode & Option B RTPS ingress */
+    /* Default to asynchronous decoupled Pub/Sub mode & full RTPS wire-message ingress */
     dmadev->tx_ip_frag_mode     = 0;
     dmadev->frag_size_bytes     = 1400U;
     dmadev->bypass_crc          = 1;
@@ -1632,7 +1631,7 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     platform_set_drvdata(pdev, dmadev);
 
     dev_info(dev,
-             "Hybrid RTPS v2.x Fast-Path & Option B Transport Plugin initialized: DMA at 0x%pa, IP at 0x%p\n",
+             "Hybrid RTPS v2.x Fast-Path & Transport Plugin DMA Driver initialized: DMA at 0x%pa, IP at 0x%p\n",
              &res0->start, dmadev->ip_regs);
     return 0;
 

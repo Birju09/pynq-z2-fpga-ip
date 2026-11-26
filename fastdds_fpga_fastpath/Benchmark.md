@@ -29,26 +29,7 @@
 
 ## 2. Round-Trip with Remote Echo (2,000 Hz)
 
-### 2a. Head-to-Head Comparison (10,000 samples)
-
-| Metric | FPGA Fastpath (100 Mbps PL) | Pure Fast DDS (1 Gbps PS) |
-|---|---|---|
-| Effective Rate | **2,000.0 samples/s** (65.5 Mbps) | 1,921.7 samples/s (63.0 Mbps) |
-| Inbound RX Samples | **10,000 (0.00% loss, SeqGaps=0)** | 9,998 (0.02% loss, SeqGaps=0) |
-| Publish Call Latency (Min / p50 / Avg) | **17.5 / 19.2 / 79.6 µs** | 276.7 / 365.1 / 451.6 µs |
-| Publish Call Latency (p95 / p99 / Max) | **369.6 / 380.0 / 467.9 µs** | 695.7 / 755.1 / 1,461.4 µs |
-| RTT Min | 1,839.9 µs | **1,127.7 µs** |
-| RTT p50 | 2,131.7 µs | **1,893.3 µs** |
-| RTT Avg | 2,137.9 µs | **1,881.2 µs** |
-| RTT p95 | **2,360.2 µs** | 2,465.3 µs |
-| RTT p99 | **2,426.9 µs** | 2,629.3 µs |
-| RTT p99.9 | **2,603.6 µs** | 3,496.9 µs |
-| RTT Max | **2,699.7 µs** | 4,398.4 µs |
-| Process CPU per Sample | **133.09 µs** (User 2.81 / Sys 130.29 µs) | 683.30 µs (User 264.68 / Sys 418.62 µs) |
-| Process CPU Usage (1-core norm.) | **26.62%** (13.31% system-wide) | 131.31% (65.66% system-wide) |
-| System CPU Busy (`/proc/stat`) | **10.45%** (SoftIRQ: **0.00%**) | 68.18% (SoftIRQ: 13.20%) |
-
-### 2b. Sustained Run (100,000 samples @ 2,000 Hz)
+### Sustained Run (100,000 samples @ 2,000 Hz)
 
 | Metric | FPGA Fastpath (100 Mbps PL) | Pure Fast DDS (1 Gbps PS) |
 |---|---|---|

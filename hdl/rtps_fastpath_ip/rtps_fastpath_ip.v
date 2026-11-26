@@ -521,7 +521,7 @@ module rtps_fastpath_ip #(
         .rd_match_count_flat      (rd_match_count_flat)
     );
 
-    // S2MM Egress: Option B mode is standard (egress full RTPS wire message starting at "RTPS" magic)
+    // S2MM Egress: stream full RTPS wire message starting at "RTPS" magic (Word 2)
     wire [11:0]           egress_start_word   = 12'd2;
     wire [ADDR_WIDTH:0]   egress_total_words  = latest_rtps_words;
 

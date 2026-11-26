@@ -257,7 +257,7 @@ struct fpga_rx_metadata {
 };
 
 /* =========================================================================
- * Option B Control-Plane Hook & Endpoint Descriptor Table Structures
+ * Control-Plane Hook & Endpoint Descriptor Table Structures
  * Populated by on_publication_matched() / on_subscription_matched()
  * ========================================================================= */
 struct rtps_writer_edt_entry {
