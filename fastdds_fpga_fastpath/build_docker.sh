@@ -39,11 +39,10 @@ build_armhf() {
                 -DCMAKE_TOOLCHAIN_FILE=/project/fastdds_fpga_fastpath/armhf-toolchain.cmake && \
             make -j\$(nproc) && \
             mkdir -p lib && \
-            cp -L /usr/lib/arm-linux-gnueabihf/libfastrtps.so.2.5 \
-                  /usr/lib/arm-linux-gnueabihf/libfastcdr.so.1 \
+            cp -L /opt/fastdds-armhf/lib/libfastdds.so* \
+                  /opt/fastdds-armhf/lib/libfastcdr.so* \
                   /usr/lib/arm-linux-gnueabihf/libfoonathan_memory.so.0.7.1 \
                   /usr/lib/arm-linux-gnueabihf/libtinyxml2.so.9 \
-                  /usr/lib/arm-linux-gnueabihf/libsqlite3.so.0 \
                   /usr/lib/arm-linux-gnueabihf/libssl.so.3 \
                   /usr/lib/arm-linux-gnueabihf/libcrypto.so.3 \
                   lib/ && \
@@ -77,11 +76,10 @@ build_x86() {
                 -DBUILD_REMOTE_APP=ON && \
             make -j\$(nproc) && \
             mkdir -p lib && \
-            cp -L /usr/lib/x86_64-linux-gnu/libfastrtps.so.2.5 \
-                  /usr/lib/x86_64-linux-gnu/libfastcdr.so.1 \
+            cp -L /usr/local/lib/libfastdds.so* \
+                  /usr/local/lib/libfastcdr.so* \
                   /usr/lib/x86_64-linux-gnu/libfoonathan_memory.so.0.7.1 \
                   /usr/lib/x86_64-linux-gnu/libtinyxml2.so.9 \
-                  /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 \
                   /usr/lib/x86_64-linux-gnu/libssl.so.3 \
                   /usr/lib/x86_64-linux-gnu/libcrypto.so.3 \
                   lib/ && \

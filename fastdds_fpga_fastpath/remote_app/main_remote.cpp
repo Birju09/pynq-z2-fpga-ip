@@ -41,11 +41,7 @@
 #include <fastdds/dds/topic/Topic.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
-#if __has_include(<fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>)
 #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
-#else
-#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
-#endif
 
 #include "../idl/FastSample.hpp"
 #include "../idl/FastSamplePubSubTypes.hpp"
@@ -93,11 +89,7 @@ public:
             struct in_addr peer_addr;
             if (inet_pton(AF_INET, peer_ip_.c_str(), &peer_addr) == 1) {
                 uint32_t pip = ntohl(peer_addr.s_addr);
-#if FASTDDS_V3
                 eprosima::fastdds::rtps::Locator_t peer_loc;
-#else
-                eprosima::fastrtps::rtps::Locator_t peer_loc;
-#endif
                 peer_loc.kind = 1; // LOCATOR_KIND_UDPv4
                 peer_loc.port = 0;
                 peer_loc.address[12] = static_cast<uint8_t>((pip >> 24) & 0xFF);
@@ -231,15 +223,9 @@ private:
                 sample.payload()[i] = static_cast<uint32_t>((iter << 16) | (i + 1));
             }
 
-#if FASTDDS_V3
             if (writer_->write(&sample) == RETCODE_OK) {
                 samples_sent_++;
             }
-#else
-            if (writer_->write(&sample)) {
-                samples_sent_++;
-            }
-#endif
 
             if (iter % (pub_rate_hz_ > 10 ? pub_rate_hz_ : 10) == 0 || iter == max_samples) {
                 std::cout << "\r[RemoteNode] Published " << iter << " / " << max_samples << " samples" << std::flush;
@@ -252,7 +238,7 @@ private:
         FastSample sample;
         SampleInfo info;
 
-        while (reader->take_next_sample(&sample, &info) == ReturnCode_t::RETCODE_OK) {
+        while (reader->take_next_sample(&sample, &info) == RETCODE_OK) {
             // The echo writer shares this participant, so it matches our own reader.
             const bool own_sample = writer_ && info.publication_handle == writer_->get_instance_handle();
             if (info.valid_data && !own_sample) {
@@ -323,11 +309,7 @@ private:
             FastSample sample = std::move(echo_queue_.front());
             echo_queue_.pop_front();
             lock.unlock();
-#if FASTDDS_V3
-            const bool ok = writer_->write(&sample) == RETCODE_OK;
-#else
-            const bool ok = writer_->write(&sample);
-#endif
+            const bool ok = (writer_->write(&sample) == RETCODE_OK);
             if (ok) samples_sent_++;
             lock.lock();
         }

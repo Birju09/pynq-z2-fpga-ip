@@ -12,6 +12,7 @@ set(CMAKE_CXX_COMPILER /usr/bin/arm-linux-gnueabihf-g++)
 set(CMAKE_LIBRARY_ARCHITECTURE arm-linux-gnueabihf)
 
 set(CMAKE_FIND_ROOT_PATH
+    /opt/fastdds-armhf
     /usr/arm-linux-gnueabihf
     /usr/lib/arm-linux-gnueabihf
     /usr/include/arm-linux-gnueabihf
@@ -24,6 +25,8 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 
 list(APPEND CMAKE_PREFIX_PATH
+    /opt/fastdds-armhf
+    /opt/fastdds-armhf/lib/cmake
     /usr/lib/arm-linux-gnueabihf/cmake
     /usr/lib/arm-linux-gnueabihf
     /usr/share

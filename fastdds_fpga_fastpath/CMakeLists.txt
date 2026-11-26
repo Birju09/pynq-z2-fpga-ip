@@ -13,17 +13,9 @@ else()
 endif()
 option(BUILD_REMOTE_APP "Build the Remote Workstation Fast DDS Node" ON)
 
-# Locate FastCDR and Fast DDS (supports both Fast DDS 2.x and 3.x)
+# Locate FastCDR and Fast DDS 3.x (required)
 find_package(fastcdr REQUIRED)
-find_package(fastdds QUIET)
-if(TARGET fastdds)
-    set(FASTDDS_TARGET fastdds)
-    message(STATUS "Found Fast DDS 3.x (target: fastdds)")
-else()
-    find_package(fastrtps REQUIRED)
-    set(FASTDDS_TARGET fastrtps)
-    message(STATUS "Found Fast DDS 2.x (target: fastrtps)")
-endif()
+find_package(fastdds 3 REQUIRED)
 
 find_package(Threads REQUIRED)
 
@@ -35,7 +27,7 @@ target_include_directories(fast_sample_types PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/idl
 )
 target_link_libraries(fast_sample_types PUBLIC
-    ${FASTDDS_TARGET}
+    fastdds
     fastcdr
 )
 
@@ -56,7 +48,7 @@ if(BUILD_FPGA_APP)
     )
     target_link_libraries(fpga_fastpath_node PRIVATE
         fast_sample_types
-        ${FASTDDS_TARGET}
+        fastdds
         fastcdr
         Threads::Threads
     )
@@ -78,7 +70,7 @@ if(BUILD_REMOTE_APP)
     )
     target_link_libraries(remote_dds_node PRIVATE
         fast_sample_types
-        ${FASTDDS_TARGET}
+        fastdds
         fastcdr
         Threads::Threads
     )

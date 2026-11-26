@@ -6,9 +6,36 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     file \
+    git \
     pkg-config \
-    libfastrtps-dev \
-    libfastcdr-dev \
+    libasio-dev \
+    libtinyxml2-dev \
+    libssl-dev \
+    libfoonathan-memory-dev \
     && rm -rf /var/lib/apt/lists/*
+
+ARG FASTCDR_VERSION=v2.2.6
+ARG FASTDDS_VERSION=v3.1.2
+RUN git clone --depth 1 --branch "${FASTCDR_VERSION}" https://github.com/eProsima/Fast-CDR.git /tmp/Fast-CDR && \
+    cmake -S /tmp/Fast-CDR -B /tmp/Fast-CDR/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON && \
+    cmake --build /tmp/Fast-CDR/build -j"$(nproc)" && \
+    cmake --install /tmp/Fast-CDR/build && \
+    git clone --depth 1 --branch "${FASTDDS_VERSION}" https://github.com/eProsima/Fast-DDS.git /tmp/Fast-DDS && \
+    cmake -S /tmp/Fast-DDS -B /tmp/Fast-DDS/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_CXX_FLAGS="-Wno-error=maybe-uninitialized" \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCOMPILE_EXAMPLES=OFF \
+        -DCOMPILE_TOOLS=OFF \
+        -DBUILD_TESTING=OFF \
+        -DSQLITE3_SUPPORT=OFF && \
+    cmake --build /tmp/Fast-DDS/build -j"$(nproc)" && \
+    cmake --install /tmp/Fast-DDS/build && \
+    ldconfig && \
+    rm -rf /tmp/Fast-CDR /tmp/Fast-DDS
 
 WORKDIR /project/fastdds_fpga_fastpath

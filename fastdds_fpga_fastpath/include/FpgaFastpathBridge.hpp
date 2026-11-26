@@ -46,28 +46,10 @@
 #include <fastdds/dds/topic/Topic.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
-#if __has_include(<fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>)
 #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
-#else
-#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
-#endif
-
-#if __has_include(<fastdds/config.hpp>)
-#include <fastdds/config.hpp>
-#endif
-
-#if defined(FASTDDS_VERSION_MAJOR) && (FASTDDS_VERSION_MAJOR >= 3)
-#define FASTDDS_V3 1
 #include <fastdds/dds/builtin/topic/SubscriptionBuiltinTopicData.hpp>
 #include <fastdds/dds/builtin/topic/PublicationBuiltinTopicData.hpp>
 #include <fastdds/rtps/common/Locator.hpp>
-#else
-#define FASTDDS_V3 0
-#include <fastrtps/rtps/builtin/data/ParticipantProxyData.h>
-#include <fastrtps/rtps/builtin/data/ReaderProxyData.h>
-#include <fastrtps/rtps/builtin/data/WriterProxyData.h>
-#include <fastrtps/rtps/common/Locator.h>
-#endif
 
 // Hardware Driver Headers
 #define FastSample FpgaHardwareFastSample
@@ -401,11 +383,7 @@ private:
         // Configure UDPv4 transport for Discovery Plane (always apply maxMessageSize for DATA_FRAG alignment)
         {
             pqos.transport().use_builtin_transports = false;
-#if FASTDDS_V3
             auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
-#else
-            auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
-#endif
             if (!config_.ps_ip.empty()) {
                 udp_transport->interfaceWhiteList.push_back(config_.ps_ip);
                 std::cout << "[FpgaBridge] Fast DDS Discovery bound to PS interface: " << config_.ps_ip << "\n";
@@ -421,11 +399,7 @@ private:
             struct in_addr peer_addr;
             if (inet_pton(AF_INET, config_.peer_ip.c_str(), &peer_addr) == 1) {
                 uint32_t pip = ntohl(peer_addr.s_addr);
-#if FASTDDS_V3
                 eprosima::fastdds::rtps::Locator_t peer_loc;
-#else
-                eprosima::fastrtps::rtps::Locator_t peer_loc;
-#endif
                 peer_loc.kind = 1; // LOCATOR_KIND_UDPv4
                 peer_loc.port = 0; // Fast DDS probes all participant ID ports on this host
                 peer_loc.address[12] = static_cast<uint8_t>((pip >> 24) & 0xFF);
@@ -494,11 +468,7 @@ private:
 
         // Remote writers send data to the PL RMII address, not the PS interface.
         {
-#if FASTDDS_V3
             eprosima::fastdds::rtps::Locator_t rx_loc;
-#else
-            eprosima::fastrtps::rtps::Locator_t rx_loc;
-#endif
             rx_loc.kind    = 1; // LOCATOR_KIND_UDPv4
             rx_loc.port    = config_.pl_rx_port;
             rx_loc.address[12] = static_cast<uint8_t>((config_.pl_ip >> 24) & 0xFF);
@@ -633,7 +603,6 @@ private:
     public:
         explicit BridgePartListener(FpgaFastpathBridge* parent) : parent_(parent) {}
 
-#if FASTDDS_V3
         void on_participant_discovery(
             eprosima::fastdds::dds::DomainParticipant*,
             eprosima::fastdds::rtps::ParticipantDiscoveryStatus reason,
@@ -702,69 +671,6 @@ private:
                 parent_->commit_discovered_remote_writer(remote_ip, info.guid.guidPrefix.value, eid);
             }
         }
-#else
-        void on_participant_discovery(
-            eprosima::fastdds::dds::DomainParticipant*,
-            eprosima::fastrtps::rtps::ParticipantDiscoveryInfo&& info) override {
-            if (info.status == eprosima::fastrtps::rtps::ParticipantDiscoveryInfo::DISCOVERED_PARTICIPANT &&
-                info.info.m_guid.guidPrefix != parent_->participant_->guid().guidPrefix) {
-                std::cout << "[FpgaBridge] SPDP Discovered Remote Participant: "
-                          << info.info.m_participantName.to_string() << "\n";
-            }
-        }
-
-        void on_subscriber_discovery(
-            eprosima::fastdds::dds::DomainParticipant*,
-            eprosima::fastrtps::rtps::ReaderDiscoveryInfo&& info) override {
-            if (info.status == eprosima::fastrtps::rtps::ReaderDiscoveryInfo::DISCOVERED_READER &&
-                info.info.topicName().to_string() == parent_->config_.topic_name &&
-                info.info.guid().guidPrefix != parent_->participant_->guid().guidPrefix) {
-                uint32_t remote_ip = parent_->config_.fallback_dst_ip;
-                uint16_t remote_port = parent_->config_.default_dst_port;
-                for (const auto& loc : info.info.remote_locators().unicast) {
-                    if (loc.kind == 1 /* LOCATOR_KIND_UDPv4 */) {
-                        remote_ip = (static_cast<uint32_t>(loc.address[12]) << 24) |
-                                    (static_cast<uint32_t>(loc.address[13]) << 16) |
-                                    (static_cast<uint32_t>(loc.address[14]) << 8)  |
-                                    static_cast<uint32_t>(loc.address[15]);
-                        remote_port = static_cast<uint16_t>(loc.port);
-                        break;
-                    }
-                }
-                auto guid = info.info.guid();
-                uint32_t eid = (static_cast<uint32_t>(guid.entityId.value[0]) << 24) |
-                               (static_cast<uint32_t>(guid.entityId.value[1]) << 16) |
-                               (static_cast<uint32_t>(guid.entityId.value[2]) << 8)  |
-                               static_cast<uint32_t>(guid.entityId.value[3]);
-                parent_->commit_discovered_remote_reader(remote_ip, remote_port, eid);
-            }
-        }
-
-        void on_publisher_discovery(
-            eprosima::fastdds::dds::DomainParticipant*,
-            eprosima::fastrtps::rtps::WriterDiscoveryInfo&& info) override {
-            if (info.status == eprosima::fastrtps::rtps::WriterDiscoveryInfo::DISCOVERED_WRITER &&
-                info.info.topicName().to_string() == parent_->config_.topic_name &&
-                info.info.guid().guidPrefix != parent_->participant_->guid().guidPrefix) {
-                uint32_t remote_ip = 0;
-                for (const auto& loc : info.info.remote_locators().unicast) {
-                    if (loc.kind == 1 /* LOCATOR_KIND_UDPv4 */) {
-                        remote_ip = (static_cast<uint32_t>(loc.address[12]) << 24) |
-                                    (static_cast<uint32_t>(loc.address[13]) << 16) |
-                                    (static_cast<uint32_t>(loc.address[14]) << 8)  |
-                                    static_cast<uint32_t>(loc.address[15]);
-                        break;
-                    }
-                }
-                auto guid = info.info.guid();
-                uint32_t eid = (static_cast<uint32_t>(guid.entityId.value[0]) << 24) |
-                               (static_cast<uint32_t>(guid.entityId.value[1]) << 16) |
-                               (static_cast<uint32_t>(guid.entityId.value[2]) << 8)  |
-                               static_cast<uint32_t>(guid.entityId.value[3]);
-                parent_->commit_discovered_remote_writer(remote_ip, guid.guidPrefix.value, eid);
-            }
-        }
-#endif
 
     private:
         FpgaFastpathBridge* parent_;

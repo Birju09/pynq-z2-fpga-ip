@@ -266,11 +266,7 @@ public:
 
     bool publish(FastSample& sample) {
         if (!writer_) return false;
-#if FASTDDS_V3
         return (writer_->write(&sample) == eprosima::fastdds::dds::RETCODE_OK);
-#else
-        return writer_->write(&sample);
-#endif
     }
 
     void stop() {
@@ -335,11 +331,7 @@ private:
             struct in_addr peer_addr;
             if (inet_pton(AF_INET, cfg_.peer_ip.c_str(), &peer_addr) == 1) {
                 uint32_t pip = ntohl(peer_addr.s_addr);
-#if FASTDDS_V3
                 eprosima::fastdds::rtps::Locator_t peer_loc;
-#else
-                eprosima::fastrtps::rtps::Locator_t peer_loc;
-#endif
                 peer_loc.kind = 1; // LOCATOR_KIND_UDPv4
                 peer_loc.port = 0;
                 peer_loc.address[12] = static_cast<uint8_t>((pip >> 24) & 0xFF);
@@ -420,7 +412,7 @@ private:
             rqos.resource_limits().max_instances = 1;
             rqos.resource_limits().max_samples_per_instance = 1024;
             rqos.endpoint().history_memory_policy =
-                eprosima::fastrtps::rtps::DYNAMIC_RESERVE_MEMORY_MODE;
+                eprosima::fastdds::rtps::DYNAMIC_RESERVE_MEMORY_MODE;
             reader_ = subscriber_->create_datareader(rx_topic_, rqos, &reader_listener_);
             if (!reader_) return false;
         }
@@ -484,7 +476,7 @@ private:
         SampleInfo info;
         auto local_prefix = participant_->guid().guidPrefix;
 
-        while (reader->take_next_sample(&sample, &info) == ReturnCode_t::RETCODE_OK) {
+        while (reader->take_next_sample(&sample, &info) == eprosima::fastdds::dds::RETCODE_OK) {
             if (!info.valid_data) continue;
             // Ignore samples published by our own DataWriter; only count peer/echoed samples
             if (info.sample_identity.writer_guid().guidPrefix == local_prefix) continue;
@@ -498,7 +490,7 @@ private:
         SampleInfo info;
         auto echo_prefix = echo_participant_->guid().guidPrefix;
 
-        while (reader->take_next_sample(&sample, &info) == ReturnCode_t::RETCODE_OK) {
+        while (reader->take_next_sample(&sample, &info) == eprosima::fastdds::dds::RETCODE_OK) {
             if (!info.valid_data) continue;
             if (info.sample_identity.writer_guid().guidPrefix == echo_prefix) continue;
             if (echo_writer_) {
@@ -511,7 +503,6 @@ private:
     public:
         explicit PurePartListener(PureDdsSession* parent) : parent_(parent) {}
 
-#if FASTDDS_V3
         void on_data_reader_discovery(
             eprosima::fastdds::dds::DomainParticipant*,
             eprosima::fastdds::rtps::ReaderDiscoveryStatus reason,
@@ -525,18 +516,6 @@ private:
                 parent_->notify_remote_reader_matched();
             }
         }
-#else
-        void on_subscriber_discovery(
-            eprosima::fastdds::dds::DomainParticipant*,
-            eprosima::fastrtps::rtps::ReaderDiscoveryInfo&& info) override {
-            if (info.status == eprosima::fastrtps::rtps::ReaderDiscoveryInfo::DISCOVERED_READER &&
-                info.info.topicName().to_string() == parent_->cfg_.topic_name &&
-                info.info.guid().guidPrefix != parent_->participant_->guid().guidPrefix &&
-                !parent_->is_rx_prefix(info.info.guid().guidPrefix)) {
-                parent_->notify_remote_reader_matched();
-            }
-        }
-#endif
     private:
         PureDdsSession* parent_;
     };
