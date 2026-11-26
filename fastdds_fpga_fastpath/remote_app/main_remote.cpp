@@ -43,8 +43,8 @@
 
 #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
 
-#include "../idl/FastSample.hpp"
-#include "../idl/FastSamplePubSubTypes.hpp"
+#include "FastSample.hpp"
+#include "FastSamplePubSubTypes.hpp"
 
 using namespace eprosima::fastdds::dds;
 

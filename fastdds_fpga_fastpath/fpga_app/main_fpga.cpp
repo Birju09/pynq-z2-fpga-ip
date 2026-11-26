@@ -40,7 +40,7 @@
 
 #include <fastdds/dds/subscriber/SampleInfo.hpp>
 
-#include "../include/FpgaFastpathBridge.hpp"
+#include "FpgaFastpathBridge.hpp"
 
 static std::atomic<bool> g_running{true};
 
