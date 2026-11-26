@@ -818,30 +818,6 @@ static void axi_rtps_snapshot_s2mm_and_rxbuf(struct axi_rtps_dev* dev,
     dev->last_rx_bd_status  = dev->rx_bd ? dev->rx_bd->status : 0;
     dev->rx_buf_total_words = num_words;
 
-    /*
-     * TEMPORARY LATENCY OPTIMIZATION:
-     * Full DDR memory scan commented out for testing.
-     * Iterating over 1,039 words in uncached DDR memory costs ~15-20 us on ARM Cortex-A9.
-     */
-    /*
-    if (rx_words && num_words > 0) {
-        for (i = 0; i < num_words; i++) {
-            if (rx_words[i] != 0xDEADBEEFU) {
-                written++;
-                if (first_idx == 0xFFFFFFFFU)
-                    first_idx = i;
-                last_idx = i;
-            }
-        }
-        dev->rx_buf_sample_words[0] = (num_words > 0)  ? rx_words[0]  : 0;
-        dev->rx_buf_sample_words[1] = (num_words > 1)  ? rx_words[1]  : 0;
-        dev->rx_buf_sample_words[2] = (num_words > 2)  ? rx_words[2]  : 0;
-        dev->rx_buf_sample_words[3] = (num_words > 8)  ? rx_words[8]  : 0;
-        dev->rx_buf_sample_words[4] = (num_words > 14) ? rx_words[14] : 0;
-        dev->rx_buf_sample_words[5] = (num_words > 15) ? rx_words[15] : 0;
-        dev->rx_buf_sample_words[6] = rx_words[num_words - 1];
-    }
-    */
     (void)rx_words;
     (void)i;
     (void)written;
@@ -921,18 +897,6 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
 
     if (mutex_lock_interruptible(&dev->rx_lock))
         return -ERESTARTSYS;
-
-    /*
-     * TEMPORARY LATENCY OPTIMIZATION:
-     * Sentinel pre-fill commented out for testing.
-     * Writing 1,039 words to uncached DDR costs ~15-20 us on ARM Cortex-A9.
-     */
-    /*
-    rx_words = (u32*)dev->rx_buf;
-    for (i = 0; i < num_words; i++) {
-        rx_words[i] = 0xDEADBEEFU;
-    }
-    */
 
     dev->pre_read_ip_status = dev->ip_regs ? ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET) : 0;
 
