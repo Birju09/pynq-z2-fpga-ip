@@ -456,7 +456,7 @@ private:
 
         DataWriterQos wqos = DATAWRITER_QOS_DEFAULT;
         wqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
-        writer_ = publisher_->create_datawriter(topic_, wqos, &writer_listener_);
+        writer_ = publisher_->create_datawriter(topic_, wqos);
         if (!writer_) return false;
 
         // Create Subscriber & DataReader
@@ -478,7 +478,7 @@ private:
             rqos.endpoint().unicast_locator_list.push_back(rx_loc);
         }
 
-        reader_ = subscriber_->create_datareader(topic_, rqos, &reader_listener_);
+        reader_ = subscriber_->create_datareader(topic_, rqos);
         if (!reader_) return false;
 
         // Replay endpoints discovered while the writer/reader were still being created.
@@ -676,28 +676,6 @@ private:
         FpgaFastpathBridge* parent_;
     };
 
-    class BridgeWriterListener : public eprosima::fastdds::dds::DataWriterListener {
-    public:
-        explicit BridgeWriterListener(FpgaFastpathBridge* parent) : parent_(parent) {}
-        void on_publication_matched(eprosima::fastdds::dds::DataWriter*,
-                                    const eprosima::fastdds::dds::PublicationMatchedStatus&) override {
-            // Note: Remote endpoint matching is handled via BridgePartListener (filtered by guidPrefix)
-        }
-    private:
-        FpgaFastpathBridge* parent_;
-    };
-
-    class BridgeReaderListener : public eprosima::fastdds::dds::DataReaderListener {
-    public:
-        explicit BridgeReaderListener(FpgaFastpathBridge* parent) : parent_(parent) {}
-        void on_subscription_matched(eprosima::fastdds::dds::DataReader*,
-                                     const eprosima::fastdds::dds::SubscriptionMatchedStatus&) override {
-            // Note: Remote endpoint matching is handled via BridgePartListener (filtered by guidPrefix)
-        }
-    private:
-        FpgaFastpathBridge* parent_;
-    };
-
     BridgeConfig config_;
     std::atomic<bool> running_{false};
     std::atomic<bool> writer_matched_{false};
@@ -735,8 +713,6 @@ private:
     eprosima::fastdds::dds::TypeSupport type_;
 
     BridgePartListener part_listener_{this};
-    BridgeWriterListener writer_listener_{this};
-    BridgeReaderListener reader_listener_{this};
 };
 
 } // namespace fastdds_fpga
