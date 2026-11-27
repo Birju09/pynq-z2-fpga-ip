@@ -31,6 +31,7 @@
 
 #include <fastdds/dds/domain/DomainParticipant.hpp>
 #include <fastdds/dds/domain/DomainParticipantFactory.hpp>
+#include <fastdds/dds/domain/DomainParticipantListener.hpp>
 #include <fastdds/dds/publisher/DataWriter.hpp>
 #include <fastdds/dds/publisher/DataWriterListener.hpp>
 #include <fastdds/dds/publisher/Publisher.hpp>
@@ -41,6 +42,7 @@
 #include <fastdds/dds/topic/Topic.hpp>
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
+#include <fastdds/rtps/common/LocatorWithMask.hpp>
 #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
 
 #include "FastSample.hpp"
@@ -61,10 +63,10 @@ public:
     RemoteNode(uint32_t domain_id, const std::string& topic_name,
                bool echo_mode, bool pub_mode, int pub_rate_hz,
                const std::string& interface_ip, const std::string& peer_ip,
-               bool large_5mb = false)
+               bool large_5mb = false, const std::string& pl_ip = "")
         : domain_id_(domain_id), topic_name_(topic_name),
           echo_mode_(echo_mode), pub_mode_(pub_mode), pub_rate_hz_(pub_rate_hz),
-          interface_ip_(interface_ip), peer_ip_(peer_ip), large_5mb_(large_5mb),
+          interface_ip_(interface_ip), peer_ip_(peer_ip), pl_ip_(pl_ip), large_5mb_(large_5mb),
           samples_received_(0), samples_sent_(0), corrupted_samples_(0), seq_gaps_(0),
           last_seq_(0) {}
 
@@ -104,7 +106,8 @@ public:
             }
         }
 
-        participant_ = DomainParticipantFactory::get_instance()->create_participant(domain_id_, pqos);
+        participant_ = DomainParticipantFactory::get_instance()->create_participant(
+            domain_id_, pqos, &part_listener_);
         if (!participant_) {
             std::cerr << "[-] Error: Failed to create DomainParticipant\n";
             return false;
@@ -139,6 +142,23 @@ public:
 
             DataWriterQos wqos = DATAWRITER_QOS_DEFAULT;
             wqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
+            if (!pl_ip_.empty()) {
+                struct in_addr pl_addr;
+                if (inet_pton(AF_INET, pl_ip_.c_str(), &pl_addr) == 1) {
+                    uint32_t plip = ntohl(pl_addr.s_addr);
+                    eprosima::fastdds::rtps::LocatorWithMask pl_loc;
+                    pl_loc.kind = 1; // LOCATOR_KIND_UDPv4
+                    pl_loc.port = 0;
+                    pl_loc.address[12] = static_cast<uint8_t>((plip >> 24) & 0xFF);
+                    pl_loc.address[13] = static_cast<uint8_t>((plip >> 16) & 0xFF);
+                    pl_loc.address[14] = static_cast<uint8_t>((plip >> 8) & 0xFF);
+                    pl_loc.address[15] = static_cast<uint8_t>(plip & 0xFF);
+                    pl_loc.mask(32);
+                    wqos.endpoint().external_unicast_locators[1][0].push_back(pl_loc);
+                    wqos.endpoint().ignore_non_matching_locators = true;
+                    std::cout << "[RemoteNode] Filtering DataWriter destination to FPGA PL IP: " << pl_ip_ << "\n";
+                }
+            }
             writer_ = publisher_->create_datawriter(topic_, wqos, &writer_listener_);
             if (!writer_) return false;
             if (echo_mode_) echo_thread_ = std::thread(&RemoteNode::echo_loop, this);
@@ -397,6 +417,36 @@ private:
         RemoteNode* parent_;
     };
 
+    class PartListener : public DomainParticipantListener {
+    public:
+        explicit PartListener(RemoteNode* parent) : parent_(parent) {}
+        void on_data_reader_discovery(
+                DomainParticipant*,
+                eprosima::fastdds::rtps::ReaderDiscoveryStatus reason,
+                const SubscriptionBuiltinTopicData& info,
+                bool& should_be_ignored) override {
+            should_be_ignored = false;
+            if (reason == eprosima::fastdds::rtps::ReaderDiscoveryStatus::DISCOVERED_READER &&
+                info.topic_name.to_string() == parent_->topic_name_ &&
+                info.guid.guidPrefix != parent_->participant_->guid().guidPrefix) {
+                std::cout << "[RemoteNode] Discovered Remote DataReader locators:";
+                for (const auto& loc : info.remote_locators.unicast) {
+                    if (loc.kind == 1) {
+                        std::cout << " "
+                                  << static_cast<int>(loc.address[12]) << "."
+                                  << static_cast<int>(loc.address[13]) << "."
+                                  << static_cast<int>(loc.address[14]) << "."
+                                  << static_cast<int>(loc.address[15]) << ":"
+                                  << loc.port;
+                    }
+                }
+                std::cout << "\n";
+            }
+        }
+    private:
+        RemoteNode* parent_;
+    };
+
     class WriterListener : public DataWriterListener {
     public:
         void on_publication_matched(DataWriter*, const PublicationMatchedStatus& info) override {
@@ -413,6 +463,7 @@ private:
     int pub_rate_hz_;
     std::string interface_ip_;
     std::string peer_ip_;
+    std::string pl_ip_;
     bool large_5mb_{false};
 
     std::atomic<uint32_t> samples_received_;
@@ -442,6 +493,7 @@ private:
     DataReader* reader_{nullptr};
     TypeSupport type_;
 
+    PartListener part_listener_{this};
     ReaderListener reader_listener_{this};
     WriterListener writer_listener_;
 };
@@ -460,6 +512,7 @@ int main(int argc, char* argv[]) {
     int max_samples = 0; // 0 = run until Ctrl+C
     std::string interface_ip = "";
     std::string peer_ip = "";
+    std::string pl_ip = "";
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -482,6 +535,8 @@ int main(int argc, char* argv[]) {
             interface_ip = argv[++i];
         } else if (arg == "--peer-ip" && i + 1 < argc) {
             peer_ip = argv[++i];
+        } else if (arg == "--pl-ip" && i + 1 < argc) {
+            pl_ip = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
@@ -489,6 +544,7 @@ int main(int argc, char* argv[]) {
                       << "  --domain <id>       DDS Domain ID (default: 0)\n"
                       << "  --interface <IP>    Bind Fast DDS to specific local NIC IP\n"
                       << "  --peer-ip <IP>      PYNQ-Z2 PS eth0 IP for unicast SPDP discovery\n"
+                      << "  --pl-ip <IP>        FPGA PL RMII IP to force DataWriter destination (e.g. 192.168.2.201)\n"
                       << "  --echo              Bounce received samples back to FPGA\n"
                       << "  --publish           Publish mode: transmit samples from PC to FPGA\n"
                       << "  --5mb               Use 5 MiB LargeSample5MB IDL instead of 4 KB FastSample\n"
@@ -509,11 +565,12 @@ int main(int argc, char* argv[]) {
               << "  Sample Type  : " << (large_5mb ? "LargeSample5MB (5 MiB)" : "FastSample (4 KB)") << "\n"
               << "  Interface    : " << (interface_ip.empty() ? "All Interfaces" : interface_ip) << "\n"
               << "  Unicast Peer : " << (peer_ip.empty() ? "Multicast Only" : peer_ip) << "\n"
+              << "  FPGA PL IP   : " << (pl_ip.empty() ? "Auto (from SEDP)" : pl_ip) << "\n"
               << "  Role         : " << (pub_mode ? "Publisher" : (echo_mode ? "Subscriber + Echo" : "Subscriber")) << "\n"
               << "  Target Samples: " << (max_samples > 0 ? std::to_string(max_samples) : "Continuous") << "\n"
               << "=================================================================\n\n";
 
-    RemoteNode node(domain_id, topic_name, echo_mode, pub_mode, pub_rate_hz, interface_ip, peer_ip, large_5mb);
+    RemoteNode node(domain_id, topic_name, echo_mode, pub_mode, pub_rate_hz, interface_ip, peer_ip, large_5mb, pl_ip);
     if (!node.init()) {
         return 1;
     }

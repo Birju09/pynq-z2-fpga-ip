@@ -50,6 +50,7 @@
 #include <fastdds/dds/builtin/topic/SubscriptionBuiltinTopicData.hpp>
 #include <fastdds/dds/builtin/topic/PublicationBuiltinTopicData.hpp>
 #include <fastdds/rtps/common/Locator.hpp>
+#include <fastdds/rtps/common/LocatorWithMask.hpp>
 
 // Hardware Driver Headers
 #define FastSample FpgaHardwareFastSample
@@ -488,16 +489,17 @@ private:
         DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
         rqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
 
-        // Remote writers send data to the PL RMII address, not the PS interface.
+        // Remote writers send data to the PL RMII address (external_unicast_locators), not PS eth0.
         {
-            eprosima::fastdds::rtps::Locator_t rx_loc;
+            eprosima::fastdds::rtps::LocatorWithMask rx_loc;
             rx_loc.kind    = 1; // LOCATOR_KIND_UDPv4
             rx_loc.port    = config_.pl_rx_port;
             rx_loc.address[12] = static_cast<uint8_t>((config_.pl_ip >> 24) & 0xFF);
             rx_loc.address[13] = static_cast<uint8_t>((config_.pl_ip >> 16) & 0xFF);
             rx_loc.address[14] = static_cast<uint8_t>((config_.pl_ip >> 8) & 0xFF);
             rx_loc.address[15] = static_cast<uint8_t>(config_.pl_ip & 0xFF);
-            rqos.endpoint().unicast_locator_list.push_back(rx_loc);
+            rx_loc.mask(24);
+            rqos.endpoint().external_unicast_locators[1][0].push_back(rx_loc);
         }
 
         reader_ = subscriber_->create_datareader(topic_, rqos);

@@ -75,7 +75,9 @@ localparam [3:0]
     S_TX_ARB        = 4'd4,
     S_DONE_IRQ      = 4'd5,
     S_LTX_DDR_FETCH = 4'd6,
-    S_LTX_HDR_WAIT  = 4'd7;
+    S_LTX_HDR_WAIT  = 4'd7,
+    S_LTX_INIT      = 4'd8,
+    S_LTX_INIT2     = 4'd9;
 
 // -----------------------------------------------------------------------------
 // Decoupled RX Egress FSM States (rtps_s2mm_egress)
@@ -144,4 +146,7 @@ localparam [5:0]
     R_LDF_BMAP_CHK     = 6'd51,
     R_LDF_BMAP_WAIT    = 6'd52,
     R_LDF_DDR_WR       = 6'd53,
-    R_LDF_COMMIT       = 6'd54;
+    R_LDF_COMMIT       = 6'd54,
+    R_LDF_SETUP2       = 6'd55,
+    R_LDF_BMAP_CHK2    = 6'd56,
+    R_LDF_BMAP_CHK3    = 6'd57;

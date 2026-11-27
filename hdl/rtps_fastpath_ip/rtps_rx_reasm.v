@@ -211,6 +211,9 @@ module rtps_rx_reasm #(
 
     // Iterative divider & DDP scratch registers
     reg [31:0] ldf_div_num;
+    reg        ldf_ovf_q, ldf_act_q, ldf_sn_lt_q, ldf_sn_eq_q, ldf_mismatch_q, ldf_prod0_q;
+    reg [31:0] ldf_raw_off_q, ldf_samp_q, ldf_rem_q;
+    reg        rid_mm_q, wid_mm_q;
     reg [31:0] ldf_div_den;
     reg [15:0] ldf_div_q;
     reg [4:0]  ldf_div_step;
@@ -1101,20 +1104,17 @@ module rtps_rx_reasm #(
                 R_DATA_READER_ID: begin
                     walk_reader_id <= walker_dout;
                     walker_rd_addr <= walk_cur_word + 12'd4;
-                    if ((walker_dout != 32'h0000_0000) &&
-                        (cam_reader_id_r != 32'h0000_0000) &&
-                        (walker_dout != cam_reader_id_r)) begin
-                        walk_cur_word  <= walk_next_submsg_word;
-                        rx_state       <= R_SUBMSG_HDR_WAIT2;
-                    end else begin
-                        rx_state       <= R_DATA_HDR_2;
-                    end
+                    rid_mm_q       <= (walker_dout != 32'h0000_0000) &&
+                                      (cam_reader_id_r != 32'h0000_0000) &&
+                                      (walker_dout != cam_reader_id_r);
+                    rx_state       <= R_DATA_HDR_2;
                 end
 
                 R_DATA_HDR_2: begin
                     walk_writer_id <= walker_dout;
                     walker_rd_addr <= walk_cur_word + 12'd5;
-                    if (!info_dst_matches_local || (walker_dout != cam_writer_id_r)) begin
+                    wid_mm_q       <= !info_dst_matches_local || (walker_dout != cam_writer_id_r);
+                    if (rid_mm_q) begin
                         walk_cur_word  <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT2;
                     end else begin
@@ -1127,7 +1127,12 @@ module rtps_rx_reasm #(
                                            {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
                                            walker_dout;
                     walker_rd_addr      <= walk_cur_word + 12'd5;
-                    rx_state            <= R_DATA_SEQ_LO;
+                    if (wid_mm_q) begin
+                        walk_cur_word <= walk_next_submsg_word;
+                        rx_state      <= R_SUBMSG_HDR_WAIT2;
+                    end else begin
+                        rx_state      <= R_DATA_SEQ_LO;
+                    end
                 end
 
                 R_DATA_SEQ_LO: begin
@@ -1186,20 +1191,17 @@ module rtps_rx_reasm #(
                 R_DF_READER_ID: begin
                     walk_reader_id <= walker_dout;
                     walker_rd_addr <= walk_cur_word + 12'd4;
-                    if ((walker_dout != 32'h0000_0000) &&
-                        (cam_reader_id_r != 32'h0000_0000) &&
-                        (walker_dout != cam_reader_id_r)) begin
-                        walk_cur_word  <= walk_next_submsg_word;
-                        rx_state       <= R_SUBMSG_HDR_WAIT2;
-                    end else begin
-                        rx_state       <= R_DF_WRITER_ID;
-                    end
+                    rid_mm_q       <= (walker_dout != 32'h0000_0000) &&
+                                      (cam_reader_id_r != 32'h0000_0000) &&
+                                      (walker_dout != cam_reader_id_r);
+                    rx_state       <= R_DF_WRITER_ID;
                 end
 
                 R_DF_WRITER_ID: begin
                     walk_writer_id <= walker_dout;
                     walker_rd_addr <= walk_cur_word + 12'd5;
-                    if (!info_dst_matches_local || (walker_dout != cam_writer_id_r)) begin
+                    wid_mm_q       <= !info_dst_matches_local || (walker_dout != cam_writer_id_r);
+                    if (rid_mm_q) begin
                         walk_cur_word  <= walk_next_submsg_word;
                         rx_state       <= R_SUBMSG_HDR_WAIT2;
                     end else begin
@@ -1212,7 +1214,12 @@ module rtps_rx_reasm #(
                                            {walker_dout[7:0], walker_dout[15:8], walker_dout[23:16], walker_dout[31:24]} :
                                            walker_dout;
                     walker_rd_addr      <= walk_cur_word + 12'd6;
-                    rx_state            <= R_DF_SEQ_LO;
+                    if (wid_mm_q) begin
+                        walk_cur_word <= walk_next_submsg_word;
+                        rx_state      <= R_SUBMSG_HDR_WAIT2;
+                    end else begin
+                        rx_state      <= R_DF_SEQ_LO;
+                    end
                 end
 
                 R_DF_SEQ_LO: begin
@@ -1531,16 +1538,26 @@ module rtps_rx_reasm #(
                     reg [4:0] next_prod;
                     next_prod = (lrx_prod_idx[walk_cam_idx] + 5'd1 >= rx_ring_depth_ep[walk_cam_idx]) ?
                                 5'd0 : (lrx_prod_idx[walk_cam_idx] + 5'd1);
-                    if (next_prod == rx_ring_cons_idx_ep[walk_cam_idx]) begin
+                    ldf_ovf_q      <= (next_prod == rx_ring_cons_idx_ep[walk_cam_idx]);
+                    ldf_act_q      <= lrx_active[walk_cam_idx];
+                    ldf_sn_lt_q    <= (walk_seq_num < lrx_writer_sn[walk_cam_idx]);
+                    ldf_sn_eq_q    <= (walk_seq_num == lrx_writer_sn[walk_cam_idx]);
+                    ldf_mismatch_q <= (lrx_sample_size[walk_cam_idx] != df_sample_size) ||
+                                      (lrx_frag_size[walk_cam_idx]   != df_frag_size);
+                    ldf_prod0_q    <= (lrx_prod_idx[walk_cam_idx] == 5'd0);
+                    rx_state       <= R_LDF_SETUP2;
+                end
+
+                R_LDF_SETUP2: begin
+                    if (ldf_ovf_q) begin
                         lrx_stat_drops[walk_cam_idx]        <= lrx_stat_drops[walk_cam_idx] + 32'd1;
                         large_rx_overflow_vec[walk_cam_idx] <= 1'b1;
                         rx_state                            <= R_IDLE;
-                    end else if (lrx_active[walk_cam_idx] && (walk_seq_num < lrx_writer_sn[walk_cam_idx])) begin
+                    end else if (ldf_act_q && ldf_sn_lt_q) begin
                         stat_stale_drops <= stat_stale_drops + 32'd1;
                         rx_state         <= R_IDLE;
-                    end else if (lrx_active[walk_cam_idx] && (walk_seq_num == lrx_writer_sn[walk_cam_idx])) begin
-                        if ((lrx_sample_size[walk_cam_idx] != df_sample_size) ||
-                            (lrx_frag_size[walk_cam_idx]   != df_frag_size)) begin
+                    end else if (ldf_act_q && ldf_sn_eq_q) begin
+                        if (ldf_mismatch_q) begin
                             lrx_stat_drops[walk_cam_idx] <= lrx_stat_drops[walk_cam_idx] + 32'd1;
                             rx_state                     <= R_IDLE;
                         end else begin
@@ -1548,11 +1565,11 @@ module rtps_rx_reasm #(
                         end
                     end else begin
                         // New sample or newer writerSN preempting incomplete older sample
-                        if (lrx_active[walk_cam_idx]) begin
+                        if (ldf_act_q) begin
                             stat_seq_gaps                <= stat_seq_gaps + 32'd1;
                             lrx_stat_drops[walk_cam_idx] <= lrx_stat_drops[walk_cam_idx] + 32'd1;
                         end
-                        if (lrx_prod_idx[walk_cam_idx] == 5'd0)
+                        if (ldf_prod0_q)
                             lrx_slot_base[walk_cam_idx] <= rx_ring_base_ep[walk_cam_idx];
                         lrx_active[walk_cam_idx]      <= 1'b1;
                         lrx_writer_sn[walk_cam_idx]   <= walk_seq_num;
@@ -1605,19 +1622,25 @@ module rtps_rx_reasm #(
                     end
                 end
 
-                R_LDF_BMAP_CHK: begin : ldf_bmap_chk_blk
-                    reg [31:0] raw_off;
-                    reg [31:0] rem_sample;
+                R_LDF_BMAP_CHK: begin
+                    ldf_raw_off_q <= {16'd0, ldf_frag_idx} * {16'd0, df_frag_size};
+                    ldf_samp_q    <= lrx_sample_size[walk_cam_idx];
+                    rx_state      <= R_LDF_BMAP_CHK2;
+                end
+
+                R_LDF_BMAP_CHK2: begin
+                    ldf_rem_q <= (ldf_raw_off_q < ldf_samp_q) ? (ldf_samp_q - ldf_raw_off_q) : 32'd0;
+                    rx_state  <= R_LDF_BMAP_CHK3;
+                end
+
+                R_LDF_BMAP_CHK3: begin : ldf_bmap_chk_blk
                     reg [11:0] chunk_b;
-                    raw_off    = {16'd0, ldf_frag_idx} * {16'd0, df_frag_size};
-                    rem_sample = (raw_off < lrx_sample_size[walk_cam_idx]) ?
-                                 (lrx_sample_size[walk_cam_idx] - raw_off) : 32'd0;
-                    chunk_b    = (rem_sample > {16'd0, df_frag_size}) ?
-                                 df_frag_size[11:0] : rem_sample[11:0];
+                    chunk_b    = (ldf_rem_q > {16'd0, df_frag_size}) ?
+                                 df_frag_size[11:0] : ldf_rem_q[11:0];
 
                     bmap_a_addr    <= {walk_cam_idx, ldf_frag_idx[14:5]};
                     ldf_bit_mask   <= (32'd1 << ldf_frag_idx[4:0]);
-                    ldf_ddr_off       <= (ldf_frag_idx == 16'd0) ? 32'd0 : (raw_off - 32'd4);
+                    ldf_ddr_off       <= (ldf_frag_idx == 16'd0) ? 32'd0 : (ldf_raw_off_q - 32'd4);
                     ldf_frag_bytes    <= (ldf_frag_idx == 16'd0) ? (chunk_b - 12'd4) : chunk_b;
                     ldf_bmap_rd_ready <= 1'b0;
                     rx_state          <= R_LDF_BMAP_WAIT;

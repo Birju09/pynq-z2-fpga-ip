@@ -247,6 +247,7 @@ module rtps_tx_engine #(
     reg [31:0] tx_slot_len_lut [0:NUM_ENDPOINTS-1][0:15];
     reg [1:0]  rr_ptr;
     reg [31:0] cur_ltx_total_bytes;
+    reg [31:0] ltx_init_len_q;
 
     // Unpack ring CSRs per endpoint
     wire [31:0] tx_ring_base_ep      [0:NUM_ENDPOINTS-1];
@@ -619,23 +620,33 @@ module rtps_tx_engine #(
                         cur_wr_writer_id <= active_wr_edt[cand][5];
                         cur_wr_reader_id <= active_wr_edt[cand][6];
 
-                        if (!ltx_active[cand]) begin
-                            ltx_active[cand]      <= 1'b1;
-                            if (ltx_cons_idx[cand] == 5'd0)
-                                ltx_slot_base[cand] <= tx_ring_base_ep[cand];
-                            ltx_byte_off[cand]    <= 32'd0;
-                            ltx_total_bytes[cand] <= tx_slot_len_lut[cand][ltx_cons_idx[cand][3:0]] + 32'd4;
-                            ltx_bytes_rem[cand]   <= tx_slot_len_lut[cand][ltx_cons_idx[cand][3:0]] + 32'd4;
-                            ltx_frag_idx[cand]    <= 16'd0;
-                            ltx_seq_num[cand]     <= writer_seq_num[cand];
-                            writer_seq_num[cand]  <= writer_seq_num[cand] + 64'd1;
-                            ltx_ts[cand]          <= active_time_ns + ts_offset;
-                        end
                         ltx_fetch_issued <= 1'b0;
-                        state            <= S_LTX_DDR_FETCH;
+                        state            <= S_LTX_INIT;
                     end else begin
                         state <= S_IDLE;
                     end
+                end
+
+                // Slot init split from S_TX_ARB so the LUT lookup starts from registered cur_wr_slot
+                S_LTX_INIT: begin
+                    ltx_init_len_q <= tx_slot_len_lut[cur_wr_slot][ltx_cons_idx[cur_wr_slot][3:0]] + 32'd4;
+                    state          <= S_LTX_INIT2;
+                end
+
+                S_LTX_INIT2: begin
+                    if (!ltx_active[cur_wr_slot]) begin
+                        ltx_active[cur_wr_slot]      <= 1'b1;
+                        if (ltx_cons_idx[cur_wr_slot] == 5'd0)
+                            ltx_slot_base[cur_wr_slot] <= tx_ring_base_ep[cur_wr_slot];
+                        ltx_byte_off[cur_wr_slot]    <= 32'd0;
+                        ltx_total_bytes[cur_wr_slot] <= ltx_init_len_q;
+                        ltx_bytes_rem[cur_wr_slot]   <= ltx_init_len_q;
+                        ltx_frag_idx[cur_wr_slot]    <= 16'd0;
+                        ltx_seq_num[cur_wr_slot]     <= writer_seq_num[cur_wr_slot];
+                        writer_seq_num[cur_wr_slot]  <= writer_seq_num[cur_wr_slot] + 64'd1;
+                        ltx_ts[cur_wr_slot]          <= active_time_ns + ts_offset;
+                    end
+                    state <= S_LTX_DDR_FETCH;
                 end
 
                 // -------------------------------------------------------------
