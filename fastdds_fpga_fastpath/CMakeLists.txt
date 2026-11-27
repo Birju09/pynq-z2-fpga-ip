@@ -19,9 +19,10 @@ find_package(fastdds 3 REQUIRED)
 
 find_package(Threads REQUIRED)
 
-# FastSample IDL Type Library
+# FastSample & LargeSample5MB IDL Type Library
 add_library(fast_sample_types STATIC
     idl/FastSamplePubSubTypes.cxx
+    idl/LargeSample5MBPubSubTypes.cxx
 )
 target_include_directories(fast_sample_types PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/idl
@@ -30,6 +31,31 @@ target_link_libraries(fast_sample_types PUBLIC
     fastdds
     fastcdr
 )
+
+# Benchmark & Latency Telemetry Library
+add_library(benchmark_telemetry STATIC
+    src/BenchmarkTelemetry.cpp
+)
+target_include_directories(benchmark_telemetry PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_options(benchmark_telemetry PRIVATE -O3 -Wall -Wextra $<$<CXX_COMPILER_ID:GNU>:-Wno-psabi>)
+
+# Pure Software Fast DDS Pub/Sub Session Library
+add_library(pure_dds_session STATIC
+    src/PureDdsSession.cpp
+)
+target_include_directories(pure_dds_session PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/idl
+)
+target_link_libraries(pure_dds_session PUBLIC
+    fast_sample_types
+    fastdds
+    fastcdr
+    Threads::Threads
+)
+target_compile_options(pure_dds_session PRIVATE -O3 -Wall -Wextra $<$<CXX_COMPILER_ID:GNU>:-Wno-psabi>)
 
 # 1. PYNQ-Z2 FPGA Hybrid Fastpath Application (Option 3)
 if(BUILD_FPGA_APP)
@@ -48,6 +74,8 @@ if(BUILD_FPGA_APP)
     )
     target_link_libraries(fpga_fastpath_node PRIVATE
         fast_sample_types
+        benchmark_telemetry
+        pure_dds_session
         fastdds
         fastcdr
         Threads::Threads

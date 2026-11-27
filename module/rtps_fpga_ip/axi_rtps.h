@@ -72,6 +72,41 @@
 #define RTPS_IP_LAST_ICMP_ERR_PORTS_OFFSET    0x1B8 /* Word 110: Offending UDP {src_port[15:0], dst_port[15:0]} */
 #define RTPS_IP_LAST_ICMP_ERR_IP_ID_OFFSET    0x1BC /* Word 111: {16'd0, offending IPv4 Identification} */
 #define RTPS_IP_FRAG_SIZE_OFFSET              0x1C0 /* Word 112: DATA_FRAG fragmentSize in bytes (default 1400) */
+#define RTPS_IP_TX_ACTIVE_WRITER_OFFSET       0x1C4 /* Word 113: [1:0] Active writer slot for <=8KB BRAM TX */
+#define RTPS_IP_LARGE_IRQ_STATUS_OFFSET       0x1C8 /* Word 114: R/W1C [3:0]=ltx_irq, [7:4]=lrx_irq, [11:8]=ovf, [15:12]=to */
+#define RTPS_IP_LARGE_RX_TIMEOUT_OFFSET       0x1CC /* Word 115: Large-sample RX reassembly timeout ticks */
+#define RTPS_IP_BMAP_RD_CTRL_OFFSET           0x1D0 /* Word 116: [1:0]=cam_idx, [11:2]=word_idx for NACK_FRAG hook */
+#define RTPS_IP_BMAP_RD_DATA_OFFSET           0x1D4 /* Word 117: Read-only 32-bit completion bitmap word */
+
+/* Per-Endpoint TX DDR Ring Bank (ep = 0..3, Base 0x300 + ep * 0x20) */
+#define RTPS_TX_RING_BASE(ep)                 (0x300U + ((ep) * 0x20U) + 0x00U)
+#define RTPS_TX_RING_SLOT_SIZE(ep)            (0x300U + ((ep) * 0x20U) + 0x04U)
+#define RTPS_TX_RING_CFG(ep)                  (0x300U + ((ep) * 0x20U) + 0x08U)
+#define RTPS_TX_RING_SUBMIT_LEN(ep)           (0x300U + ((ep) * 0x20U) + 0x0CU)
+#define RTPS_TX_RING_PROD_IDX(ep)             (0x300U + ((ep) * 0x20U) + 0x10U)
+#define RTPS_TX_RING_CONS_IDX(ep)             (0x300U + ((ep) * 0x20U) + 0x14U)
+#define RTPS_TX_RING_STAT_DONE(ep)            (0x300U + ((ep) * 0x20U) + 0x18U)
+
+/* Per-Endpoint RX DDR Ring Bank (ep = 0..3, Base 0x400 + ep * 0x40) */
+#define RTPS_RX_RING_BASE(ep)                 (0x400U + ((ep) * 0x40U) + 0x00U)
+#define RTPS_RX_RING_SLOT_SIZE(ep)            (0x400U + ((ep) * 0x40U) + 0x04U)
+#define RTPS_RX_RING_CFG(ep)                  (0x400U + ((ep) * 0x40U) + 0x08U)
+#define RTPS_RX_RING_PROD_IDX(ep)             (0x400U + ((ep) * 0x40U) + 0x0CU)
+#define RTPS_RX_RING_CONS_IDX(ep)             (0x400U + ((ep) * 0x40U) + 0x10U)
+#define RTPS_RX_RING_COMP_BYTES(ep)           (0x400U + ((ep) * 0x40U) + 0x14U)
+#define RTPS_RX_RING_COMP_SEQ_LO(ep)          (0x400U + ((ep) * 0x40U) + 0x18U)
+#define RTPS_RX_RING_COMP_SEQ_HI(ep)          (0x400U + ((ep) * 0x40U) + 0x1CU)
+#define RTPS_RX_RING_COMP_TS_LO(ep)           (0x400U + ((ep) * 0x40U) + 0x20U)
+#define RTPS_RX_RING_COMP_TS_HI(ep)           (0x400U + ((ep) * 0x40U) + 0x24U)
+#define RTPS_RX_RING_COMP_SRC_IP(ep)          (0x400U + ((ep) * 0x40U) + 0x28U)
+#define RTPS_RX_RING_COMP_PORTS(ep)           (0x400U + ((ep) * 0x40U) + 0x2CU)
+#define RTPS_RX_RING_STAT_DONE(ep)            (0x400U + ((ep) * 0x40U) + 0x30U)
+#define RTPS_RX_RING_STAT_DROPS(ep)           (0x400U + ((ep) * 0x40U) + 0x34U)
+
+#define RTPS_RING_CFG_ENABLE                  (1U << 8)
+#define RTPS_RING_CFG_RESET                   (1U << 9)
+#define RTPS_MAX_RING_DEPTH                   16U
+#define RTPS_SMALL_PATH_MAX_BYTES             8192U
 
 /* =========================================================================
  * Option 1 Hardware RTPS Endpoint Lifecycle States (plan.txt Section 4)
@@ -103,11 +138,14 @@
 #define RTPS_CTRL_PUB_ONLY               (1U << 8) /* Deprecated/ignored: IP is always async */
 #define RTPS_CTRL_SUB_ONLY               (1U << 9) /* Subscribe-only mode: unsolicited wire RX from S_IDLE */
 #define RTPS_CTRL_TX_IP_FRAG_MODE        (1U << 10) /* 0 = DATA_FRAG default, 1 = Legacy IPv4 fragmentation */
+#define RTPS_CTRL_WIRE_SWAP_LOOPBACK     (1U << 11) /* 1 = Zero-BRAM streaming wire-swap loopback (>8KB self-test) */
 
 /* STATUS_ADDR (0x04) Bit Masks */
 #define RTPS_STATUS_ACK_IRQ              (1U << 0) /* Write Bit 0: Acknowledge TX Level-High IRQ */
 #define RTPS_STATUS_KICK_EGRESS          (1U << 1) /* Write Bit 1: Kick S2MM Egress Streaming */
 #define RTPS_STATUS_ACK_RX_IRQ           (1U << 3) /* Write Bit 3: Acknowledge RX Level-High IRQ */
+#define RTPS_STATUS_ACK_LARGE_TX_IRQ     (1U << 4) /* Write Bit 4: Acknowledge all Large TX IRQs */
+#define RTPS_STATUS_ACK_LARGE_RX_IRQ     (1U << 5) /* Write Bit 5: Acknowledge all Large RX IRQs */
 #define RTPS_STATUS_IRQ_MASK             (1U << 0)
 #define RTPS_STATUS_STATE_MASK           0x0000001EU
 #define RTPS_STATUS_ERR_CRC              (1U << 5)
@@ -121,6 +159,8 @@
 #define RTPS_STATUS_WDOG_EXPIRED         (1U << 14)
 #define RTPS_STATUS_LIFECYCLE_OK         (1U << 15)
 #define RTPS_STATUS_RX_SAMPLES_SHIFT     16
+#define RTPS_STATUS_LARGE_TX_IRQ_ANY     (1U << 28)
+#define RTPS_STATUS_LARGE_RX_IRQ_ANY     (1U << 29)
 #define RTPS_STATUS_RX_EGRESS_STATE_SHIFT 30
 #define RTPS_STATUS_RX_EGRESS_STATE_MASK  0xC0000000U
 #define RTPS_STATUS_ERR_ALL_MASK         0x000001E0U
@@ -212,8 +252,10 @@
 #define XAXIDMA_BD_STS_ACTUAL_LEN_MASK   0x007FFFFF
 
 /* MMAP Offsets for TX and RX coherent buffers (Rule 2b) */
-#define AXI_DMA_MMAP_TX_OFFSET           0x00000000
-#define AXI_DMA_MMAP_RX_OFFSET           0x00100000 /* 1MB page offset to map RX buffer */
+#define AXI_DMA_MMAP_TX_OFFSET           0x00000000UL
+#define AXI_DMA_MMAP_RX_OFFSET           0x00100000UL /* 1MB page offset to map small RX buffer */
+#define AXI_DMA_MMAP_TX_RING_OFFSET(ep)  (0x10000000UL + ((unsigned long)(ep) << 26)) /* 64MB window/ep */
+#define AXI_DMA_MMAP_RX_RING_OFFSET(ep)  (0x20000000UL + ((unsigned long)(ep) << 26)) /* 64MB window/ep */
 
 /* =========================================================================
  * Option 1 Hardware RTPS Dedicated Endpoint Structures (plan.txt)
@@ -393,6 +435,43 @@ struct rtps_cycle_diag {
 #define AXI_RTPS_IOC_CONFIGURE_WRITER    _IOW(AXI_RTPS_IOC_MAGIC, 7, struct fpga_writer_endpoint)
 #define AXI_RTPS_IOC_CONFIGURE_READER    _IOW(AXI_RTPS_IOC_MAGIC, 8, struct fpga_reader_endpoint)
 #define AXI_RTPS_IOC_COMMIT_ENDPOINTS    _IOW(AXI_RTPS_IOC_MAGIC, 9, __u32)
+
+/* Adaptive Large-Payload DDR Ring IOCTL Structures (up to 4 Pub / 4 Sub) */
+struct rtps_ring_cfg {
+    __u32 ep_slot;      /* 0..3 */
+    __u32 is_rx;        /* 0 = TX ring, 1 = RX ring */
+    __u32 slot_size;    /* Bytes per slot (rounded up to PAGE_SIZE; 0 = free/disable ring) */
+    __u32 ring_depth;   /* Number of slots (1..16) */
+    __u64 mmap_offset;  /* OUT: offset to pass to mmap() */
+    __u64 mmap_size;    /* OUT: total ring bytes = slot_size * ring_depth */
+};
+
+struct rtps_tx_submit {
+    __u32 writer_slot;   /* 0..3 */
+    __u32 payload_bytes; /* <= 8192 -> BRAM fast path; > 8192 -> TX DDR ring */
+    __u32 ring_slot_idx; /* Ring slot index for > 8192 */
+    __u32 timeout_ms;    /* 0 = default 5000 ms */
+};
+
+struct rtps_rx_take {
+    __u32 reader_slot;   /* 0..3 */
+    __u32 timeout_ms;    /* 0 = default 5000 ms */
+    __u32 is_large_ring; /* OUT: 0 = small rx_buf, 1 = rx_ring[reader_slot] */
+    __u32 ring_slot_idx; /* OUT: completed slot index (when is_large_ring == 1) */
+    __u32 payload_bytes; /* OUT: exact received payload bytes */
+    struct fpga_rx_metadata meta; /* OUT: writerSN, timestamp, src_ip, ports */
+};
+
+struct rtps_rx_release {
+    __u32 reader_slot;   /* 0..3 */
+    __u32 is_large_ring; /* 1 = advance RX_RING_CONS_IDX(reader_slot) */
+    __u32 ring_slot_idx; /* Sanity check against current cons_idx */
+};
+
+#define AXI_RTPS_IOC_CONFIG_RING         _IOWR(AXI_RTPS_IOC_MAGIC, 10, struct rtps_ring_cfg)
+#define AXI_RTPS_IOC_TX_SUBMIT           _IOW(AXI_RTPS_IOC_MAGIC,  11, struct rtps_tx_submit)
+#define AXI_RTPS_IOC_RX_TAKE             _IOWR(AXI_RTPS_IOC_MAGIC, 12, struct rtps_rx_take)
+#define AXI_RTPS_IOC_RX_RELEASE          _IOW(AXI_RTPS_IOC_MAGIC,  13, struct rtps_rx_release)
 
 /* AXI DMA SG Buffer Descriptor Structure (64 bytes aligned) */
 struct axi_dma_bd {

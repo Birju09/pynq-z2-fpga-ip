@@ -505,6 +505,35 @@ struct fpga_fastpath {
     uint32_t                 active_generation;
     uint32_t                 writer_state[RTPS_MAX_ENDPOINTS];
     uint32_t                 reader_state[RTPS_MAX_ENDPOINTS];
+
+    /* Per-Endpoint Adaptive DDR Rings (> 8 KB, up to 4 Pub / 4 Sub) */
+    uint8_t*                 tx_ring_buf[RTPS_MAX_ENDPOINTS];
+    size_t                   tx_ring_mmap_size[RTPS_MAX_ENDPOINTS];
+    uint32_t                 tx_ring_slot_size[RTPS_MAX_ENDPOINTS];
+    uint32_t                 tx_ring_depth[RTPS_MAX_ENDPOINTS];
+    uint32_t                 tx_ring_next_slot[RTPS_MAX_ENDPOINTS];
+
+    uint8_t*                 rx_ring_buf[RTPS_MAX_ENDPOINTS];
+    size_t                   rx_ring_mmap_size[RTPS_MAX_ENDPOINTS];
+    uint32_t                 rx_ring_slot_size[RTPS_MAX_ENDPOINTS];
+    uint32_t                 rx_ring_depth[RTPS_MAX_ENDPOINTS];
+};
+
+struct fpga_tx_loan {
+    void*    ptr;
+    uint32_t writer_slot;
+    uint32_t max_bytes;
+    uint32_t ring_slot_idx;
+    int      is_large_ring;
+};
+
+struct fpga_rx_loan {
+    const void*             payload_ptr;
+    size_t                  payload_bytes;
+    uint32_t                reader_slot;
+    uint32_t                ring_slot_idx;
+    int                     is_large_ring;
+    struct fpga_rx_metadata meta;
 };
 
 static inline int fpga_fastpath_open(
@@ -572,6 +601,12 @@ static inline int fpga_fastpath_open(
 static inline void fpga_fastpath_close(struct fpga_fastpath* fpga) {
     if (!fpga)
         return;
+    for (int i = 0; i < RTPS_MAX_ENDPOINTS; i++) {
+        if (fpga->tx_ring_buf[i] && fpga->tx_ring_buf[i] != MAP_FAILED)
+            munmap(fpga->tx_ring_buf[i], fpga->tx_ring_mmap_size[i]);
+        if (fpga->rx_ring_buf[i] && fpga->rx_ring_buf[i] != MAP_FAILED)
+            munmap(fpga->rx_ring_buf[i], fpga->rx_ring_mmap_size[i]);
+    }
     if (fpga->use_mmap) {
         if (fpga->tx_buf && fpga->tx_buf != MAP_FAILED)
             munmap(fpga->tx_buf, fpga->mmap_size);
@@ -581,6 +616,190 @@ static inline void fpga_fastpath_close(struct fpga_fastpath* fpga) {
     if (fpga->fd >= 0)
         close(fpga->fd);
     free(fpga);
+}
+
+/* =========================================================================
+ * Adaptive Zero-Copy DDR Ring API (<=8KB BRAM / >8KB DDR Ring, 4 Pub/4 Sub)
+ * ========================================================================= */
+static inline int fpga_fastpath_config_tx_ring(
+    struct fpga_fastpath* fpga,
+    uint32_t writer_slot,
+    uint32_t slot_size_bytes,
+    uint32_t ring_depth) {
+    if (!fpga || writer_slot >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+    if (fpga->tx_ring_buf[writer_slot] && fpga->tx_ring_buf[writer_slot] != MAP_FAILED) {
+        munmap(fpga->tx_ring_buf[writer_slot], fpga->tx_ring_mmap_size[writer_slot]);
+        fpga->tx_ring_buf[writer_slot] = NULL;
+    }
+
+    struct rtps_ring_cfg rcfg;
+    memset(&rcfg, 0, sizeof(rcfg));
+    rcfg.ep_slot    = writer_slot;
+    rcfg.is_rx      = 0;
+    rcfg.slot_size  = slot_size_bytes;
+    rcfg.ring_depth = ring_depth;
+    if (ioctl(fpga->fd, AXI_RTPS_IOC_CONFIG_RING, &rcfg) < 0)
+        return -errno;
+
+    if (slot_size_bytes == 0) {
+        fpga->tx_ring_slot_size[writer_slot] = 0;
+        fpga->tx_ring_depth[writer_slot]     = 0;
+        fpga->tx_ring_mmap_size[writer_slot] = 0;
+        return 0;
+    }
+
+    void* p = mmap(NULL, (size_t)rcfg.mmap_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fpga->fd, (off_t)rcfg.mmap_offset);
+    if (p == MAP_FAILED)
+        return -errno;
+
+    fpga->tx_ring_buf[writer_slot]       = (uint8_t*)p;
+    fpga->tx_ring_mmap_size[writer_slot] = (size_t)rcfg.mmap_size;
+    fpga->tx_ring_slot_size[writer_slot] = rcfg.slot_size;
+    fpga->tx_ring_depth[writer_slot]     = rcfg.ring_depth;
+    fpga->tx_ring_next_slot[writer_slot] = 0;
+    return 0;
+}
+
+static inline int fpga_fastpath_config_rx_ring(
+    struct fpga_fastpath* fpga,
+    uint32_t reader_slot,
+    uint32_t slot_size_bytes,
+    uint32_t ring_depth) {
+    if (!fpga || reader_slot >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+    if (fpga->rx_ring_buf[reader_slot] && fpga->rx_ring_buf[reader_slot] != MAP_FAILED) {
+        munmap(fpga->rx_ring_buf[reader_slot], fpga->rx_ring_mmap_size[reader_slot]);
+        fpga->rx_ring_buf[reader_slot] = NULL;
+    }
+
+    struct rtps_ring_cfg rcfg;
+    memset(&rcfg, 0, sizeof(rcfg));
+    rcfg.ep_slot    = reader_slot;
+    rcfg.is_rx      = 1;
+    rcfg.slot_size  = slot_size_bytes;
+    rcfg.ring_depth = ring_depth;
+    if (ioctl(fpga->fd, AXI_RTPS_IOC_CONFIG_RING, &rcfg) < 0)
+        return -errno;
+
+    if (slot_size_bytes == 0) {
+        fpga->rx_ring_slot_size[reader_slot] = 0;
+        fpga->rx_ring_depth[reader_slot]     = 0;
+        fpga->rx_ring_mmap_size[reader_slot] = 0;
+        return 0;
+    }
+
+    void* p = mmap(NULL, (size_t)rcfg.mmap_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fpga->fd, (off_t)rcfg.mmap_offset);
+    if (p == MAP_FAILED)
+        return -errno;
+
+    fpga->rx_ring_buf[reader_slot]       = (uint8_t*)p;
+    fpga->rx_ring_mmap_size[reader_slot] = (size_t)rcfg.mmap_size;
+    fpga->rx_ring_slot_size[reader_slot] = rcfg.slot_size;
+    fpga->rx_ring_depth[reader_slot]     = rcfg.ring_depth;
+    return 0;
+}
+
+static inline int fpga_fastpath_get_tx_loan(
+    struct fpga_fastpath* fpga,
+    uint32_t writer_slot,
+    size_t payload_bytes,
+    struct fpga_tx_loan* loan_out) {
+    if (!fpga || !loan_out || writer_slot >= RTPS_MAX_ENDPOINTS || payload_bytes == 0)
+        return -EINVAL;
+    memset(loan_out, 0, sizeof(*loan_out));
+    loan_out->writer_slot = writer_slot;
+
+    if (payload_bytes <= RTPS_SMALL_PATH_MAX_BYTES) {
+        if (!fpga->use_mmap || !fpga->tx_buf)
+            return -EINVAL;
+        loan_out->ptr           = fpga->tx_buf;
+        loan_out->max_bytes     = RTPS_SMALL_PATH_MAX_BYTES;
+        loan_out->is_large_ring = 0;
+        return 0;
+    }
+
+    if (!fpga->tx_ring_buf[writer_slot] || payload_bytes > fpga->tx_ring_slot_size[writer_slot])
+        return -EMSGSIZE;
+
+    uint32_t slot = fpga->tx_ring_next_slot[writer_slot];
+    fpga->tx_ring_next_slot[writer_slot] = (slot + 1U >= fpga->tx_ring_depth[writer_slot]) ? 0U : (slot + 1U);
+    loan_out->ptr           = fpga->tx_ring_buf[writer_slot] + ((size_t)slot * fpga->tx_ring_slot_size[writer_slot]);
+    loan_out->max_bytes     = fpga->tx_ring_slot_size[writer_slot];
+    loan_out->ring_slot_idx = slot;
+    loan_out->is_large_ring = 1;
+    return 0;
+}
+
+static inline int fpga_fastpath_publish_loan(
+    struct fpga_fastpath* fpga,
+    const struct fpga_tx_loan* loan,
+    uint32_t payload_bytes,
+    uint32_t timeout_ms) {
+    if (!fpga || !loan || payload_bytes == 0)
+        return -EINVAL;
+    struct rtps_tx_submit sub;
+    sub.writer_slot   = loan->writer_slot;
+    sub.payload_bytes = payload_bytes;
+    sub.ring_slot_idx = loan->ring_slot_idx;
+    sub.timeout_ms    = timeout_ms;
+    return (ioctl(fpga->fd, AXI_RTPS_IOC_TX_SUBMIT, &sub) < 0) ? -errno : 0;
+}
+
+static inline int fpga_fastpath_take_loan(
+    struct fpga_fastpath* fpga,
+    uint32_t reader_slot,
+    struct fpga_rx_loan* rx_loan_out,
+    uint32_t timeout_ms) {
+    if (!fpga || !rx_loan_out || reader_slot >= RTPS_MAX_ENDPOINTS)
+        return -EINVAL;
+
+    struct rtps_rx_take tk;
+    memset(&tk, 0, sizeof(tk));
+    tk.reader_slot = reader_slot;
+    tk.timeout_ms  = timeout_ms;
+    if (ioctl(fpga->fd, AXI_RTPS_IOC_RX_TAKE, &tk) < 0)
+        return -errno;
+
+    rx_loan_out->reader_slot   = reader_slot;
+    rx_loan_out->is_large_ring = (int)tk.is_large_ring;
+    rx_loan_out->ring_slot_idx = tk.ring_slot_idx;
+    rx_loan_out->meta          = tk.meta;
+
+    if (tk.is_large_ring) {
+        if (!fpga->rx_ring_buf[reader_slot])
+            return -EINVAL;
+        rx_loan_out->payload_ptr   = fpga->rx_ring_buf[reader_slot] +
+                                     ((size_t)tk.ring_slot_idx * fpga->rx_ring_slot_size[reader_slot]);
+        rx_loan_out->payload_bytes = tk.payload_bytes;
+    } else {
+        const uint8_t* rx_bytes = (const uint8_t*)fpga->rx_buf;
+        rx_loan_out->payload_ptr   = (tk.payload_bytes > RTPS_WIRE_HEADER_BYTES &&
+                                      memcmp(rx_bytes, "RTPS", 4) == 0)
+                                     ? (const void*)(rx_bytes + RTPS_WIRE_HEADER_BYTES)
+                                     : (const void*)rx_bytes;
+        rx_loan_out->payload_bytes = (tk.payload_bytes > RTPS_WIRE_HEADER_BYTES &&
+                                      memcmp(rx_bytes, "RTPS", 4) == 0)
+                                     ? (tk.payload_bytes - RTPS_WIRE_HEADER_BYTES)
+                                     : tk.payload_bytes;
+    }
+    return 0;
+}
+
+static inline int fpga_fastpath_release_loan(
+    struct fpga_fastpath* fpga,
+    const struct fpga_rx_loan* rx_loan) {
+    if (!fpga || !rx_loan)
+        return -EINVAL;
+    if (!rx_loan->is_large_ring)
+        return 0;
+    struct rtps_rx_release rel;
+    rel.reader_slot   = rx_loan->reader_slot;
+    rel.is_large_ring = 1;
+    rel.ring_slot_idx = rx_loan->ring_slot_idx;
+    return (ioctl(fpga->fd, AXI_RTPS_IOC_RX_RELEASE, &rel) < 0) ? -errno : 0;
 }
 
 static inline int fpga_configure_writer(

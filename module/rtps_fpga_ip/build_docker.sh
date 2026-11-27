@@ -40,7 +40,7 @@ docker run --rm \
     -v "${RTPS_HDL_DIR}:/rtps" \
     -w "/rtps/sim" \
     "${IMAGE_NAME}" \
-    bash -c "iverilog -g2012 -o sim_arp.vvp ../icmp_engine.v ../arp_reply_generator.v tb_arp_reply_generator.v && vvp sim_arp.vvp && rm -f sim_arp.vvp && iverilog -g2012 -I .. -o sim_rtps.vvp ../rtps_peer_emulator.v ../rtps_csr_edt.v ../rtps_wire_mux.v ../rtps_tx_csum_pipe.v ../rtps_tx_engine.v ../rtps_rx_reasm.v ../rtps_s2mm_egress.v ../rtps_fastpath_ip.v tb_rtps_fastpath.v && vvp sim_rtps.vvp && rm -f sim_rtps.vvp"
+    bash -c "iverilog -g2012 -o sim_arp.vvp ../icmp_engine.v ../arp_reply_generator.v tb_arp_reply_generator.v && vvp sim_arp.vvp && rm -f sim_arp.vvp && iverilog -g2012 -I .. -o sim_rtps.vvp ../rtps_peer_emulator.v ../rtps_csr_edt.v ../rtps_wire_mux.v ../rtps_tx_csum_pipe.v ../rtps_ddr_dma_engine.v ../rtps_tx_engine.v ../rtps_rx_reasm.v ../rtps_s2mm_egress.v ../rtps_fastpath_ip.v tb_rtps_fastpath.v && vvp sim_rtps.vvp && rm -f sim_rtps.vvp"
 
 echo "===> [2/2] Running ARM Kernel Module & RTPS Transport Cross-Compilation..."
 docker run --rm \

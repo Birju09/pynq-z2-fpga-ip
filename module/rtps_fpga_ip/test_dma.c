@@ -1051,6 +1051,165 @@ static int run_async_pubsub_benchmark(NDDS_Transport_Plugin* plugin, int fd, int
     return 0;
 }
 
+struct adaptive_ep_arg {
+    struct fpga_fastpath* fpga;
+    uint32_t              ep_idx;
+    uint32_t              payload_bytes;
+    int                   iterations;
+    int                   errors;
+    double                avg_mbps;
+};
+
+static void* adaptive_sub_thread(void* arg) {
+    struct adaptive_ep_arg* a = (struct adaptive_ep_arg*)arg;
+    struct fpga_rx_loan rx_loan;
+    int it;
+    uint32_t w, words = a->payload_bytes / 4U;
+
+    memset(&rx_loan, 0, sizeof(rx_loan));
+
+    for (it = 0; it < a->iterations; it++) {
+        if (fpga_fastpath_take_loan(a->fpga, a->ep_idx, &rx_loan, 10000) != 0) {
+            fprintf(stderr, "[-] Sub[%u] iter %d: take_loan failed: %s\n",
+                    a->ep_idx, it, strerror(errno));
+            a->errors++;
+            break;
+        }
+        if (rx_loan.payload_bytes != a->payload_bytes) {
+            fprintf(stderr, "[-] Sub[%u] iter %d: size mismatch exp=%u got=%zu\n",
+                    a->ep_idx, it, a->payload_bytes, rx_loan.payload_bytes);
+            a->errors++;
+        } else {
+            const uint32_t* p = (const uint32_t*)rx_loan.payload_ptr;
+            uint32_t seed = ((a->ep_idx + 1U) << 24) ^ (uint32_t)(it + 1);
+            for (w = 0; w < words; w++) {
+                uint32_t exp_w = seed ^ (w * 0x00010003U);
+                if (p[w] != exp_w) {
+                    fprintf(stderr, "[-] Sub[%u] iter %d word %u mismatch: exp=0x%08x got=0x%08x\n",
+                            a->ep_idx, it, w, exp_w, p[w]);
+                    a->errors++;
+                    break;
+                }
+            }
+        }
+        fpga_fastpath_release_loan(a->fpga, &rx_loan);
+    }
+    return NULL;
+}
+
+static void* adaptive_pub_thread(void* arg) {
+    struct adaptive_ep_arg* a = (struct adaptive_ep_arg*)arg;
+    struct fpga_tx_loan tx_loan;
+    struct timespec t0, t1;
+    double total_s = 0.0;
+    int it;
+    uint32_t w, words = a->payload_bytes / 4U;
+
+    for (it = 0; it < a->iterations; it++) {
+        if (fpga_fastpath_get_tx_loan(a->fpga, a->ep_idx, a->payload_bytes, &tx_loan) != 0) {
+            fprintf(stderr, "[-] Pub[%u] iter %d: get_tx_loan failed\n", a->ep_idx, it);
+            a->errors++;
+            break;
+        }
+        uint32_t* p = (uint32_t*)tx_loan.ptr;
+        uint32_t seed = ((a->ep_idx + 1U) << 24) ^ (uint32_t)(it + 1);
+        for (w = 0; w < words; w++) {
+            p[w] = seed ^ (w * 0x00010003U);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (fpga_fastpath_publish_loan(a->fpga, &tx_loan, a->payload_bytes, 10000) != 0) {
+            fprintf(stderr, "[-] Pub[%u] iter %d: publish_loan failed: %s\n",
+                    a->ep_idx, it, strerror(errno));
+            a->errors++;
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        total_s += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    }
+    if (total_s > 0.0)
+        a->avg_mbps = ((double)a->payload_bytes * a->iterations) / (total_s * 1024.0 * 1024.0);
+    return NULL;
+}
+
+static int run_adaptive_ring_test(int iterations, uint32_t large_bytes,
+                                  uint32_t ring_depth, int multi_ep, int enable_peer_emu) {
+    struct fpga_fastpath* fpga = NULL;
+    struct adaptive_ep_arg pub_args[RTPS_MAX_ENDPOINTS], sub_args[RTPS_MAX_ENDPOINTS];
+    pthread_t pub_th[RTPS_MAX_ENDPOINTS], sub_th[RTPS_MAX_ENDPOINTS];
+    int ep, total_err = 0;
+
+    if (multi_ep < 1) multi_ep = 1;
+    if (multi_ep > RTPS_MAX_ENDPOINTS) multi_ep = RTPS_MAX_ENDPOINTS;
+
+    if (fpga_fastpath_open(DEVICE_PATH, 1, &fpga) < 0) {
+        perror("fpga_fastpath_open");
+        return 1;
+    }
+
+    fpga->cfg.enable_peer_emu = enable_peer_emu ? 1 : 0;
+    fpga->cfg.num_writers     = (uint8_t)multi_ep;
+    for (ep = 0; ep < multi_ep; ep++) {
+        struct fpga_writer_endpoint wr;
+        struct fpga_reader_endpoint rd;
+        memset(&wr, 0, sizeof(wr));
+        wr.slot_idx         = (uint32_t)ep;
+        wr.lifecycle_state  = FPGA_LIFECYCLE_ACTIVE;
+        wr.payload_words    = (large_bytes <= RTPS_SMALL_PATH_MAX_BYTES) ? (large_bytes / 4U) : RTPS_FAST_SAMPLE_WORDS;
+        wr.dst_ip           = 0xC0A8010A;
+        wr.src_port         = (uint16_t)(7411 + ep * 2);
+        wr.dst_port         = (uint16_t)(7410 + ep * 2);
+        wr.writer_entity_id = 0x00000102U + (uint32_t)ep;
+        wr.generation       = 1;
+        fpga_configure_writer(fpga, &wr);
+
+        memset(&rd, 0, sizeof(rd));
+        rd.slot_idx                = (uint32_t)ep;
+        rd.lifecycle_state         = FPGA_LIFECYCLE_ACTIVE;
+        rd.expected_dst_port       = wr.dst_port;
+        rd.remote_writer_entity_id = wr.writer_entity_id;
+        rd.local_reader_entity_id  = 0x00000207U + (uint32_t)ep;
+        fpga_configure_reader(fpga, &rd);
+
+        if (large_bytes > RTPS_SMALL_PATH_MAX_BYTES) {
+            if (fpga_fastpath_config_tx_ring(fpga, (uint32_t)ep, large_bytes, ring_depth) < 0 ||
+                fpga_fastpath_config_rx_ring(fpga, (uint32_t)ep, large_bytes, ring_depth) < 0) {
+                perror("fpga_fastpath_config_ring");
+                fpga_fastpath_close(fpga);
+                return 1;
+            }
+        }
+    }
+    fpga_commit_endpoints(fpga, 1);
+
+    printf("[*] Adaptive Zero-Copy Test: %d ep(s), %u bytes/sample (%s), ring_depth=%u, iters=%d\n",
+           multi_ep, large_bytes,
+           (large_bytes > RTPS_SMALL_PATH_MAX_BYTES) ? "DDR Ring" : "BRAM Fast-Path",
+           ring_depth, iterations);
+
+    for (ep = 0; ep < multi_ep; ep++) {
+        memset(&pub_args[ep], 0, sizeof(pub_args[ep]));
+        memset(&sub_args[ep], 0, sizeof(sub_args[ep]));
+        pub_args[ep].fpga          = fpga;
+        pub_args[ep].ep_idx        = (uint32_t)ep;
+        pub_args[ep].payload_bytes = large_bytes;
+        pub_args[ep].iterations    = iterations;
+        sub_args[ep]               = pub_args[ep];
+        pthread_create(&sub_th[ep], NULL, adaptive_sub_thread, &sub_args[ep]);
+        pthread_create(&pub_th[ep], NULL, adaptive_pub_thread, &pub_args[ep]);
+    }
+
+    for (ep = 0; ep < multi_ep; ep++) {
+        pthread_join(pub_th[ep], NULL);
+        pthread_join(sub_th[ep], NULL);
+        printf("    EP[%d]: TX avg = %.2f MB/s, pub_err=%d, sub_err=%d\n",
+               ep, pub_args[ep].avg_mbps, pub_args[ep].errors, sub_args[ep].errors);
+        total_err += pub_args[ep].errors + sub_args[ep].errors;
+    }
+
+    fpga_fastpath_close(fpga);
+    return (total_err == 0) ? 0 : 1;
+}
+
 int main(int argc, char* argv[]) {
     int fd;
     NDDS_Transport_Plugin plugin;
@@ -1068,6 +1227,9 @@ int main(int argc, char* argv[]) {
     int fastpath_mode = 0; /* Option 1 dedicated hardware RTPS endpoint mode */
     int async_mode = 1;    /* Default: True Asynchronous 1-2 kHz Pub/Sub benchmark */
     int target_rate_hz = 1000; /* Default 1000 Hz (1 kHz) */
+    uint32_t large_bytes = 0;
+    uint32_t ring_depth = 4;
+    int multi_ep = 1;
     int enable_peer_emu = 1; /* 1 = Internal Hardware Peer Emulator, 0 = Physical Ethernet Wire (LAN8720) */
     uint32_t peer_mac_lo = 0x5E200002U;
     uint16_t peer_mac_hi = 0x0002U;
@@ -1100,6 +1262,9 @@ int main(int argc, char* argv[]) {
             printf("  --wire                 Use Physical Ethernet Wire (LAN8720 PHY, disables internal emulator)\n");
             printf("  --async                Enable True Asynchronous 1 kHz - 2 kHz Pub/Sub Pipeline\n");
             printf("  --rate HZ              Target publish rate in Hz for --async mode (e.g. 1000, 2000)\n");
+            printf("  --large-bytes N        Run adaptive zero-copy ring test with N-byte payload (e.g. 10485760)\n");
+            printf("  --ring-depth K         Per-endpoint DDR ring depth (1..16, default: 4)\n");
+            printf("  --multi-ep M           Number of concurrent Pub/Sub endpoints (1..4, default: 1)\n");
             printf("  --peer-mac MAC         Destination Peer MAC address (e.g. c8:a3:62:30:54:90 or ff:ff:ff:ff:ff:ff)\n");
             printf("  --emulation            Enable hardware RTI Peer Emulator (default)\n");
             printf("  -v, --verbose          Print per-iteration hardware emulation and phase timing\n");
@@ -1140,6 +1305,12 @@ int main(int argc, char* argv[]) {
             }
         } else if (strcmp(argv[arg_i], "--emulation") == 0) {
             enable_peer_emu = 1;
+        } else if (strcmp(argv[arg_i], "--large-bytes") == 0 && arg_i + 1 < argc) {
+            large_bytes = (uint32_t)strtoul(argv[++arg_i], NULL, 0);
+        } else if (strcmp(argv[arg_i], "--ring-depth") == 0 && arg_i + 1 < argc) {
+            ring_depth = (uint32_t)atoi(argv[++arg_i]);
+        } else if (strcmp(argv[arg_i], "--multi-ep") == 0 && arg_i + 1 < argc) {
+            multi_ep = atoi(argv[++arg_i]);
         } else if (argv[arg_i][0] != '-') {
             /* Fallback to positional parsing */
             if (arg_i == 1) {
@@ -1160,6 +1331,10 @@ int main(int argc, char* argv[]) {
     if (!enable_peer_emu && !peer_mac_explicit) {
         peer_mac_lo = 0;
         peer_mac_hi = 0;
+    }
+
+    if (large_bytes > 0) {
+        return run_adaptive_ring_test(iterations, large_bytes, ring_depth, multi_ep, enable_peer_emu);
     }
 
     if (fastpath_mode) {

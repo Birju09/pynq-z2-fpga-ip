@@ -19,6 +19,7 @@ module rtps_wire_mux #(
 
     // Control & Emulator Configuration
     input  wire                  emu_enable,
+    input  wire                  wire_swap_loopback,
     input  wire [31:0]           fault_inject_reg,
     input  wire                  tx_ip_frag_mode,
     input  wire [15:0]           cfg_frag_size,
@@ -57,18 +58,29 @@ module rtps_wire_mux #(
     wire                  emu_tx_tready;
 
     // Engine words are network-order; the 8<->32 converters are LSB-first.
-    assign m_axis_wire_tdata  = {eng_tx_tdata[7:0], eng_tx_tdata[15:8], eng_tx_tdata[23:16], eng_tx_tdata[31:24]};
-    assign m_axis_wire_tvalid = emu_enable ? 1'b0 : eng_tx_tvalid;
-    assign m_axis_wire_tlast  = eng_tx_tlast;
-    assign eng_tx_tready      = emu_enable ? emu_tx_tready : m_axis_wire_tready;
+    // When wire_swap_loopback == 1 (and emu_enable == 0), loop eng_tx directly
+    // back to eng_rx through the 1-stage skid buffer (zero BRAM, 100+ MB ready).
+    wire use_wire_loop = !emu_enable && wire_swap_loopback;
 
-    // AXI4-Stream 1-stage skid buffer on s_axis_wire to isolate external FIFO timing
+    assign m_axis_wire_tdata  = {eng_tx_tdata[7:0], eng_tx_tdata[15:8], eng_tx_tdata[23:16], eng_tx_tdata[31:24]};
+    assign m_axis_wire_tvalid = (emu_enable || wire_swap_loopback) ? 1'b0 : eng_tx_tvalid;
+    assign m_axis_wire_tlast  = eng_tx_tlast;
+
+    // AXI4-Stream 1-stage skid buffer on s_axis_wire (or loopback TX)
     reg                   wire_in_valid, wire_skid_valid;
     reg  [DATA_WIDTH-1:0] wire_in_data,  wire_skid_data;
     reg                   wire_in_last,  wire_skid_last;
 
-    wire wire_in_accept = !emu_enable && s_axis_wire_tvalid && !wire_skid_valid;
+    wire [DATA_WIDTH-1:0] ext_in_data  = use_wire_loop ? eng_tx_tdata  : s_axis_wire_tdata;
+    wire                  ext_in_valid = use_wire_loop ? eng_tx_tvalid : s_axis_wire_tvalid;
+    wire                  ext_in_last  = use_wire_loop ? eng_tx_tlast  : s_axis_wire_tlast;
+
+    wire wire_in_accept = !emu_enable && ext_in_valid && !wire_skid_valid;
     wire wire_out_fire  = !emu_enable && wire_in_valid && eng_rx_tready;
+
+    assign eng_tx_tready = emu_enable         ? emu_tx_tready :
+                           wire_swap_loopback ? !wire_skid_valid :
+                                                m_axis_wire_tready;
 
     always @(posedge clk) begin
         if (!rst_n_local) begin
@@ -82,12 +94,12 @@ module rtps_wire_mux #(
             if (wire_in_accept) begin
                 if (!wire_in_valid || wire_out_fire) begin
                     wire_in_valid <= 1'b1;
-                    wire_in_data  <= s_axis_wire_tdata;
-                    wire_in_last  <= s_axis_wire_tlast;
+                    wire_in_data  <= ext_in_data;
+                    wire_in_last  <= ext_in_last;
                 end else begin
                     wire_skid_valid <= 1'b1;
-                    wire_skid_data  <= s_axis_wire_tdata;
-                    wire_skid_last  <= s_axis_wire_tlast;
+                    wire_skid_data  <= ext_in_data;
+                    wire_skid_last  <= ext_in_last;
                 end
             end else if (wire_out_fire) begin
                 if (wire_skid_valid) begin
@@ -102,12 +114,13 @@ module rtps_wire_mux #(
         end
     end
 
-    assign eng_rx_tdata       = emu_enable ? emu_rx_tdata  :
+    assign eng_rx_tdata       = emu_enable    ? emu_rx_tdata  :
+                                use_wire_loop ? wire_in_data  :
                                 {wire_in_data[7:0], wire_in_data[15:8], wire_in_data[23:16], wire_in_data[31:24]};
     assign eng_rx_tvalid      = emu_enable ? emu_rx_tvalid : wire_in_valid;
     assign eng_rx_tlast       = emu_enable ? emu_rx_tlast  : wire_in_last;
     assign emu_rx_tready      = emu_enable ? eng_rx_tready : 1'b0;
-    assign s_axis_wire_tready = emu_enable ? 1'b1          : !wire_skid_valid;
+    assign s_axis_wire_tready = (emu_enable || wire_swap_loopback) ? 1'b1 : !wire_skid_valid;
 
     rtps_peer_emulator #(
         .DATA_WIDTH  (DATA_WIDTH),

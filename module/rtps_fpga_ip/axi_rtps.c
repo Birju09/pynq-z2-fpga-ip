@@ -25,6 +25,23 @@ MODULE_DESCRIPTION(
     "Hybrid PS+PL RTPS v2.x Cyclic Fast-Path & RTI Transport Plugin DMA Driver for PYNQ-Z2");
 MODULE_VERSION("1.0");
 
+struct rtps_ddr_ring {
+    void*       buf;
+    dma_addr_t  phys;
+    size_t      total_size;
+    u32         slot_size;
+    u32         depth;
+    u32         cons_idx;
+    bool        active;
+    struct file* owner_file;
+};
+
+struct axi_rtps_file_ctx {
+    struct axi_rtps_dev* dev;
+    u8 owned_tx_rings;
+    u8 owned_rx_rings;
+};
+
 struct axi_rtps_dev {
     dev_t dev_num;
     struct cdev cdev;
@@ -62,6 +79,16 @@ struct axi_rtps_dev {
     wait_queue_head_t rx_waitq;     /* Woken when S2MM DMA IOC/error IRQ completes */
     wait_queue_head_t tx_ip_waitq;  /* Woken when PL TX FSM finishes wire TX & raises tx_done_irq */
     wait_queue_head_t rx_packet_waitq; /* Woken when PL RX egress FSM has a sample ready (rx_done_irq) */
+
+    /* Per-Endpoint Adaptive DDR Rings (up to 4 Pub / 4 Sub) */
+    struct mutex             ring_cfg_lock;
+    struct mutex             ep_tx_lock[RTPS_MAX_ENDPOINTS];
+    struct mutex             ep_rx_lock[RTPS_MAX_ENDPOINTS];
+    wait_queue_head_t        large_tx_waitq[RTPS_MAX_ENDPOINTS];
+    wait_queue_head_t        sub_rx_waitq[RTPS_MAX_ENDPOINTS];
+    struct rtps_ddr_ring     tx_rings[RTPS_MAX_ENDPOINTS];
+    struct rtps_ddr_ring     rx_rings[RTPS_MAX_ENDPOINTS];
+    atomic_t                 open_count;
     volatile int tx_in_flight;      /* 1 while MM2S DMA burst is active (guards S2MM reset fallback) */
     int tx_done;                    /* 1 when MM2S DMA transfer has completed */
     int rx_done;                    /* 1 when S2MM DMA transfer has completed */
@@ -313,18 +340,42 @@ static irqreturn_t axi_rtps_dma_rx_isr(int irq, void* dev_id) {
 static irqreturn_t axi_rtps_ip_isr(int irq, void* dev_id) {
     struct axi_rtps_dev* dev = (struct axi_rtps_dev*)dev_id;
     u32 ip_status;
+    u32 large_irq = 0;
     int ack_polls;
     u32 post_ack;
     bool is_rx;
     bool is_tx;
     u32 ack_bits;
+    int ep;
 
     if (!dev->ip_regs)
         return IRQ_NONE;
 
     ip_status = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-    if (!(ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK)))
+    if (ip_status & (RTPS_STATUS_LARGE_TX_IRQ_ANY | RTPS_STATUS_LARGE_RX_IRQ_ANY)) {
+        large_irq = ioread32(dev->ip_regs + RTPS_IP_LARGE_IRQ_STATUS_OFFSET);
+    }
+
+    if (!(ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK)) &&
+        !(large_irq & 0xFFU))
         return IRQ_NONE;
+
+    if (large_irq & 0xFFU) {
+        iowrite32(large_irq & 0xFFU, dev->ip_regs + RTPS_IP_LARGE_IRQ_STATUS_OFFSET);
+        (void)ioread32(dev->ip_regs + RTPS_IP_LARGE_IRQ_STATUS_OFFSET);
+        for (ep = 0; ep < RTPS_MAX_ENDPOINTS; ep++) {
+            if (large_irq & (1U << ep)) {
+                wake_up_interruptible(&dev->large_tx_waitq[ep]);
+            }
+            if (large_irq & (1U << (ep + 4))) {
+                wake_up_interruptible(&dev->sub_rx_waitq[ep]);
+            }
+        }
+        if (!(ip_status & (RTPS_STATUS_IRQ_MASK | RTPS_STATUS_ERR_ALL_MASK))) {
+            dev->irq_cnt_ip++;
+            return IRQ_HANDLED;
+        }
+    }
 
     is_rx = (ip_status & RTPS_STATUS_IRQ_IS_RX) != 0;
     is_tx = (((ip_status & RTPS_STATUS_STATE_MASK) >> 1) == 5) ||
@@ -373,9 +424,14 @@ static irqreturn_t axi_rtps_ip_isr(int irq, void* dev_id) {
     return IRQ_HANDLED;
 }
 
+static long axi_rtps_handle_ring_ioctls(struct file* file, unsigned int cmd, unsigned long arg);
+static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count, loff_t* ppos);
+static ssize_t axi_rtps_write(struct file* file, const char __user* buf, size_t count, loff_t* ppos);
+
 static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
                                     unsigned long arg) {
-    struct axi_rtps_dev* dev = file->private_data;
+    struct axi_rtps_file_ctx* fctx = file->private_data;
+    struct axi_rtps_dev* dev = fctx->dev;
     u32 val;
     u32 ctrl_word;
     struct rtps_endpoint_cfg cfg;
@@ -749,54 +805,358 @@ static long axi_rtps_unlocked_ioctl(struct file* file, unsigned int cmd,
         }
 
         default:
-            return -ENOTTY;
+            return axi_rtps_handle_ring_ioctls(file, cmd, arg);
+    }
+}
+
+static void axi_rtps_free_ring_locked(struct axi_rtps_dev* dev, u32 ep, bool is_rx) {
+    struct rtps_ddr_ring* r = is_rx ? &dev->rx_rings[ep] : &dev->tx_rings[ep];
+    if (dev->ip_regs) {
+        if (is_rx) {
+            iowrite32(RTPS_RING_CFG_RESET, dev->ip_regs + RTPS_RX_RING_CFG(ep));
+            iowrite32(0, dev->ip_regs + RTPS_RX_RING_BASE(ep));
+            iowrite32(0, dev->ip_regs + RTPS_RX_RING_SLOT_SIZE(ep));
+        } else {
+            iowrite32(RTPS_RING_CFG_RESET, dev->ip_regs + RTPS_TX_RING_CFG(ep));
+            iowrite32(0, dev->ip_regs + RTPS_TX_RING_BASE(ep));
+            iowrite32(0, dev->ip_regs + RTPS_TX_RING_SLOT_SIZE(ep));
+        }
+    }
+    if (r->buf) {
+        dma_free_coherent(&dev->pdev->dev, r->total_size, r->buf, r->phys);
+        r->buf = NULL;
+    }
+    r->phys = 0;
+    r->total_size = 0;
+    r->slot_size = 0;
+    r->depth = 0;
+    r->cons_idx = 0;
+    r->active = false;
+    r->owner_file = NULL;
+}
+
+static long axi_rtps_handle_ring_ioctls(struct file* file, unsigned int cmd,
+                                        unsigned long arg) {
+    struct axi_rtps_file_ctx* fctx = file->private_data;
+    struct axi_rtps_dev* dev = fctx->dev;
+
+    switch (cmd) {
+        case AXI_RTPS_IOC_CONFIG_RING: {
+            struct rtps_ring_cfg rcfg;
+            struct rtps_ddr_ring* r;
+            size_t total;
+            u32 slot_sz;
+
+            if (copy_from_user(&rcfg, (void __user*)arg, sizeof(rcfg)))
+                return -EFAULT;
+            if (rcfg.ep_slot >= RTPS_MAX_ENDPOINTS)
+                return -EINVAL;
+            if (rcfg.slot_size != 0 && (rcfg.ring_depth == 0 || rcfg.ring_depth > RTPS_MAX_RING_DEPTH))
+                return -EINVAL;
+
+            mutex_lock(&dev->ring_cfg_lock);
+            r = rcfg.is_rx ? &dev->rx_rings[rcfg.ep_slot] : &dev->tx_rings[rcfg.ep_slot];
+            if (r->active && r->owner_file && r->owner_file != file) {
+                mutex_unlock(&dev->ring_cfg_lock);
+                return -EBUSY;
+            }
+
+            /* Free any existing ring on this endpoint first */
+            axi_rtps_free_ring_locked(dev, rcfg.ep_slot, rcfg.is_rx != 0);
+            if (rcfg.is_rx)
+                fctx->owned_rx_rings &= ~(1U << rcfg.ep_slot);
+            else
+                fctx->owned_tx_rings &= ~(1U << rcfg.ep_slot);
+
+            if (rcfg.slot_size == 0) {
+                rcfg.mmap_offset = 0;
+                rcfg.mmap_size = 0;
+                mutex_unlock(&dev->ring_cfg_lock);
+                if (copy_to_user((void __user*)arg, &rcfg, sizeof(rcfg)))
+                    return -EFAULT;
+                return 0;
+            }
+
+            slot_sz = PAGE_ALIGN(rcfg.slot_size);
+            total = (size_t)slot_sz * (size_t)rcfg.ring_depth;
+            r->buf = dma_alloc_coherent(&dev->pdev->dev, total, &r->phys, GFP_KERNEL);
+            if (!r->buf) {
+                mutex_unlock(&dev->ring_cfg_lock);
+                return -ENOMEM;
+            }
+            r->total_size = total;
+            r->slot_size = slot_sz;
+            r->depth = rcfg.ring_depth;
+            r->cons_idx = 0;
+            r->active = true;
+            r->owner_file = file;
+
+            if (rcfg.is_rx) {
+                fctx->owned_rx_rings |= (1U << rcfg.ep_slot);
+                iowrite32((u32)r->phys, dev->ip_regs + RTPS_RX_RING_BASE(rcfg.ep_slot));
+                iowrite32(slot_sz, dev->ip_regs + RTPS_RX_RING_SLOT_SIZE(rcfg.ep_slot));
+                iowrite32(RTPS_RING_CFG_ENABLE | RTPS_RING_CFG_RESET | rcfg.ring_depth,
+                          dev->ip_regs + RTPS_RX_RING_CFG(rcfg.ep_slot));
+                iowrite32(0, dev->ip_regs + RTPS_RX_RING_CONS_IDX(rcfg.ep_slot));
+                rcfg.mmap_offset = AXI_DMA_MMAP_RX_RING_OFFSET(rcfg.ep_slot);
+            } else {
+                fctx->owned_tx_rings |= (1U << rcfg.ep_slot);
+                iowrite32((u32)r->phys, dev->ip_regs + RTPS_TX_RING_BASE(rcfg.ep_slot));
+                iowrite32(slot_sz, dev->ip_regs + RTPS_TX_RING_SLOT_SIZE(rcfg.ep_slot));
+                iowrite32(RTPS_RING_CFG_ENABLE | RTPS_RING_CFG_RESET | rcfg.ring_depth,
+                          dev->ip_regs + RTPS_TX_RING_CFG(rcfg.ep_slot));
+                rcfg.mmap_offset = AXI_DMA_MMAP_TX_RING_OFFSET(rcfg.ep_slot);
+            }
+            rcfg.slot_size = slot_sz;
+            rcfg.mmap_size = total;
+            mutex_unlock(&dev->ring_cfg_lock);
+
+            if (copy_to_user((void __user*)arg, &rcfg, sizeof(rcfg)))
+                return -EFAULT;
+            return 0;
+        }
+
+        case AXI_RTPS_IOC_TX_SUBMIT: {
+            struct rtps_tx_submit sub;
+            unsigned long tout;
+            long wret;
+
+            if (copy_from_user(&sub, (void __user*)arg, sizeof(sub)))
+                return -EFAULT;
+            if (sub.writer_slot >= RTPS_MAX_ENDPOINTS || sub.payload_bytes == 0 || (sub.payload_bytes & 3U))
+                return -EINVAL;
+
+            tout = msecs_to_jiffies(sub.timeout_ms ? sub.timeout_ms : 5000U);
+
+            if (sub.payload_bytes <= RTPS_SMALL_PATH_MAX_BYTES) {
+                /* Adaptive Small Path (<= 8 KB): route through existing MM2S -> BRAM */
+                if (mutex_lock_interruptible(&dev->tx_lock))
+                    return -ERESTARTSYS;
+                iowrite32(sub.writer_slot, dev->ip_regs + RTPS_IP_TX_ACTIVE_WRITER_OFFSET);
+                mutex_unlock(&dev->tx_lock);
+                {
+                    ssize_t w = axi_rtps_write(file, (const char __user*)dev->tx_user_addr,
+                                               sub.payload_bytes, NULL);
+                    return (w < 0) ? (long)w : 0;
+                }
+            } else {
+                struct rtps_ddr_ring* r = &dev->tx_rings[sub.writer_slot];
+                u32 prod, next_prod, cons;
+
+                if (mutex_lock_interruptible(&dev->ep_tx_lock[sub.writer_slot]))
+                    return -ERESTARTSYS;
+                if (!r->active || sub.payload_bytes > r->slot_size) {
+                    mutex_unlock(&dev->ep_tx_lock[sub.writer_slot]);
+                    return -EINVAL;
+                }
+                prod = ioread32(dev->ip_regs + RTPS_TX_RING_PROD_IDX(sub.writer_slot));
+                next_prod = (prod + 1U >= r->depth) ? 0U : (prod + 1U);
+                /* Wait if ring is full */
+                wret = wait_event_interruptible_timeout(
+                    dev->large_tx_waitq[sub.writer_slot],
+                    ioread32(dev->ip_regs + RTPS_TX_RING_CONS_IDX(sub.writer_slot)) != next_prod,
+                    tout);
+                if (wret <= 0) {
+                    mutex_unlock(&dev->ep_tx_lock[sub.writer_slot]);
+                    return (wret == 0) ? -ETIMEDOUT : wret;
+                }
+                wmb();
+                iowrite32(sub.payload_bytes, dev->ip_regs + RTPS_TX_RING_SUBMIT_LEN(sub.writer_slot));
+                wmb();
+                iowrite32(next_prod, dev->ip_regs + RTPS_TX_RING_PROD_IDX(sub.writer_slot));
+
+                /* Wait for complete-payload IRQ (cons_idx catches up to next_prod) */
+                wret = wait_event_interruptible_timeout(
+                    dev->large_tx_waitq[sub.writer_slot],
+                    (cons = ioread32(dev->ip_regs + RTPS_TX_RING_CONS_IDX(sub.writer_slot))) == next_prod,
+                    tout);
+                mutex_unlock(&dev->ep_tx_lock[sub.writer_slot]);
+                if (wret == 0)
+                    return -ETIMEDOUT;
+                if (wret < 0)
+                    return wret;
+                return 0;
+            }
+        }
+
+        case AXI_RTPS_IOC_RX_TAKE: {
+            struct rtps_rx_take tk;
+            struct rtps_ddr_ring* r;
+            unsigned long tout;
+            long wret;
+
+            if (copy_from_user(&tk, (void __user*)arg, sizeof(tk)))
+                return -EFAULT;
+            if (tk.reader_slot >= RTPS_MAX_ENDPOINTS)
+                return -EINVAL;
+
+            r = &dev->rx_rings[tk.reader_slot];
+            tout = msecs_to_jiffies(tk.timeout_ms ? tk.timeout_ms : 5000U);
+
+            if (mutex_lock_interruptible(&dev->ep_rx_lock[tk.reader_slot]))
+                return -ERESTARTSYS;
+
+            if (r->active) {
+                wret = wait_event_interruptible_timeout(
+                    dev->sub_rx_waitq[tk.reader_slot],
+                    (ioread32(dev->ip_regs + RTPS_RX_RING_PROD_IDX(tk.reader_slot)) != r->cons_idx) ||
+                    READ_ONCE(dev->rx_packet_avail),
+                    tout);
+                if (wret == 0) {
+                    mutex_unlock(&dev->ep_rx_lock[tk.reader_slot]);
+                    return -ETIMEDOUT;
+                }
+                if (wret < 0) {
+                    mutex_unlock(&dev->ep_rx_lock[tk.reader_slot]);
+                    return wret;
+                }
+
+                if (ioread32(dev->ip_regs + RTPS_RX_RING_PROD_IDX(tk.reader_slot)) != r->cons_idx) {
+                    u32 ports_w = ioread32(dev->ip_regs + RTPS_RX_RING_COMP_PORTS(tk.reader_slot));
+                    rmb();
+                    tk.is_large_ring = 1;
+                    tk.ring_slot_idx = r->cons_idx;
+                    tk.payload_bytes = ioread32(dev->ip_regs + RTPS_RX_RING_COMP_BYTES(tk.reader_slot));
+                    tk.meta.reader_slot = tk.reader_slot;
+                    tk.meta.writer_sequence_number =
+                        ((u64)ioread32(dev->ip_regs + RTPS_RX_RING_COMP_SEQ_HI(tk.reader_slot)) << 32) |
+                        ioread32(dev->ip_regs + RTPS_RX_RING_COMP_SEQ_LO(tk.reader_slot));
+                    tk.meta.source_timestamp =
+                        ((u64)ioread32(dev->ip_regs + RTPS_RX_RING_COMP_TS_HI(tk.reader_slot)) << 32) |
+                        ioread32(dev->ip_regs + RTPS_RX_RING_COMP_TS_LO(tk.reader_slot));
+                    tk.meta.source_ipv4 = ioread32(dev->ip_regs + RTPS_RX_RING_COMP_SRC_IP(tk.reader_slot));
+                    tk.meta.source_udp_port = (u16)(ports_w >> 16);
+                    tk.meta.destination_udp_port = (u16)(ports_w & 0xFFFFU);
+                    tk.meta.flags = 0;
+                    mutex_unlock(&dev->ep_rx_lock[tk.reader_slot]);
+                    if (copy_to_user((void __user*)arg, &tk, sizeof(tk)))
+                        return -EFAULT;
+                    return 0;
+                }
+            }
+            mutex_unlock(&dev->ep_rx_lock[tk.reader_slot]);
+
+            /* Fallback / Small BRAM path (<= 8 KB) */
+            {
+                ssize_t nr = axi_rtps_read(file, (char __user*)dev->rx_user_addr, RTPS_FULL_MSG_BYTES, NULL);
+                if (nr < 0)
+                    return (long)nr;
+                tk.is_large_ring = 0;
+                tk.ring_slot_idx = 0;
+                tk.payload_bytes = (u32)nr;
+                tk.meta.reader_slot = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_META_OFFSET) & 0x03U;
+                tk.meta.writer_sequence_number =
+                    ((u64)ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SEQ_HI_OFFSET) << 32) |
+                    ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SEQ_LO_OFFSET);
+                tk.meta.source_timestamp =
+                    ((u64)ioread32(dev->ip_regs + RTPS_IP_LAST_RX_TS_HI_OFFSET) << 32) |
+                    ioread32(dev->ip_regs + RTPS_IP_LAST_RX_TS_LO_OFFSET);
+                tk.meta.source_ipv4 = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_SRC_IP_OFFSET);
+                {
+                    u32 pw = ioread32(dev->ip_regs + RTPS_IP_LAST_RX_PORTS_OFFSET);
+                    tk.meta.source_udp_port = (u16)(pw >> 16);
+                    tk.meta.destination_udp_port = (u16)(pw & 0xFFFFU);
+                }
+                tk.meta.flags = 0;
+                if (copy_to_user((void __user*)arg, &tk, sizeof(tk)))
+                    return -EFAULT;
+                return 0;
+            }
+        }
+
+        case AXI_RTPS_IOC_RX_RELEASE: {
+            struct rtps_rx_release rel;
+            struct rtps_ddr_ring* r;
+
+            if (copy_from_user(&rel, (void __user*)arg, sizeof(rel)))
+                return -EFAULT;
+            if (rel.reader_slot >= RTPS_MAX_ENDPOINTS)
+                return -EINVAL;
+            if (!rel.is_large_ring)
+                return 0;
+
+            r = &dev->rx_rings[rel.reader_slot];
+            mutex_lock(&dev->ep_rx_lock[rel.reader_slot]);
+            if (r->active && rel.ring_slot_idx == r->cons_idx) {
+                r->cons_idx = (r->cons_idx + 1U >= r->depth) ? 0U : (r->cons_idx + 1U);
+                iowrite32(r->cons_idx, dev->ip_regs + RTPS_RX_RING_CONS_IDX(rel.reader_slot));
+            }
+            mutex_unlock(&dev->ep_rx_lock[rel.reader_slot]);
+            return 0;
+        }
+
+        default:
+            return axi_rtps_handle_ring_ioctls(file, cmd, arg);
     }
 }
 
 static int axi_rtps_open(struct inode* inode, struct file* file) {
     struct axi_rtps_dev* dev = &rtps_device;
-    file->private_data = dev;
-    dev->crc_err        = 0;
-    dev->no_match_err   = 0;
-    dev->csum_err       = 0;
-    dev->tx_err         = 0;
-    dev->rx_err         = 0;
-    dev->rx_packet_avail= 0;
-    dev->tx_ip_done     = 1; /* Ready for first write() */
-    dev->tx_in_flight   = 0;
-    dev->bypass_crc     = 1;
+    struct axi_rtps_file_ctx* fctx;
 
-    if (dev->ip_regs) {
-        u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-        u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
-        u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
-        iowrite32(1, dev->ip_regs + RTPS_IP_WDOG_HEARTBEAT_OFFSET);
-        if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
-            /* Single write to TRIGGER_OFFSET resets non-IDLE FSMs back to IDLE */
-            iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+    fctx = kzalloc(sizeof(*fctx), GFP_KERNEL);
+    if (!fctx)
+        return -ENOMEM;
+    fctx->dev = dev;
+    file->private_data = fctx;
+
+    if (atomic_inc_return(&dev->open_count) == 1) {
+        dev->crc_err        = 0;
+        dev->no_match_err   = 0;
+        dev->csum_err       = 0;
+        dev->tx_err         = 0;
+        dev->rx_err         = 0;
+        dev->rx_packet_avail= 0;
+        dev->tx_ip_done     = 1; /* Ready for first write() */
+        dev->tx_in_flight   = 0;
+        dev->bypass_crc     = 1;
+
+        if (dev->ip_regs) {
+            u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+            u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+            u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
+            iowrite32(1, dev->ip_regs + RTPS_IP_WDOG_HEARTBEAT_OFFSET);
+            if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
+                iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+            }
         }
     }
     return 0;
 }
 
 static int axi_rtps_release(struct inode* inode, struct file* file) {
-    struct axi_rtps_dev* dev = file->private_data;
+    struct axi_rtps_file_ctx* fctx = file->private_data;
+    struct axi_rtps_dev* dev = fctx ? fctx->dev : NULL;
+    int ep;
+
     if (dev) {
-        dev->tx_user_addr = 0;
-        dev->rx_user_addr = 0;
-        dev->tx_in_flight = 0;
-        if (dev->ip_regs) {
-            u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
-            u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
-            u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
-            if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
-                iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
-            }
+        mutex_lock(&dev->ring_cfg_lock);
+        for (ep = 0; ep < RTPS_MAX_ENDPOINTS; ep++) {
+            if (fctx->owned_tx_rings & (1U << ep))
+                axi_rtps_free_ring_locked(dev, ep, false);
+            if (fctx->owned_rx_rings & (1U << ep))
+                axi_rtps_free_ring_locked(dev, ep, true);
         }
-        mutex_lock(&dev->dma_hw_lock);
-        axi_dma_reset(dev);
-        mutex_unlock(&dev->dma_hw_lock);
+        mutex_unlock(&dev->ring_cfg_lock);
+
+        if (atomic_dec_and_test(&dev->open_count)) {
+            dev->tx_user_addr = 0;
+            dev->rx_user_addr = 0;
+            dev->tx_in_flight = 0;
+            if (dev->ip_regs) {
+                u32 st = ioread32(dev->ip_regs + RTPS_IP_STATUS_OFFSET);
+                u8 cur_state = (st & RTPS_STATUS_STATE_MASK) >> 1;
+                u8 rx_egress_st = (st & RTPS_STATUS_RX_EGRESS_STATE_MASK) >> RTPS_STATUS_RX_EGRESS_STATE_SHIFT;
+                if (cur_state != 0 || rx_egress_st != RTPS_RX_EGRESS_IDLE) {
+                    iowrite32(1, dev->ip_regs + RTPS_IP_TRIGGER_OFFSET);
+                }
+            }
+            mutex_lock(&dev->dma_hw_lock);
+            axi_dma_reset(dev);
+            mutex_unlock(&dev->dma_hw_lock);
+        }
     }
+    kfree(fctx);
     return 0;
 }
 
@@ -885,7 +1245,8 @@ static void axi_rtps_check_learned_macs(struct axi_rtps_dev* dev) {
  */
 static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
                              loff_t* ppos) {
-    struct axi_rtps_dev* dev = file->private_data;
+    struct axi_rtps_file_ctx* fctx = file->private_data;
+    struct axi_rtps_dev* dev = fctx->dev;
     size_t transfer_len;
     long ret;
     u32 rx_bytes;
@@ -1160,7 +1521,8 @@ static ssize_t axi_rtps_read(struct file* file, char __user* buf, size_t count,
  */
 static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
                               size_t count, loff_t* ppos) {
-    struct axi_rtps_dev* dev = file->private_data;
+    struct axi_rtps_file_ctx* fctx = file->private_data;
+    struct axi_rtps_dev* dev = fctx->dev;
     size_t transfer_len;
     size_t num_words;
     u32 crc;
@@ -1335,31 +1697,47 @@ static ssize_t axi_rtps_write(struct file* file, const char __user* buf,
     return transfer_len;
 }
 
-/* Rule 2b: MMAP Interface: Map TX or RX coherent DMA buffer directly to user space */
+/* Rule 2b: MMAP Interface: Map small TX/RX or per-endpoint DDR rings directly to user space */
 static int axi_rtps_mmap(struct file* file, struct vm_area_struct* vma) {
-    struct axi_rtps_dev* dev = file->private_data;
+    struct axi_rtps_file_ctx* fctx = file->private_data;
+    struct axi_rtps_dev* dev = fctx->dev;
     unsigned long size = vma->vm_end - vma->vm_start;
-    unsigned long rx_pgoff = AXI_DMA_MMAP_RX_OFFSET >> PAGE_SHIFT;
+    unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+    int ep;
 
-    if (size > XAXIDMA_DEFAULT_BUF_SIZE) {
-        dev_err(&dev->pdev->dev, "mmap: requested size %lu exceeds buffer size %u\n",
-                size, XAXIDMA_DEFAULT_BUF_SIZE);
-        return -EINVAL;
-    }
-
-    if (vma->vm_pgoff == (AXI_DMA_MMAP_TX_OFFSET >> PAGE_SHIFT)) {
+    if (offset == AXI_DMA_MMAP_TX_OFFSET) {
+        if (size > XAXIDMA_DEFAULT_BUF_SIZE)
+            return -EINVAL;
         dev->tx_user_addr = vma->vm_start;
         return dma_mmap_coherent(&dev->pdev->dev, vma, dev->tx_buf,
                                  dev->tx_buf_phys, XAXIDMA_DEFAULT_BUF_SIZE);
-    } else if (vma->vm_pgoff == rx_pgoff) {
+    } else if (offset == AXI_DMA_MMAP_RX_OFFSET) {
+        if (size > XAXIDMA_DEFAULT_BUF_SIZE)
+            return -EINVAL;
         dev->rx_user_addr = vma->vm_start;
         vma->vm_pgoff = 0;
         return dma_mmap_coherent(&dev->pdev->dev, vma, dev->rx_buf,
                                  dev->rx_buf_phys, XAXIDMA_DEFAULT_BUF_SIZE);
     }
 
-    dev_err(&dev->pdev->dev, "mmap: invalid offset 0x%lx\n",
-            vma->vm_pgoff << PAGE_SHIFT);
+    for (ep = 0; ep < RTPS_MAX_ENDPOINTS; ep++) {
+        if (offset == AXI_DMA_MMAP_TX_RING_OFFSET(ep)) {
+            struct rtps_ddr_ring* r = &dev->tx_rings[ep];
+            if (!r->active || size > r->total_size)
+                return -EINVAL;
+            vma->vm_pgoff = 0;
+            return dma_mmap_coherent(&dev->pdev->dev, vma, r->buf, r->phys, r->total_size);
+        }
+        if (offset == AXI_DMA_MMAP_RX_RING_OFFSET(ep)) {
+            struct rtps_ddr_ring* r = &dev->rx_rings[ep];
+            if (!r->active || size > r->total_size)
+                return -EINVAL;
+            vma->vm_pgoff = 0;
+            return dma_mmap_coherent(&dev->pdev->dev, vma, r->buf, r->phys, r->total_size);
+        }
+    }
+
+    dev_err(&dev->pdev->dev, "mmap: invalid offset 0x%lx\n", offset);
     return -EINVAL;
 }
 
@@ -1425,10 +1803,21 @@ static int axi_rtps_probe(struct platform_device* pdev) {
     mutex_init(&dmadev->tx_lock);
     mutex_init(&dmadev->rx_lock);
     mutex_init(&dmadev->dma_hw_lock);
+    mutex_init(&dmadev->ring_cfg_lock);
+    atomic_set(&dmadev->open_count, 0);
     init_waitqueue_head(&dmadev->tx_waitq);
     init_waitqueue_head(&dmadev->rx_waitq);
     init_waitqueue_head(&dmadev->tx_ip_waitq);
     init_waitqueue_head(&dmadev->rx_packet_waitq);
+    {
+        int ep_i;
+        for (ep_i = 0; ep_i < RTPS_MAX_ENDPOINTS; ep_i++) {
+            mutex_init(&dmadev->ep_tx_lock[ep_i]);
+            mutex_init(&dmadev->ep_rx_lock[ep_i]);
+            init_waitqueue_head(&dmadev->large_tx_waitq[ep_i]);
+            init_waitqueue_head(&dmadev->sub_rx_waitq[ep_i]);
+        }
+    }
 
     res0 = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res0) {

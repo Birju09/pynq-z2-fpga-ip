@@ -21,8 +21,8 @@ module rtps_fastpath_ip #(
     parameter integer DATA_WIDTH        = 32,
     parameter integer BRAM_DEPTH        = 2048,
     parameter integer ADDR_WIDTH        = 11,
-    parameter integer CFG_DEPTH         = 256,
-    parameter integer CFG_ADDR_WIDTH    = 8,
+    parameter integer CFG_DEPTH         = 1024,
+    parameter integer CFG_ADDR_WIDTH    = 10,
     parameter integer NUM_ENDPOINTS     = 4,
     parameter integer REASM_DEPTH       = 1536,
     parameter integer CLK_PERIOD_NS     = 10,
@@ -108,7 +108,48 @@ module rtps_fastpath_ip #(
     input  wire [31:0]               icmp_err_info,
     input  wire [31:0]               icmp_err_dst_ip,
     input  wire [31:0]               icmp_err_ports,
-    input  wire [15:0]               icmp_err_ip_id
+    input  wire [15:0]               icmp_err_ip_id,
+
+    // -------------------------------------------------------------------------
+    // 8. AXI4 Full Master Interface (m_axi_ddr -> Zynq S_AXI_HP1 for >8KB Rings)
+    // -------------------------------------------------------------------------
+    output wire [0:0]                m_axi_ddr_awid,
+    output wire [31:0]               m_axi_ddr_awaddr,
+    output wire [7:0]                m_axi_ddr_awlen,
+    output wire [2:0]                m_axi_ddr_awsize,
+    output wire [1:0]                m_axi_ddr_awburst,
+    output wire                      m_axi_ddr_awlock,
+    output wire [3:0]                m_axi_ddr_awcache,
+    output wire [2:0]                m_axi_ddr_awprot,
+    output wire [3:0]                m_axi_ddr_awqos,
+    output wire                      m_axi_ddr_awvalid,
+    input  wire                      m_axi_ddr_awready,
+    output wire [DATA_WIDTH-1:0]     m_axi_ddr_wdata,
+    output wire [3:0]                m_axi_ddr_wstrb,
+    output wire                      m_axi_ddr_wlast,
+    output wire                      m_axi_ddr_wvalid,
+    input  wire                      m_axi_ddr_wready,
+    input  wire [0:0]                m_axi_ddr_bid,
+    input  wire [1:0]                m_axi_ddr_bresp,
+    input  wire                      m_axi_ddr_bvalid,
+    output wire                      m_axi_ddr_bready,
+    output wire [0:0]                m_axi_ddr_arid,
+    output wire [31:0]               m_axi_ddr_araddr,
+    output wire [7:0]                m_axi_ddr_arlen,
+    output wire [2:0]                m_axi_ddr_arsize,
+    output wire [1:0]                m_axi_ddr_arburst,
+    output wire                      m_axi_ddr_arlock,
+    output wire [3:0]                m_axi_ddr_arcache,
+    output wire [2:0]                m_axi_ddr_arprot,
+    output wire [3:0]                m_axi_ddr_arqos,
+    output wire                      m_axi_ddr_arvalid,
+    input  wire                      m_axi_ddr_arready,
+    input  wire [0:0]                m_axi_ddr_rid,
+    input  wire [DATA_WIDTH-1:0]     m_axi_ddr_rdata,
+    input  wire [1:0]                m_axi_ddr_rresp,
+    input  wire                      m_axi_ddr_rlast,
+    input  wire                      m_axi_ddr_rvalid,
+    output wire                      m_axi_ddr_rready
 );
 
     `include "rtps_fastpath_defs.vh"
@@ -155,14 +196,71 @@ module rtps_fastpath_ip #(
     wire [31:0]                   wr0_reader_id;
     wire [NUM_ENDPOINTS-1:0]      wr_valid_vec;
     wire [NUM_ENDPOINTS*32-1:0]   wr_seq_seed_flat;
+    wire [NUM_ENDPOINTS*8*32-1:0] wr_edt_flat;
     wire [NUM_ENDPOINTS*7*32-1:0] rd_edt_flat;
+
+    // Adaptive Large-Payload DDR Ring & AXI4 Master Interconnect Wires
+    wire [1:0]                    tx_active_writer;
+    wire [31:0]                   large_rx_timeout_limit;
+    wire [11:0]                   bmap_rd_ctrl;
+    wire [31:0]                   bmap_rd_data;
+
+    wire [NUM_ENDPOINTS*32-1:0]   tx_ring_base_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   tx_ring_slot_size_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   tx_ring_cfg_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   tx_ring_submit_len_flat;
+    wire [NUM_ENDPOINTS*5-1:0]    tx_ring_prod_idx_flat;
+    wire [NUM_ENDPOINTS-1:0]      tx_ring_doorbell_pulse;
+    wire [NUM_ENDPOINTS-1:0]      tx_ring_reset_pulse;
+    wire [NUM_ENDPOINTS*5-1:0]    tx_ring_cons_idx_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   tx_ring_stat_done_flat;
+
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_base_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_slot_size_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_cfg_flat;
+    wire [NUM_ENDPOINTS*5-1:0]    rx_ring_cons_idx_flat;
+    wire [NUM_ENDPOINTS-1:0]      rx_ring_reset_pulse;
+    wire [NUM_ENDPOINTS*5-1:0]    rx_ring_prod_idx_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_comp_bytes_flat;
+    wire [NUM_ENDPOINTS*64-1:0]   rx_ring_comp_seq_flat;
+    wire [NUM_ENDPOINTS*64-1:0]   rx_ring_comp_ts_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_comp_src_ip_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_comp_ports_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_stat_done_flat;
+    wire [NUM_ENDPOINTS*32-1:0]   rx_ring_stat_drops_flat;
+
+    wire [NUM_ENDPOINTS-1:0]      large_tx_done_irq_vec;
+    wire [NUM_ENDPOINTS-1:0]      large_rx_done_irq_vec;
+    wire [NUM_ENDPOINTS-1:0]      large_rx_overflow_vec;
+    wire [NUM_ENDPOINTS-1:0]      large_rx_timeout_vec;
+    wire [NUM_ENDPOINTS-1:0]      large_tx_irq_ack_pulse;
+    wire [NUM_ENDPOINTS-1:0]      large_rx_irq_ack_pulse;
+
+    wire                          ddr_rd_req_valid;
+    wire [31:0]                   ddr_rd_req_addr;
+    wire [9:0]                    ddr_rd_req_words;
+    wire                          ddr_rd_data_valid;
+    wire [31:0]                   ddr_rd_data_word;
+    wire [9:0]                    ddr_rd_data_idx;
+    wire                          ddr_rd_done_pulse;
+    wire [15:0]                   ddr_rd_csum_fold;
+    wire                          ddr_rd_resp_err;
+
+    wire                          ddr_wr_req_valid;
+    wire [31:0]                   ddr_wr_req_addr;
+    wire [9:0]                    ddr_wr_req_words;
+    wire [8:0]                    ddr_wr_pkt_base_word;
+    wire [8:0]                    ddr_wr_pkt_rd_addr;
+    wire [31:0]                   ddr_wr_pkt_rd_data;
+    wire                          ddr_wr_done_pulse;
+    wire                          ddr_wr_resp_err;
 
     wire [3:0]                    state;
     wire [1:0]                    rx_egress_state;
     wire                          egress_active;
     wire                          tx_done_irq;
     wire                          rx_done_irq;
-    assign ip_done_irq = tx_done_irq | rx_done_irq;
+    assign ip_done_irq = tx_done_irq | rx_done_irq | (|large_tx_done_irq_vec) | (|large_rx_done_irq_vec);
     wire [5:0]                    rx_state;
     wire [31:0]                   crc_accum;
     wire [31:0]                   last_cycle_ticks;
@@ -359,7 +457,40 @@ module rtps_fastpath_ip #(
         .wr0_reader_id            (wr0_reader_id),
         .wr_valid_vec             (wr_valid_vec),
         .wr_seq_seed_flat         (wr_seq_seed_flat),
+        .wr_edt_flat              (wr_edt_flat),
         .rd_edt_flat              (rd_edt_flat),
+        .tx_active_writer         (tx_active_writer),
+        .large_rx_timeout_limit   (large_rx_timeout_limit),
+        .bmap_rd_ctrl             (bmap_rd_ctrl),
+        .bmap_rd_data             (bmap_rd_data),
+        .tx_ring_base_flat        (tx_ring_base_flat),
+        .tx_ring_slot_size_flat   (tx_ring_slot_size_flat),
+        .tx_ring_cfg_flat         (tx_ring_cfg_flat),
+        .tx_ring_submit_len_flat  (tx_ring_submit_len_flat),
+        .tx_ring_prod_idx_flat    (tx_ring_prod_idx_flat),
+        .tx_ring_doorbell_pulse   (tx_ring_doorbell_pulse),
+        .tx_ring_reset_pulse      (tx_ring_reset_pulse),
+        .tx_ring_cons_idx_flat    (tx_ring_cons_idx_flat),
+        .tx_ring_stat_done_flat   (tx_ring_stat_done_flat),
+        .rx_ring_base_flat        (rx_ring_base_flat),
+        .rx_ring_slot_size_flat   (rx_ring_slot_size_flat),
+        .rx_ring_cfg_flat         (rx_ring_cfg_flat),
+        .rx_ring_cons_idx_flat    (rx_ring_cons_idx_flat),
+        .rx_ring_reset_pulse      (rx_ring_reset_pulse),
+        .rx_ring_prod_idx_flat    (rx_ring_prod_idx_flat),
+        .rx_ring_comp_bytes_flat  (rx_ring_comp_bytes_flat),
+        .rx_ring_comp_seq_flat    (rx_ring_comp_seq_flat),
+        .rx_ring_comp_ts_flat     (rx_ring_comp_ts_flat),
+        .rx_ring_comp_src_ip_flat (rx_ring_comp_src_ip_flat),
+        .rx_ring_comp_ports_flat  (rx_ring_comp_ports_flat),
+        .rx_ring_stat_done_flat   (rx_ring_stat_done_flat),
+        .rx_ring_stat_drops_flat  (rx_ring_stat_drops_flat),
+        .large_tx_done_irq_vec    (large_tx_done_irq_vec),
+        .large_rx_done_irq_vec    (large_rx_done_irq_vec),
+        .large_rx_overflow_vec    (large_rx_overflow_vec),
+        .large_rx_timeout_vec     (large_rx_timeout_vec),
+        .large_tx_irq_ack_pulse   (large_tx_irq_ack_pulse),
+        .large_rx_irq_ack_pulse   (large_rx_irq_ack_pulse),
         .state                    (state),
         .rx_egress_state          (rx_egress_state),
         .crc_accum                (crc_accum),
@@ -401,6 +532,7 @@ module rtps_fastpath_ip #(
         .clk                (clk),
         .rst_n_local        (rst_n_local),
         .emu_enable         (ctrl_reg[4]),
+        .wire_swap_loopback (ctrl_reg[11]),
         .fault_inject_reg   (fault_inject_reg),
         .tx_ip_frag_mode    (ctrl_reg[10]),
         .cfg_frag_size      (cfg_frag_size[15:0]),
@@ -459,14 +591,31 @@ module rtps_fastpath_ip #(
         .trigger_detected         (trigger_detected),
         .edt_commit_applied       (edt_commit_applied),
         .identity_clear_seq_pulse (identity_clear_seq_pulse),
-        .wr0_dst_ip               (wr0_dst_ip),
-        .wr0_src_port             (wr0_src_port),
-        .wr0_dst_port             (wr0_dst_port),
+        .wr_edt_flat              (wr_edt_flat),
         .wr0_dst_mac              (wr0_dst_mac),
-        .wr0_writer_id            (wr0_writer_id),
-        .wr0_reader_id            (wr0_reader_id),
         .wr_valid_vec             (wr_valid_vec),
         .wr_seq_seed_flat         (wr_seq_seed_flat),
+        .tx_active_writer         (tx_active_writer),
+        .tx_ring_base_flat        (tx_ring_base_flat),
+        .tx_ring_slot_size_flat   (tx_ring_slot_size_flat),
+        .tx_ring_cfg_flat         (tx_ring_cfg_flat),
+        .tx_ring_submit_len_flat  (tx_ring_submit_len_flat),
+        .tx_ring_prod_idx_flat    (tx_ring_prod_idx_flat),
+        .tx_ring_doorbell_pulse   (tx_ring_doorbell_pulse),
+        .tx_ring_reset_pulse      (tx_ring_reset_pulse),
+        .tx_ring_cons_idx_flat    (tx_ring_cons_idx_flat),
+        .tx_ring_stat_done_flat   (tx_ring_stat_done_flat),
+        .large_tx_irq_ack_pulse   (large_tx_irq_ack_pulse),
+        .large_tx_done_irq_vec    (large_tx_done_irq_vec),
+        .ddr_rd_req_valid         (ddr_rd_req_valid),
+        .ddr_rd_req_addr          (ddr_rd_req_addr),
+        .ddr_rd_req_words         (ddr_rd_req_words),
+        .ddr_rd_data_valid        (ddr_rd_data_valid),
+        .ddr_rd_data_word         (ddr_rd_data_word),
+        .ddr_rd_data_idx          (ddr_rd_data_idx),
+        .ddr_rd_done_pulse        (ddr_rd_done_pulse),
+        .ddr_rd_csum_fold         (ddr_rd_csum_fold),
+        .ddr_rd_resp_err          (ddr_rd_resp_err),
         .rx_csum_err_pulse        (rx_csum_err_pulse),
         .ip_done_irq              (tx_done_irq),
         .state                    (state),
@@ -518,7 +667,98 @@ module rtps_fastpath_ip #(
         .last_rx_dst_port         (last_rx_dst_port),
         .last_rx_cam_idx          (last_rx_cam_idx),
         .last_rx_src_mac          (last_rx_src_mac),
-        .rd_match_count_flat      (rd_match_count_flat)
+        .rd_match_count_flat      (rd_match_count_flat),
+        .large_rx_timeout_limit   (large_rx_timeout_limit),
+        .bmap_rd_ctrl             (bmap_rd_ctrl),
+        .bmap_rd_data             (bmap_rd_data),
+        .rx_ring_base_flat        (rx_ring_base_flat),
+        .rx_ring_slot_size_flat   (rx_ring_slot_size_flat),
+        .rx_ring_cfg_flat         (rx_ring_cfg_flat),
+        .rx_ring_cons_idx_flat    (rx_ring_cons_idx_flat),
+        .rx_ring_reset_pulse      (rx_ring_reset_pulse),
+        .rx_ring_prod_idx_flat    (rx_ring_prod_idx_flat),
+        .rx_ring_comp_bytes_flat  (rx_ring_comp_bytes_flat),
+        .rx_ring_comp_seq_flat    (rx_ring_comp_seq_flat),
+        .rx_ring_comp_ts_flat     (rx_ring_comp_ts_flat),
+        .rx_ring_comp_src_ip_flat (rx_ring_comp_src_ip_flat),
+        .rx_ring_comp_ports_flat  (rx_ring_comp_ports_flat),
+        .rx_ring_stat_done_flat   (rx_ring_stat_done_flat),
+        .rx_ring_stat_drops_flat  (rx_ring_stat_drops_flat),
+        .large_rx_irq_ack_pulse   (large_rx_irq_ack_pulse),
+        .large_rx_done_irq_vec    (large_rx_done_irq_vec),
+        .large_rx_overflow_vec    (large_rx_overflow_vec),
+        .large_rx_timeout_vec     (large_rx_timeout_vec),
+        .ddr_wr_req_valid         (ddr_wr_req_valid),
+        .ddr_wr_req_addr          (ddr_wr_req_addr),
+        .ddr_wr_req_words         (ddr_wr_req_words),
+        .ddr_wr_pkt_base_word     (ddr_wr_pkt_base_word),
+        .ddr_wr_pkt_rd_addr       (ddr_wr_pkt_rd_addr),
+        .ddr_wr_pkt_rd_data       (ddr_wr_pkt_rd_data),
+        .ddr_wr_done_pulse        (ddr_wr_done_pulse),
+        .ddr_wr_resp_err          (ddr_wr_resp_err)
+    );
+
+    rtps_ddr_dma_engine #(
+        .DATA_WIDTH    (DATA_WIDTH),
+        .ADDR_WIDTH    (32),
+        .MAX_BURST_LEN (32)
+    ) u_ddr_dma_engine (
+        .clk                  (clk),
+        .rst_n_local          (rst_n_local),
+        .rd_req_valid         (ddr_rd_req_valid),
+        .rd_req_addr          (ddr_rd_req_addr),
+        .rd_req_words         (ddr_rd_req_words),
+        .rd_data_valid        (ddr_rd_data_valid),
+        .rd_data_word         (ddr_rd_data_word),
+        .rd_data_idx          (ddr_rd_data_idx),
+        .rd_done_pulse        (ddr_rd_done_pulse),
+        .rd_csum_fold         (ddr_rd_csum_fold),
+        .rd_resp_err          (ddr_rd_resp_err),
+        .wr_req_valid         (ddr_wr_req_valid),
+        .wr_req_addr          (ddr_wr_req_addr),
+        .wr_req_words         (ddr_wr_req_words),
+        .wr_pkt_base_word     (ddr_wr_pkt_base_word),
+        .wr_pkt_rd_addr       (ddr_wr_pkt_rd_addr),
+        .wr_pkt_rd_data       (ddr_wr_pkt_rd_data),
+        .wr_done_pulse        (ddr_wr_done_pulse),
+        .wr_resp_err          (ddr_wr_resp_err),
+        .m_axi_ddr_awid       (m_axi_ddr_awid),
+        .m_axi_ddr_awaddr     (m_axi_ddr_awaddr),
+        .m_axi_ddr_awlen      (m_axi_ddr_awlen),
+        .m_axi_ddr_awsize     (m_axi_ddr_awsize),
+        .m_axi_ddr_awburst    (m_axi_ddr_awburst),
+        .m_axi_ddr_awlock     (m_axi_ddr_awlock),
+        .m_axi_ddr_awcache    (m_axi_ddr_awcache),
+        .m_axi_ddr_awprot     (m_axi_ddr_awprot),
+        .m_axi_ddr_awqos      (m_axi_ddr_awqos),
+        .m_axi_ddr_awvalid    (m_axi_ddr_awvalid),
+        .m_axi_ddr_awready    (m_axi_ddr_awready),
+        .m_axi_ddr_wdata      (m_axi_ddr_wdata),
+        .m_axi_ddr_wstrb      (m_axi_ddr_wstrb),
+        .m_axi_ddr_wlast      (m_axi_ddr_wlast),
+        .m_axi_ddr_wvalid     (m_axi_ddr_wvalid),
+        .m_axi_ddr_wready     (m_axi_ddr_wready),
+        .m_axi_ddr_bid        (m_axi_ddr_bid),
+        .m_axi_ddr_bresp      (m_axi_ddr_bresp),
+        .m_axi_ddr_bvalid     (m_axi_ddr_bvalid),
+        .m_axi_ddr_bready     (m_axi_ddr_bready),
+        .m_axi_ddr_arid       (m_axi_ddr_arid),
+        .m_axi_ddr_araddr     (m_axi_ddr_araddr),
+        .m_axi_ddr_arlen      (m_axi_ddr_arlen),
+        .m_axi_ddr_arsize     (m_axi_ddr_arsize),
+        .m_axi_ddr_arburst    (m_axi_ddr_arburst),
+        .m_axi_ddr_arlock     (m_axi_ddr_arlock),
+        .m_axi_ddr_arcache    (m_axi_ddr_arcache),
+        .m_axi_ddr_arprot     (m_axi_ddr_arprot),
+        .m_axi_ddr_arqos      (m_axi_ddr_arqos),
+        .m_axi_ddr_arvalid    (m_axi_ddr_arvalid),
+        .m_axi_ddr_arready    (m_axi_ddr_arready),
+        .m_axi_ddr_rid        (m_axi_ddr_rid),
+        .m_axi_ddr_rdata      (m_axi_ddr_rdata),
+        .m_axi_ddr_rresp      (m_axi_ddr_rresp),
+        .m_axi_ddr_rlast      (m_axi_ddr_rlast),
+        .m_axi_ddr_rvalid     (m_axi_ddr_rvalid),
+        .m_axi_ddr_rready     (m_axi_ddr_rready)
     );
 
     // S2MM Egress: stream full RTPS wire message starting at "RTPS" magic (Word 2)

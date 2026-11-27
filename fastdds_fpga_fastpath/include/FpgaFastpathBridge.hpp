@@ -57,36 +57,13 @@
 #include "rtps_fpga_transport.h"
 #undef FastSample
 
+#include "BridgeConfig.hpp"
 #include "FastSample.hpp"
 #include "FastSamplePubSubTypes.hpp"
+#include "LargeSample5MB.hpp"
+#include "LargeSample5MBPubSubTypes.hpp"
 
 namespace fastdds_fpga {
-
-struct BridgeConfig {
-    std::string device_path{"/dev/" XILINX_RTPS_DEV_NAME};
-    uint32_t    domain_id{0};
-    std::string topic_name{"FastSampleTopic"};
-
-    // PS Control-Plane Discovery Network (Linux eth0)
-    std::string ps_ip{""};                 // Empty = bind all interfaces; or e.g. "192.168.1.10"
-    std::string peer_ip{""};               // Optional unicast SPDP peer IP, e.g. "192.168.1.100"
-
-    // PL Data-Plane Hardware Identity (RMII PHY)
-    uint32_t    pl_ip{0xC0A801C9};         // 192.168.1.201 (dedicated PL RMII IP)
-    uint8_t     pl_mac[6]{0x02, 0x00, 0x5E, 0x10, 0x00, 0x01};
-    uint16_t    local_src_port{7411};
-    uint16_t    pl_rx_port{7511};          // Reader locator advertised via SEDP; must not collide with PS default ports 7410/7411
-    uint16_t    default_dst_port{7410};
-    uint32_t    fallback_dst_ip{0xC0A80164}; // 192.168.1.100
-
-    bool        enable_peer_emu{false};    // false = Physical RMII wire (LAN8720), true = internal emulator
-    bool        tx_ip_frag_mode{false};    // false = Option C DATA_FRAG default (0x16), true = Legacy IPv4 frag
-    uint32_t    max_message_size{1468};    // Fast DDS UDP maxMessageSize (1468 - 68B RTPS/DATA_FRAG = 1400B)
-    uint32_t    frag_size_bytes{0};        // Optional explicit DATA_FRAG fragmentSize override (0 = derive from max_message_size)
-    uint8_t     override_peer_mac[6]{0};
-    bool        has_peer_mac_override{false};
-    uint32_t    pacing_timer_ticks{0};     // 0 = wire line rate
-};
 
 class FpgaFastpathBridge {
 public:
@@ -121,6 +98,16 @@ public:
 
         std::cout << "[FpgaBridge] FPGA driver initialized (fd=" << fpga_->fd
                   << ", coherent mmap=" << (fpga_->use_mmap ? "ENABLED" : "DISABLED") << ")\n";
+
+        if (config_.large_5mb) {
+            uint32_t depth = (config_.ring_depth >= 1 && config_.ring_depth <= 16) ? config_.ring_depth : 2U;
+            if (fpga_fastpath_config_tx_ring(fpga_, 0, sizeof(LargeSample5MB), depth) < 0 ||
+                fpga_fastpath_config_rx_ring(fpga_, 0, sizeof(LargeSample5MB), depth) < 0) {
+                std::cerr << "[-] Error: failed to configure 5MB DDR rings (check CMA size)\n";
+                return false;
+            }
+            std::cout << "[FpgaBridge] Configured 5 MiB TX/RX DDR Rings (depth=" << depth << ")\n";
+        }
 
         // Pet watchdog immediately to clear any prior expired state
         pet_watchdog();
@@ -300,6 +287,38 @@ public:
         });
     }
 
+    // 5 MiB Adaptive DDR Ring Zero-Copy Loan & Publish/Take
+    LargeSample5MB* zero_copy_loan_5mb(struct fpga_tx_loan* loan_out) {
+        if (!fpga_ || !loan_out) return nullptr;
+        if (fpga_fastpath_get_tx_loan(fpga_, 0, sizeof(LargeSample5MB), loan_out) != 0)
+            return nullptr;
+        return reinterpret_cast<LargeSample5MB*>(loan_out->ptr);
+    }
+
+    int publish_loaned_5mb(const struct fpga_tx_loan& loan) {
+        if (!fpga_) return -ENODEV;
+        return fpga_fastpath_publish_loan(fpga_, &loan, sizeof(LargeSample5MB), 15000);
+    }
+
+    void start_rx_worker_5mb(std::function<void(const LargeSample5MB&, const struct fpga_rx_metadata&)> callback) {
+        rx_thread_ = std::thread([this, callback]() {
+            std::cout << "[FpgaBridge] 5 MiB DDR Ring RX worker started.\n";
+            while (running_) {
+                struct fpga_rx_loan rx_loan;
+                std::memset(&rx_loan, 0, sizeof(rx_loan));
+                int rc = fpga_fastpath_take_loan(fpga_, 0, &rx_loan, 5000);
+                if (rc == 0 && rx_loan.payload_ptr && rx_loan.payload_bytes >= sizeof(LargeSample5MB)) {
+                    const LargeSample5MB* ls = reinterpret_cast<const LargeSample5MB*>(rx_loan.payload_ptr);
+                    callback(*ls, rx_loan.meta);
+                    fpga_fastpath_release_loan(fpga_, &rx_loan);
+                } else if (rc != -EAGAIN && rc != -ETIMEDOUT && running_) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
+            }
+            std::cout << "[FpgaBridge] 5 MiB DDR Ring RX worker stopped.\n";
+        });
+    }
+
     bool get_diagnostics(struct rtps_cycle_diag* diag) {
         if (!fpga_ || !diag) return false;
         return (ioctl(fpga_->fd, AXI_RTPS_IOC_GET_DIAG, diag) == 0);
@@ -444,7 +463,10 @@ private:
         fpga_->cfg.local_identity_valid = 1;
 
         // Register Topic & Type
-        type_.reset(new FastSamplePubSubType());
+        if (config_.large_5mb)
+            type_.reset(new LargeSample5MBPubSubType());
+        else
+            type_.reset(new FastSamplePubSubType());
         type_.register_type(participant_);
 
         topic_ = participant_->create_topic(config_.topic_name, type_.get_type_name(), TOPIC_QOS_DEFAULT);

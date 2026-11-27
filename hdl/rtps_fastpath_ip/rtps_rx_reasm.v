@@ -57,7 +57,39 @@ module rtps_rx_reasm #(
     output reg  [15:0]                   last_rx_dst_port,
     output reg  [1:0]                    last_rx_cam_idx,
     output reg  [47:0]                   last_rx_src_mac,
-    output wire [NUM_ENDPOINTS*32-1:0]   rd_match_count_flat
+    output wire [NUM_ENDPOINTS*32-1:0]   rd_match_count_flat,
+
+    // Large (>8KB) DDR Ring DDP & Bitmap Hook
+    input  wire [31:0]                   large_rx_timeout_limit,
+    input  wire [11:0]                   bmap_rd_ctrl,
+    output reg  [31:0]                   bmap_rd_data,
+    input  wire [NUM_ENDPOINTS*32-1:0]   rx_ring_base_flat,
+    input  wire [NUM_ENDPOINTS*32-1:0]   rx_ring_slot_size_flat,
+    input  wire [NUM_ENDPOINTS*32-1:0]   rx_ring_cfg_flat,
+    input  wire [NUM_ENDPOINTS*5-1:0]    rx_ring_cons_idx_flat,
+    input  wire [NUM_ENDPOINTS-1:0]      rx_ring_reset_pulse,
+    output wire [NUM_ENDPOINTS*5-1:0]    rx_ring_prod_idx_flat,
+    output wire [NUM_ENDPOINTS*32-1:0]   rx_ring_comp_bytes_flat,
+    output wire [NUM_ENDPOINTS*64-1:0]   rx_ring_comp_seq_flat,
+    output wire [NUM_ENDPOINTS*64-1:0]   rx_ring_comp_ts_flat,
+    output wire [NUM_ENDPOINTS*32-1:0]   rx_ring_comp_src_ip_flat,
+    output wire [NUM_ENDPOINTS*32-1:0]   rx_ring_comp_ports_flat,
+    output wire [NUM_ENDPOINTS*32-1:0]   rx_ring_stat_done_flat,
+    output wire [NUM_ENDPOINTS*32-1:0]   rx_ring_stat_drops_flat,
+    input  wire [NUM_ENDPOINTS-1:0]      large_rx_irq_ack_pulse,
+    output reg  [NUM_ENDPOINTS-1:0]      large_rx_done_irq_vec,
+    output reg  [NUM_ENDPOINTS-1:0]      large_rx_overflow_vec,
+    output reg  [NUM_ENDPOINTS-1:0]      large_rx_timeout_vec,
+
+    // AXI4 Master Write Channel Interface (rtps_ddr_dma_engine)
+    output reg                           ddr_wr_req_valid,
+    output reg  [31:0]                   ddr_wr_req_addr,
+    output reg  [9:0]                    ddr_wr_req_words,
+    output reg  [8:0]                    ddr_wr_pkt_base_word,
+    input  wire [8:0]                    ddr_wr_pkt_rd_addr,
+    output wire [31:0]                   ddr_wr_pkt_rd_data,
+    input  wire                          ddr_wr_done_pulse,
+    input  wire                          ddr_wr_resp_err
 );
 
     `include "rtps_fastpath_defs.vh"
@@ -103,14 +135,92 @@ module rtps_rx_reasm #(
     reg [31:0] rx_pkt_dout;
     reg        walk_from_pkt_ram;
 
+    wire [8:0] rx_pkt_rd_addr_mux = (rx_state == R_LDF_DDR_WR) ? ddr_wr_pkt_rd_addr : walker_rd_addr[8:0];
+
     always @(posedge clk) begin
         if (rx_pkt_wr_en) begin
             rx_pkt_ram[rx_pkt_wr_addr] <= rx_pkt_wr_data;
         end
-        rx_pkt_dout <= rx_pkt_ram[walker_rd_addr[8:0]];
+        rx_pkt_dout <= rx_pkt_ram[rx_pkt_rd_addr_mux];
     end
 
+    assign ddr_wr_pkt_rd_data = rx_pkt_dout;
     wire [31:0] walker_dout = walk_from_pkt_ram ? rx_pkt_dout : reasm_walker_dout;
+
+    // -------------------------------------------------------------------------
+    // 4 x 4 KB Completion Bitmap BRAM (32,768 frags/subscriber = ~45.8 MB max)
+    // Port A: RX DDP FSM; Port B: Read-only NACK_FRAG CSR hook
+    // -------------------------------------------------------------------------
+    (* ram_style = "block" *) reg [31:0] rx_bmap_bram [0:4095];
+    reg        bmap_wr_en;
+    reg [11:0] bmap_a_addr;
+    reg [31:0] bmap_wr_data;
+    reg [31:0] bmap_a_dout;
+
+    always @(posedge clk) begin
+        if (bmap_wr_en) begin
+            rx_bmap_bram[bmap_a_addr] <= bmap_wr_data;
+        end
+        bmap_a_dout  <= rx_bmap_bram[bmap_a_addr];
+        bmap_rd_data <= rx_bmap_bram[bmap_rd_ctrl];
+    end
+
+    // Per-Endpoint Large RX DDP Context & Ring Metadata
+    reg        lrx_active      [0:NUM_ENDPOINTS-1];
+    reg [63:0] lrx_writer_sn   [0:NUM_ENDPOINTS-1];
+    reg [31:0] lrx_sample_size [0:NUM_ENDPOINTS-1];
+    reg [15:0] lrx_frag_size   [0:NUM_ENDPOINTS-1];
+    reg [15:0] lrx_exp_frags   [0:NUM_ENDPOINTS-1];
+    reg [15:0] lrx_got_frags   [0:NUM_ENDPOINTS-1];
+    reg [31:0] lrx_slot_base   [0:NUM_ENDPOINTS-1];
+    reg [31:0] lrx_timeout_cnt [0:NUM_ENDPOINTS-1];
+    reg [4:0]  lrx_prod_idx    [0:NUM_ENDPOINTS-1];
+    reg [31:0] lrx_stat_done   [0:NUM_ENDPOINTS-1];
+    reg [31:0] lrx_stat_drops  [0:NUM_ENDPOINTS-1];
+
+    reg [31:0] lrx_meta_bytes  [0:NUM_ENDPOINTS-1][0:15];
+    reg [63:0] lrx_meta_seq    [0:NUM_ENDPOINTS-1][0:15];
+    reg [63:0] lrx_meta_ts     [0:NUM_ENDPOINTS-1][0:15];
+    reg [31:0] lrx_meta_src_ip [0:NUM_ENDPOINTS-1][0:15];
+    reg [31:0] lrx_meta_ports  [0:NUM_ENDPOINTS-1][0:15];
+
+    wire [31:0] rx_ring_base_ep      [0:NUM_ENDPOINTS-1];
+    wire [31:0] rx_ring_slot_size_ep [0:NUM_ENDPOINTS-1];
+    wire [4:0]  rx_ring_depth_ep     [0:NUM_ENDPOINTS-1];
+    wire        rx_ring_enable_ep    [0:NUM_ENDPOINTS-1];
+    wire [4:0]  rx_ring_cons_idx_ep  [0:NUM_ENDPOINTS-1];
+
+    generate
+        for (g_ep = 0; g_ep < NUM_ENDPOINTS; g_ep = g_ep + 1) begin : GEN_LRX_CSR
+            wire [3:0] cons_s = rx_ring_cons_idx_flat[g_ep*5 +: 4];
+            assign rx_ring_base_ep[g_ep]      = rx_ring_base_flat[g_ep*32 +: 32];
+            assign rx_ring_slot_size_ep[g_ep] = rx_ring_slot_size_flat[g_ep*32 +: 32];
+            assign rx_ring_depth_ep[g_ep]     = rx_ring_cfg_flat[g_ep*32 +: 5];
+            assign rx_ring_enable_ep[g_ep]    = rx_ring_cfg_flat[g_ep*32 + 8];
+            assign rx_ring_cons_idx_ep[g_ep]  = rx_ring_cons_idx_flat[g_ep*5 +: 5];
+            assign rx_ring_prod_idx_flat[g_ep*5 +: 5]        = lrx_prod_idx[g_ep];
+            assign rx_ring_comp_bytes_flat[g_ep*32 +: 32]    = lrx_meta_bytes[g_ep][cons_s];
+            assign rx_ring_comp_seq_flat[g_ep*64 +: 64]      = lrx_meta_seq[g_ep][cons_s];
+            assign rx_ring_comp_ts_flat[g_ep*64 +: 64]       = lrx_meta_ts[g_ep][cons_s];
+            assign rx_ring_comp_src_ip_flat[g_ep*32 +: 32]   = lrx_meta_src_ip[g_ep][cons_s];
+            assign rx_ring_comp_ports_flat[g_ep*32 +: 32]    = lrx_meta_ports[g_ep][cons_s];
+            assign rx_ring_stat_done_flat[g_ep*32 +: 32]     = lrx_stat_done[g_ep];
+            assign rx_ring_stat_drops_flat[g_ep*32 +: 32]    = lrx_stat_drops[g_ep];
+        end
+    endgenerate
+
+    // Iterative divider & DDP scratch registers
+    reg [31:0] ldf_div_num;
+    reg [31:0] ldf_div_den;
+    reg [15:0] ldf_div_q;
+    reg [4:0]  ldf_div_step;
+    reg [10:0] ldf_bmap_clr_cnt;
+    reg [10:0] ldf_bmap_clr_max;
+    reg [15:0] ldf_frag_idx;
+    reg [31:0] ldf_bit_mask;
+    reg [31:0] ldf_ddr_off;
+    reg [11:0] ldf_frag_bytes;
+    reg        ldf_bmap_rd_ready;
 
     reg [11:0] rx_wire_beat;
     reg [15:0] rx_ip_len;
@@ -379,6 +489,40 @@ module rtps_rx_reasm #(
             rx_active_src_mac       <= 48'd0;
             last_rx_src_mac         <= 48'd0;
 
+            bmap_wr_en              <= 1'b0;
+            bmap_a_addr             <= 12'd0;
+            bmap_wr_data            <= 32'd0;
+            ddr_wr_req_valid        <= 1'b0;
+            ddr_wr_req_addr         <= 32'd0;
+            ddr_wr_req_words        <= 10'd0;
+            ddr_wr_pkt_base_word    <= 9'd0;
+            large_rx_done_irq_vec   <= {NUM_ENDPOINTS{1'b0}};
+            large_rx_overflow_vec   <= {NUM_ENDPOINTS{1'b0}};
+            large_rx_timeout_vec    <= {NUM_ENDPOINTS{1'b0}};
+            ldf_div_num             <= 32'd0;
+            ldf_div_den             <= 32'd0;
+            ldf_div_q               <= 16'd0;
+            ldf_div_step            <= 5'd0;
+            ldf_bmap_clr_cnt        <= 11'd0;
+            ldf_bmap_clr_max        <= 11'd0;
+            ldf_frag_idx            <= 16'd0;
+            ldf_bit_mask            <= 32'd0;
+            ldf_ddr_off             <= 32'd0;
+            ldf_frag_bytes          <= 12'd0;
+            for (rst_ep = 0; rst_ep < NUM_ENDPOINTS; rst_ep = rst_ep + 1) begin
+                lrx_active[rst_ep]      <= 1'b0;
+                lrx_writer_sn[rst_ep]   <= 64'd0;
+                lrx_sample_size[rst_ep] <= 32'd0;
+                lrx_frag_size[rst_ep]   <= 16'd0;
+                lrx_exp_frags[rst_ep]   <= 16'd0;
+                lrx_got_frags[rst_ep]   <= 16'd0;
+                lrx_slot_base[rst_ep]   <= 32'd0;
+                lrx_timeout_cnt[rst_ep] <= 32'd0;
+                lrx_prod_idx[rst_ep]    <= 5'd0;
+                lrx_stat_done[rst_ep]   <= 32'd0;
+                lrx_stat_drops[rst_ep]  <= 32'd0;
+            end
+
             walk_guid_prefix        <= 96'd0;
             walk_cam_idx            <= 2'd0;
             walk_cam_hit            <= 1'b0;
@@ -460,6 +604,31 @@ module rtps_rx_reasm #(
             rx_hdr_init       <= 1'b0;
             rx_commit_pulse   <= 1'b0;
             rx_csum_err_pulse <= 1'b0;
+            bmap_wr_en        <= 1'b0;
+            ddr_wr_req_valid  <= 1'b0;
+
+            for (rst_ep = 0; rst_ep < NUM_ENDPOINTS; rst_ep = rst_ep + 1) begin
+                if (large_rx_irq_ack_pulse[rst_ep]) begin
+                    large_rx_done_irq_vec[rst_ep] <= 1'b0;
+                    large_rx_overflow_vec[rst_ep] <= 1'b0;
+                    large_rx_timeout_vec[rst_ep]  <= 1'b0;
+                end
+                if (rx_ring_reset_pulse[rst_ep]) begin
+                    lrx_active[rst_ep]      <= 1'b0;
+                    lrx_prod_idx[rst_ep]    <= 5'd0;
+                    lrx_slot_base[rst_ep]   <= rx_ring_base_ep[rst_ep];
+                    lrx_timeout_cnt[rst_ep] <= 32'd0;
+                end else if (lrx_active[rst_ep] && !(rx_state >= R_LDF_SETUP && walk_cam_idx == rst_ep[1:0])) begin
+                    if (large_rx_timeout_limit != 32'd0 && lrx_timeout_cnt[rst_ep] >= large_rx_timeout_limit) begin
+                        lrx_active[rst_ep]           <= 1'b0;
+                        lrx_stat_drops[rst_ep]       <= lrx_stat_drops[rst_ep] + 32'd1;
+                        large_rx_timeout_vec[rst_ep] <= 1'b1;
+                        lrx_timeout_cnt[rst_ep]      <= 32'd0;
+                    end else begin
+                        lrx_timeout_cnt[rst_ep] <= lrx_timeout_cnt[rst_ep] + 32'd1;
+                    end
+                end
+            end
 
             if (edt_commit_applied || identity_clear_seq_pulse) begin
                 for (rst_ep = 0; rst_ep < NUM_ENDPOINTS; rst_ep = rst_ep + 1) begin
@@ -1088,6 +1257,14 @@ module rtps_rx_reasm #(
                     if (walk_seq_num <= cam_last_seq_r) begin
                         stat_stale_drops <= stat_stale_drops + 32'd1;
                         rx_state         <= R_IDLE;
+                    end else if ((df_sample_size > 32'd8192) && rx_ring_enable_ep[walk_cam_idx]) begin
+                        if ((df_frag_start < 32'd1) || (df_frag_start > 32'd32768) ||
+                            (df_frags_in_submsg != 16'd1) || (df_frag_size < 16'd4)) begin
+                            rx_state <= R_IDLE;
+                        end else begin
+                            ldf_frag_idx <= df_frag_start[15:0] - 16'd1;
+                            rx_state     <= R_LDF_SETUP;
+                        end
                     end else if ((df_frag_start < 32'd1) || (df_frag_start > 32'd32) ||
                                  (df_frags_in_submsg < 16'd1) ||
                                  ((df_frag_start + {16'd0, df_frags_in_submsg}) > 32'd33) ||
@@ -1345,6 +1522,177 @@ module rtps_rx_reasm #(
                                           (walk_submsg_flags[0] ? {walker_dout[3:0], walker_dout[15:10]} : walker_dout[13:2]);
                         rx_state       <= R_SKIP_QOS_WAIT2;
                     end
+                end
+
+                // -------------------------------------------------------------
+                // Large (>8 KB) DDR Ring Direct Data Placement (DDP) States
+                // -------------------------------------------------------------
+                R_LDF_SETUP: begin : ldf_setup_blk
+                    reg [4:0] next_prod;
+                    next_prod = (lrx_prod_idx[walk_cam_idx] + 5'd1 >= rx_ring_depth_ep[walk_cam_idx]) ?
+                                5'd0 : (lrx_prod_idx[walk_cam_idx] + 5'd1);
+                    if (next_prod == rx_ring_cons_idx_ep[walk_cam_idx]) begin
+                        lrx_stat_drops[walk_cam_idx]        <= lrx_stat_drops[walk_cam_idx] + 32'd1;
+                        large_rx_overflow_vec[walk_cam_idx] <= 1'b1;
+                        rx_state                            <= R_IDLE;
+                    end else if (lrx_active[walk_cam_idx] && (walk_seq_num < lrx_writer_sn[walk_cam_idx])) begin
+                        stat_stale_drops <= stat_stale_drops + 32'd1;
+                        rx_state         <= R_IDLE;
+                    end else if (lrx_active[walk_cam_idx] && (walk_seq_num == lrx_writer_sn[walk_cam_idx])) begin
+                        if ((lrx_sample_size[walk_cam_idx] != df_sample_size) ||
+                            (lrx_frag_size[walk_cam_idx]   != df_frag_size)) begin
+                            lrx_stat_drops[walk_cam_idx] <= lrx_stat_drops[walk_cam_idx] + 32'd1;
+                            rx_state                     <= R_IDLE;
+                        end else begin
+                            rx_state <= R_LDF_BMAP_CHK;
+                        end
+                    end else begin
+                        // New sample or newer writerSN preempting incomplete older sample
+                        if (lrx_active[walk_cam_idx]) begin
+                            stat_seq_gaps                <= stat_seq_gaps + 32'd1;
+                            lrx_stat_drops[walk_cam_idx] <= lrx_stat_drops[walk_cam_idx] + 32'd1;
+                        end
+                        if (lrx_prod_idx[walk_cam_idx] == 5'd0)
+                            lrx_slot_base[walk_cam_idx] <= rx_ring_base_ep[walk_cam_idx];
+                        lrx_active[walk_cam_idx]      <= 1'b1;
+                        lrx_writer_sn[walk_cam_idx]   <= walk_seq_num;
+                        lrx_sample_size[walk_cam_idx] <= df_sample_size;
+                        lrx_frag_size[walk_cam_idx]   <= df_frag_size;
+                        lrx_got_frags[walk_cam_idx]   <= 16'd0;
+                        lrx_timeout_cnt[walk_cam_idx] <= 32'd0;
+                        // Setup 16-cycle restoring divider: ceil(sample_size / frag_size)
+                        ldf_div_num                   <= df_sample_size + {16'd0, df_frag_size} - 32'd1;
+                        ldf_div_den                   <= {16'd0, df_frag_size};
+                        ldf_div_q                     <= 16'd0;
+                        ldf_div_step                  <= 5'd15;
+                        rx_state                      <= R_LDF_DIV;
+                    end
+                end
+
+                R_LDF_DIV: begin : ldf_div_blk
+                    reg [31:0] shifted_den;
+                    shifted_den = ldf_div_den << ldf_div_step[3:0];
+                    if (ldf_div_num >= shifted_den) begin
+                        ldf_div_num <= ldf_div_num - shifted_den;
+                        ldf_div_q[ldf_div_step[3:0]] <= 1'b1;
+                    end
+                    if (ldf_div_step == 5'd0) begin : ldf_div_done_blk
+                        reg [15:0] final_q;
+                        final_q = ldf_div_q | ((ldf_div_num >= ldf_div_den) ? 16'd1 : 16'd0);
+                        if (final_q == 16'd0 || final_q > 16'd32768) begin
+                            lrx_active[walk_cam_idx]     <= 1'b0;
+                            lrx_stat_drops[walk_cam_idx] <= lrx_stat_drops[walk_cam_idx] + 32'd1;
+                            rx_state                     <= R_IDLE;
+                        end else begin
+                            lrx_exp_frags[walk_cam_idx] <= final_q;
+                            ldf_bmap_clr_cnt            <= 11'd0;
+                            ldf_bmap_clr_max            <= ({1'b0, final_q[14:5]}) + (|final_q[4:0] ? 11'd1 : 11'd0);
+                            rx_state                    <= R_LDF_BMAP_CLR;
+                        end
+                    end else begin
+                        ldf_div_step <= ldf_div_step - 5'd1;
+                    end
+                end
+
+                R_LDF_BMAP_CLR: begin
+                    bmap_wr_en       <= 1'b1;
+                    bmap_a_addr      <= {walk_cam_idx, ldf_bmap_clr_cnt[9:0]};
+                    bmap_wr_data     <= 32'd0;
+                    if (ldf_bmap_clr_cnt + 11'd1 >= ldf_bmap_clr_max) begin
+                        rx_state <= R_LDF_BMAP_CHK;
+                    end else begin
+                        ldf_bmap_clr_cnt <= ldf_bmap_clr_cnt + 11'd1;
+                    end
+                end
+
+                R_LDF_BMAP_CHK: begin : ldf_bmap_chk_blk
+                    reg [31:0] raw_off;
+                    reg [31:0] rem_sample;
+                    reg [11:0] chunk_b;
+                    raw_off    = {16'd0, ldf_frag_idx} * {16'd0, df_frag_size};
+                    rem_sample = (raw_off < lrx_sample_size[walk_cam_idx]) ?
+                                 (lrx_sample_size[walk_cam_idx] - raw_off) : 32'd0;
+                    chunk_b    = (rem_sample > {16'd0, df_frag_size}) ?
+                                 df_frag_size[11:0] : rem_sample[11:0];
+
+                    bmap_a_addr    <= {walk_cam_idx, ldf_frag_idx[14:5]};
+                    ldf_bit_mask   <= (32'd1 << ldf_frag_idx[4:0]);
+                    ldf_ddr_off       <= (ldf_frag_idx == 16'd0) ? 32'd0 : (raw_off - 32'd4);
+                    ldf_frag_bytes    <= (ldf_frag_idx == 16'd0) ? (chunk_b - 12'd4) : chunk_b;
+                    ldf_bmap_rd_ready <= 1'b0;
+                    rx_state          <= R_LDF_BMAP_WAIT;
+                end
+
+                R_LDF_BMAP_WAIT: begin
+                    if (!ldf_bmap_rd_ready) begin
+                        ldf_bmap_rd_ready <= 1'b1;
+                    end else if (ldf_frag_bytes == 12'd0 ||
+                        (ldf_ddr_off + {20'd0, ldf_frag_bytes}) > rx_ring_slot_size_ep[walk_cam_idx]) begin
+                        lrx_stat_drops[walk_cam_idx] <= lrx_stat_drops[walk_cam_idx] + 32'd1;
+                        rx_state                     <= R_IDLE;
+                    end else if ((bmap_a_dout & ldf_bit_mask) != 32'd0) begin
+                        stat_stale_drops <= stat_stale_drops + 32'd1;
+                        rx_state         <= R_IDLE;
+                    end else begin
+                        bmap_wr_en           <= 1'b1;
+                        bmap_a_addr          <= {walk_cam_idx, ldf_frag_idx[14:5]};
+                        bmap_wr_data         <= bmap_a_dout | ldf_bit_mask;
+                        ddr_wr_req_valid     <= 1'b1;
+                        ddr_wr_req_addr      <= lrx_slot_base[walk_cam_idx] + ldf_ddr_off;
+                        ddr_wr_req_words     <= ldf_frag_bytes[11:2];
+                        ddr_wr_pkt_base_word <= (ldf_frag_idx == 16'd0) ?
+                                                (df_pay_start_word[8:0] + 9'd1) : df_pay_start_word[8:0];
+                        rx_state             <= R_LDF_DDR_WR;
+                    end
+                end
+
+                R_LDF_DDR_WR: begin
+                    if (ddr_wr_done_pulse) begin
+                        lrx_timeout_cnt[walk_cam_idx] <= 32'd0;
+                        if (ddr_wr_resp_err) begin
+                            lrx_stat_drops[walk_cam_idx] <= lrx_stat_drops[walk_cam_idx] + 32'd1;
+                            rx_state                     <= R_IDLE;
+                        end else if (lrx_got_frags[walk_cam_idx] + 16'd1 >= lrx_exp_frags[walk_cam_idx]) begin
+                            rx_state <= R_LDF_COMMIT;
+                        end else begin
+                            lrx_got_frags[walk_cam_idx] <= lrx_got_frags[walk_cam_idx] + 16'd1;
+                            rx_state                    <= R_IDLE;
+                        end
+                    end
+                end
+
+                R_LDF_COMMIT: begin : ldf_commit_blk
+                    reg [4:0] next_prod;
+                    reg [3:0] cur_slot4;
+                    cur_slot4 = lrx_prod_idx[walk_cam_idx][3:0];
+                    next_prod = (lrx_prod_idx[walk_cam_idx] + 5'd1 >= rx_ring_depth_ep[walk_cam_idx]) ?
+                                5'd0 : (lrx_prod_idx[walk_cam_idx] + 5'd1);
+
+                    lrx_meta_bytes[walk_cam_idx][cur_slot4]  <= lrx_sample_size[walk_cam_idx] - 32'd4;
+                    lrx_meta_seq[walk_cam_idx][cur_slot4]    <= lrx_writer_sn[walk_cam_idx];
+                    lrx_meta_ts[walk_cam_idx][cur_slot4]     <= walk_ts;
+                    lrx_meta_src_ip[walk_cam_idx][cur_slot4] <= walk_src_ip;
+                    lrx_meta_ports[walk_cam_idx][cur_slot4]  <= {walk_udp_src_port, walk_udp_dst_port};
+
+                    lrx_prod_idx[walk_cam_idx]    <= next_prod;
+                    lrx_slot_base[walk_cam_idx]   <= (next_prod == 5'd0) ?
+                                                     rx_ring_base_ep[walk_cam_idx] :
+                                                     (lrx_slot_base[walk_cam_idx] + rx_ring_slot_size_ep[walk_cam_idx]);
+                    lrx_active[walk_cam_idx]      <= 1'b0;
+                    lrx_stat_done[walk_cam_idx]   <= lrx_stat_done[walk_cam_idx] + 32'd1;
+                    stat_rx_samples               <= stat_rx_samples + 32'd1;
+                    rd_match_count[walk_cam_idx]  <= rd_match_count[walk_cam_idx] + 32'd1;
+                    last_rx_seq_num_by_cam[walk_cam_idx] <= lrx_writer_sn[walk_cam_idx];
+                    last_rx_ts_by_cam[walk_cam_idx]      <= walk_ts;
+                    last_rx_seq_num               <= lrx_writer_sn[walk_cam_idx];
+                    last_rx_ts                    <= walk_ts;
+                    last_rx_src_ip                <= walk_src_ip;
+                    last_rx_src_port              <= walk_udp_src_port;
+                    last_rx_dst_port              <= walk_udp_dst_port;
+                    last_rx_cam_idx               <= walk_cam_idx;
+                    last_rx_src_mac               <= walk_src_mac;
+                    large_rx_done_irq_vec[walk_cam_idx] <= 1'b1;
+                    rx_state                      <= R_IDLE;
                 end
 
                 default: rx_state <= R_IDLE;

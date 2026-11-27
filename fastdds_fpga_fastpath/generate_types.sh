@@ -16,8 +16,9 @@ if ! command -v fastddsgen &> /dev/null; then
     exit 0
 fi
 
-echo "[+] Generating Fast DDS type support from ${IDL_DIR}/FastSample.idl..."
+echo "[+] Generating Fast DDS type support from ${IDL_DIR}/FastSample.idl and LargeSample5MB.idl..."
 cd "${IDL_DIR}"
 fastddsgen -replace -typeobject FastSample.idl
+fastddsgen -replace -typeobject LargeSample5MB.idl
 
 echo "[+] Generation complete."

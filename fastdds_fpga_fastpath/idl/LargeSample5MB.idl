@@ -1,0 +1,13 @@
+// ============================================================================
+// LargeSample5MB.idl
+//
+// 5 MiB (5,242,880-Byte) Hardware-Accelerated Sample Definition (@final)
+// Uses Adaptive DDR Ring + DATA_FRAG (0x16) on the PYNQ-Z2 RTPS Fastpath IP.
+// ============================================================================
+
+struct LargeSample5MB {
+    unsigned long cycle_id;
+    unsigned long flags;
+    unsigned long long tx_timestamp_ns;
+    unsigned long payload[1310716];
+};

@@ -29,7 +29,7 @@ module tb_rtps_fastpath;
     localparam integer DATA_WIDTH     = 32;
     localparam integer BRAM_DEPTH     = 2048;
     localparam integer ADDR_WIDTH     = 11;
-    localparam integer CFG_ADDR_WIDTH = 8;
+    localparam integer CFG_ADDR_WIDTH = 10;
     localparam integer PAYLOAD_WORDS  = 1024; // 4,096 bytes (4 KB FastSample)
 
     reg                       clk;
@@ -88,6 +88,45 @@ module tb_rtps_fastpath;
     wire [31:0]               remote_client_ip;
     reg  [47:0]               remote_client_mac;
     wire [47:0]               ingress_remote_client_mac;
+
+    // AXI4 Full Master DDR Wires
+    wire [0:0]                m_axi_ddr_awid;
+    wire [31:0]               m_axi_ddr_awaddr;
+    wire [7:0]                m_axi_ddr_awlen;
+    wire [2:0]                m_axi_ddr_awsize;
+    wire [1:0]                m_axi_ddr_awburst;
+    wire                      m_axi_ddr_awlock;
+    wire [3:0]                m_axi_ddr_awcache;
+    wire [2:0]                m_axi_ddr_awprot;
+    wire [3:0]                m_axi_ddr_awqos;
+    wire                      m_axi_ddr_awvalid;
+    reg                       m_axi_ddr_awready;
+    wire [31:0]               m_axi_ddr_wdata;
+    wire [3:0]                m_axi_ddr_wstrb;
+    wire                      m_axi_ddr_wlast;
+    wire                      m_axi_ddr_wvalid;
+    reg                       m_axi_ddr_wready;
+    reg  [0:0]                m_axi_ddr_bid;
+    reg  [1:0]                m_axi_ddr_bresp;
+    reg                       m_axi_ddr_bvalid;
+    wire                      m_axi_ddr_bready;
+    wire [0:0]                m_axi_ddr_arid;
+    wire [31:0]               m_axi_ddr_araddr;
+    wire [7:0]                m_axi_ddr_arlen;
+    wire [2:0]                m_axi_ddr_arsize;
+    wire [1:0]                m_axi_ddr_arburst;
+    wire                      m_axi_ddr_arlock;
+    wire [3:0]                m_axi_ddr_arcache;
+    wire [2:0]                m_axi_ddr_arprot;
+    wire [3:0]                m_axi_ddr_arqos;
+    wire                      m_axi_ddr_arvalid;
+    reg                       m_axi_ddr_arready;
+    reg  [0:0]                m_axi_ddr_rid;
+    reg  [31:0]               m_axi_ddr_rdata;
+    reg  [1:0]                m_axi_ddr_rresp;
+    reg                       m_axi_ddr_rlast;
+    reg                       m_axi_ddr_rvalid;
+    wire                      m_axi_ddr_rready;
 
     // Instantiate DUT
     rtps_fastpath_ip #(
@@ -148,15 +187,150 @@ module tb_rtps_fastpath;
         .icmp_err_info          (32'd0),
         .icmp_err_dst_ip        (32'd0),
         .icmp_err_ports         (32'd0),
-        .icmp_err_ip_id         (16'd0)
+        .icmp_err_ip_id         (16'd0),
+        .m_axi_ddr_awid         (m_axi_ddr_awid),
+        .m_axi_ddr_awaddr       (m_axi_ddr_awaddr),
+        .m_axi_ddr_awlen        (m_axi_ddr_awlen),
+        .m_axi_ddr_awsize       (m_axi_ddr_awsize),
+        .m_axi_ddr_awburst      (m_axi_ddr_awburst),
+        .m_axi_ddr_awlock       (m_axi_ddr_awlock),
+        .m_axi_ddr_awcache      (m_axi_ddr_awcache),
+        .m_axi_ddr_awprot       (m_axi_ddr_awprot),
+        .m_axi_ddr_awqos        (m_axi_ddr_awqos),
+        .m_axi_ddr_awvalid      (m_axi_ddr_awvalid),
+        .m_axi_ddr_awready      (m_axi_ddr_awready),
+        .m_axi_ddr_wdata        (m_axi_ddr_wdata),
+        .m_axi_ddr_wstrb        (m_axi_ddr_wstrb),
+        .m_axi_ddr_wlast        (m_axi_ddr_wlast),
+        .m_axi_ddr_wvalid       (m_axi_ddr_wvalid),
+        .m_axi_ddr_wready       (m_axi_ddr_wready),
+        .m_axi_ddr_bid          (m_axi_ddr_bid),
+        .m_axi_ddr_bresp        (m_axi_ddr_bresp),
+        .m_axi_ddr_bvalid       (m_axi_ddr_bvalid),
+        .m_axi_ddr_bready       (m_axi_ddr_bready),
+        .m_axi_ddr_arid         (m_axi_ddr_arid),
+        .m_axi_ddr_araddr       (m_axi_ddr_araddr),
+        .m_axi_ddr_arlen        (m_axi_ddr_arlen),
+        .m_axi_ddr_arsize       (m_axi_ddr_arsize),
+        .m_axi_ddr_arburst      (m_axi_ddr_arburst),
+        .m_axi_ddr_arlock       (m_axi_ddr_arlock),
+        .m_axi_ddr_arcache      (m_axi_ddr_arcache),
+        .m_axi_ddr_arprot       (m_axi_ddr_arprot),
+        .m_axi_ddr_arqos        (m_axi_ddr_arqos),
+        .m_axi_ddr_arvalid      (m_axi_ddr_arvalid),
+        .m_axi_ddr_arready      (m_axi_ddr_arready),
+        .m_axi_ddr_rid          (m_axi_ddr_rid),
+        .m_axi_ddr_rdata        (m_axi_ddr_rdata),
+        .m_axi_ddr_rresp        (m_axi_ddr_rresp),
+        .m_axi_ddr_rlast        (m_axi_ddr_rlast),
+        .m_axi_ddr_rvalid       (m_axi_ddr_rvalid),
+        .m_axi_ddr_rready       (m_axi_ddr_rready)
     );
+
+    // =========================================================================
+    // Behavioral AXI4 Full Slave DDR Memory Model (512 KB = 128K x 32-bit)
+    // =========================================================================
+    reg [31:0] ddr_mem [0:131071];
+    reg [31:0] axi_s_ar_addr;
+    reg [7:0]  axi_s_ar_rem;
+    reg        axi_s_rd_busy;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            m_axi_ddr_arready <= 1'b1;
+            m_axi_ddr_rvalid  <= 1'b0;
+            m_axi_ddr_rlast   <= 1'b0;
+            m_axi_ddr_rdata   <= 32'd0;
+            m_axi_ddr_rresp   <= 2'b00;
+            m_axi_ddr_rid     <= 1'b0;
+            axi_s_rd_busy     <= 1'b0;
+        end else begin
+            if (!axi_s_rd_busy) begin
+                if (m_axi_ddr_arvalid && m_axi_ddr_arready) begin
+                    if (({1'b0, m_axi_ddr_araddr[11:0]} + (({4'd0, m_axi_ddr_arlen} + 12'd1) << 2)) > 13'd4096) begin
+                        $display("[-] AXI4 ERROR: Read burst crossed 4KB boundary! addr=0x%08X len=%0d",
+                                 m_axi_ddr_araddr, m_axi_ddr_arlen);
+                        errors = errors + 1;
+                    end
+                    m_axi_ddr_arready <= 1'b0;
+                    axi_s_ar_addr     <= m_axi_ddr_araddr;
+                    axi_s_ar_rem      <= m_axi_ddr_arlen;
+                    axi_s_rd_busy     <= 1'b1;
+                    m_axi_ddr_rvalid  <= 1'b1;
+                    m_axi_ddr_rdata   <= ddr_mem[m_axi_ddr_araddr[18:2]];
+                    m_axi_ddr_rlast   <= (m_axi_ddr_arlen == 8'd0);
+                end
+            end else if (m_axi_ddr_rvalid && m_axi_ddr_rready) begin
+                if (m_axi_ddr_rlast) begin
+                    m_axi_ddr_rvalid  <= 1'b0;
+                    m_axi_ddr_rlast   <= 1'b0;
+                    m_axi_ddr_arready <= 1'b1;
+                    axi_s_rd_busy     <= 1'b0;
+                end else begin
+                    axi_s_ar_addr   <= axi_s_ar_addr + 32'd4;
+                    axi_s_ar_rem    <= axi_s_ar_rem - 8'd1;
+                    m_axi_ddr_rdata <= ddr_mem[(axi_s_ar_addr[18:2]) + 17'd1];
+                    m_axi_ddr_rlast <= (axi_s_ar_rem == 8'd1);
+                end
+            end
+        end
+    end
+
+    reg [31:0] axi_s_aw_addr;
+    reg [7:0]  axi_s_aw_rem;
+    reg        axi_s_wr_busy;
+    reg        axi_s_wr_bwait;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            m_axi_ddr_awready <= 1'b1;
+            m_axi_ddr_wready  <= 1'b0;
+            m_axi_ddr_bvalid  <= 1'b0;
+            m_axi_ddr_bresp   <= 2'b00;
+            m_axi_ddr_bid     <= 1'b0;
+            axi_s_wr_busy     <= 1'b0;
+            axi_s_wr_bwait    <= 1'b0;
+        end else begin
+            if (!axi_s_wr_busy && !axi_s_wr_bwait) begin
+                if (m_axi_ddr_awvalid && m_axi_ddr_awready) begin
+                    if (({1'b0, m_axi_ddr_awaddr[11:0]} + (({4'd0, m_axi_ddr_awlen} + 12'd1) << 2)) > 13'd4096) begin
+                        $display("[-] AXI4 ERROR: Write burst crossed 4KB boundary! addr=0x%08X len=%0d",
+                                 m_axi_ddr_awaddr, m_axi_ddr_awlen);
+                        errors = errors + 1;
+                    end
+                    m_axi_ddr_awready <= 1'b0;
+                    m_axi_ddr_wready  <= 1'b1;
+                    axi_s_aw_addr     <= m_axi_ddr_awaddr;
+                    axi_s_aw_rem      <= m_axi_ddr_awlen;
+                    axi_s_wr_busy     <= 1'b1;
+                end
+            end else if (axi_s_wr_busy) begin
+                if (m_axi_ddr_wvalid && m_axi_ddr_wready) begin
+                    ddr_mem[axi_s_aw_addr[18:2]] <= m_axi_ddr_wdata;
+                    axi_s_aw_addr <= axi_s_aw_addr + 32'd4;
+                    if (m_axi_ddr_wlast) begin
+                        m_axi_ddr_wready <= 1'b0;
+                        m_axi_ddr_bvalid <= 1'b1;
+                        axi_s_wr_busy    <= 1'b0;
+                        axi_s_wr_bwait   <= 1'b1;
+                    end
+                end
+            end else if (axi_s_wr_bwait) begin
+                if (m_axi_ddr_bvalid && m_axi_ddr_bready) begin
+                    m_axi_ddr_bvalid  <= 1'b0;
+                    m_axi_ddr_awready <= 1'b1;
+                    axi_s_wr_bwait    <= 1'b0;
+                end
+            end
+        end
+    end
 
     // 100 MHz clock (10 ns period)
     initial clk = 1'b0;
     always #5 clk = ~clk;
 
     // AXI4-Lite Write Task
-    task axi_write(input [9:0] byte_addr, input [31:0] data);
+    task axi_write(input [11:0] byte_addr, input [31:0] data);
         begin
             @(posedge clk);
             s_axi_awaddr  <= byte_addr;
@@ -222,7 +396,7 @@ module tb_rtps_fastpath;
     endtask
 
     // AXI4-Lite Read Task
-    task axi_read(input [9:0] byte_addr, output [31:0] data);
+    task axi_read(input [11:0] byte_addr, output [31:0] data);
         begin
             @(posedge clk);
             s_axi_araddr  <= byte_addr;
@@ -1834,6 +2008,196 @@ module tb_rtps_fastpath;
             end
             if (errors == 0)
                 $display("[+] PASS: Unaligned non-4B-multiple (fragmentSize=1397) OOO DATA_FRAG + RTPS header synthesis verified!");
+        end
+
+        // =====================================================================
+        // TEST 23: Adaptive 64 KB Large Payload (TX Ring 0 -> Wire-Swap -> RX Ring 0)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 23: Adaptive 64 KB Large Payload (DDR Ring + Wire-Swap Loopback)");
+        $display("==================================================================");
+        begin : test23_blk
+            reg [31:0] l_irq, r_prod, r_bytes, r_seq, bmap_w;
+            integer    w_idx, l_err;
+
+            // Populate 64 KB (16,384 words) in TX Ring 0 Slot 0 (0x0000_0000)
+            for (w_idx = 0; w_idx < 16384; w_idx = w_idx + 1) begin
+                ddr_mem[w_idx] = 32'hCAFE_0000 ^ (w_idx * 32'h0001_0003);
+                ddr_mem[17'h10000 + w_idx] = 32'hDEAD_BEEF; // Poison RX Ring 0 Slot 0 (0x0004_0000)
+            end
+
+            // Configure Reader CAM 0 to match our own Local GUID + Writer 0 ID + Local IP + Port 7410
+            axi_write(12'h100, 32'h1CF2_0005); // dst_port=7410 (0x1CF2), active, valid=1
+            axi_write(12'h104, 32'h0110_CD01); // local_guid[95:64]
+            axi_write(12'h108, 32'h2345_6789); // local_guid[63:32]
+            axi_write(12'h10C, 32'hABCD_EF01); // local_guid[31:0]
+            axi_write(12'h110, 32'h0000_0102); // wr0_entity_id
+            axi_write(12'h114, 32'h0000_0000); // reader_id
+            axi_write(12'h118, 32'hC0A8_01C9); // local_src_ip (192.168.1.201)
+
+            // Configure Writer 0 dst_ip = local_src_ip for loopback
+            axi_write(12'h080, 32'h0001_0405);
+            axi_write(12'h084, 32'hC0A8_01C9);
+            axi_write(12'h088, {16'd7411, 16'd7410});
+            axi_write(12'h08C, 32'h5E10_0001);
+            axi_write(12'h090, 32'h0000_0200);
+            axi_write(12'h094, 32'h0000_0102);
+            axi_write(12'h098, 32'h0000_0000);
+            axi_write(12'h09C, 32'h0000_0001);
+
+            // Commit EDT & enable wire_swap_loopback (CTRL[11]=1, emu_en=0, enable=1)
+            axi_write(12'h180, 32'd100);
+            axi_write(12'h07C, 32'h0000_0007); // clear seq + valid
+            axi_write(12'h014, 32'd1024);
+            axi_write(12'h1C0, 32'd1400);
+            axi_write(12'h008, 32'h0000_0823); // enable=1, writers=1, commit=1, wire_swap_loopback=1
+            repeat (10) @(posedge clk);
+
+            // Configure TX Ring 0 (base=0x0000_0000, slot_size=0x0002_0000, depth=2, enable=1)
+            axi_write(12'h300, 32'h0000_0000);
+            axi_write(12'h304, 32'h0002_0000);
+            axi_write(12'h308, 32'h0000_0302); // reset=1, enable=1, depth=2
+
+            // Configure RX Ring 0 (base=0x0004_0000, slot_size=0x0002_0000, depth=2, enable=1)
+            axi_write(12'h400, 32'h0004_0000);
+            axi_write(12'h404, 32'h0002_0000);
+            axi_write(12'h408, 32'h0000_0302); // reset=1, enable=1, depth=2
+
+            // Submit 64 KB (65,536 bytes) on TX Ring 0 Slot 0
+            axi_write(12'h30C, 32'd65536);
+            axi_write(12'h310, 32'd1); // Doorbell prod_idx = 1
+
+            // Wait for BOTH large_tx_done_irq[0] (bit 0) and large_rx_done_irq[0] (bit 4)
+            sim_timeout = 0;
+            l_irq = 32'd0;
+            while (((l_irq & 32'h0000_0011) != 32'h0000_0011) && sim_timeout < 200000) begin
+                @(posedge clk);
+                if (ip_done_irq) begin
+                    axi_read(12'h1C8, l_irq);
+                end
+                sim_timeout = sim_timeout + 1;
+            end
+
+            axi_read(12'h40C, r_prod);
+            axi_read(12'h414, r_bytes);
+            axi_read(12'h418, r_seq);
+            axi_write(12'h1D0, 32'h0000_0000); // BMAP_RD_CTRL: cam=0, word=0
+            axi_read(12'h1D4, bmap_w);
+
+            $display("[+] 64KB Large Loopback: LARGE_IRQ=0x%08X, RX_PROD=%0d, RX_BYTES=%0d, RX_SEQ=%0d, BMAP[0]=0x%08X, cycles=%0d (rx_st=%0d got=%0d exp=%0d csum_err=%0d stale=%0d)",
+                     l_irq, r_prod, r_bytes, r_seq, bmap_w, sim_timeout,
+                     dut.u_rx_reasm.rx_state, dut.u_rx_reasm.lrx_got_frags[0], dut.u_rx_reasm.lrx_exp_frags[0],
+                     dut.u_rx_reasm.stat_csum_errs, dut.u_rx_reasm.stat_stale_drops);
+
+            l_err = 0;
+            if ((l_irq & 32'h0000_0011) !== 32'h0000_0011 || r_prod !== 32'd1 || r_bytes !== 32'd65536 || bmap_w !== 32'hFFFF_FFFF) begin
+                $display("[-] FAIL TEST 23: Control/metadata mismatch!");
+                errors = errors + 1;
+                l_err = 1;
+            end
+            for (w_idx = 0; w_idx < 16384; w_idx = w_idx + 1) begin
+                if (ddr_mem[17'h10000 + w_idx] !== ddr_mem[w_idx]) begin
+                    if (l_err < 10) $display("[-] FAIL TEST 23 DDR Word %0d: exp=0x%08X got=0x%08X",
+                                             w_idx, ddr_mem[w_idx], ddr_mem[17'h10000 + w_idx]);
+                    l_err = l_err + 1;
+                    errors = errors + 1;
+                end
+            end
+
+            // ACK both large IRQs (W1C) and release RX Ring 0 Slot 0
+            axi_write(12'h1C8, 32'h0000_0011);
+            axi_write(12'h410, 32'd1); // RX_RING_CONS_IDX(0) = 1
+            repeat (5) @(posedge clk);
+            if (ip_done_irq !== 1'b0) begin
+                $display("[-] FAIL TEST 23: ip_done_irq did not drop after W1C ACK!");
+                errors = errors + 1;
+            end
+            if (l_err == 0)
+                $display("[+] PASS: 64 KB zero-copy DDR Ring -> DATA_FRAG -> DDP verified with 0 errors and single IRQ!");
+        end
+
+        // =====================================================================
+        // TEST 24: Fragment-Boundary Preemption (32KB Large Pub 0 + 4KB Small Pub 1)
+        // =====================================================================
+        $display("\n==================================================================");
+        $display("  TEST 24: Fragment-Boundary Preemption (32KB Pub 0 + 4KB Small Pub 1)");
+        $display("==================================================================");
+        begin : test24_blk
+            reg [31:0] st_val, l_irq, r_bytes;
+            integer    w_idx, saw_small_preempt;
+
+            // Configure Writer 1 (0x0A0..0x0BC) with dst_port=7412 (0x1CF4)
+            axi_write(12'h0A0, 32'h0001_0405);
+            axi_write(12'h0A4, 32'hC0A8_01C9);
+            axi_write(12'h0A8, {16'd7413, 16'd7412});
+            axi_write(12'h0AC, 32'h5E10_0001);
+            axi_write(12'h0B0, 32'h0000_0200);
+            axi_write(12'h0B4, 32'h0000_0202); // writer 1 entityId
+            axi_write(12'h0B8, 32'h0000_0000);
+            axi_write(12'h0BC, 32'h0000_0001);
+            axi_write(12'h180, 32'd101);
+            axi_write(12'h008, 32'h0000_0825); // enable=1, writers=2, commit=1, wire_swap_loopback=1
+            repeat (10) @(posedge clk);
+
+            // Reset TX Ring 0 & RX Ring 0
+            axi_write(12'h308, 32'h0000_0302);
+            axi_write(12'h408, 32'h0000_0302);
+
+            // Submit 32 KB (32,768 bytes) on TX Ring 0 Slot 0
+            axi_write(12'h30C, 32'd32768);
+            axi_write(12'h310, 32'd1);
+
+            // Wait 600 cycles (~6 us, mid-flight of 32 KB transfer) then inject 4 KB Small TX on Writer 1
+            repeat (600) @(posedge clk);
+            axi_write(12'h1C4, 32'd1); // TX_ACTIVE_WRITER_ADDR = 1
+            axi_write(12'h00C, 32'd0); // expected_crc = 0 (bypass)
+            for (w_idx = 0; w_idx < 1024; w_idx = w_idx + 1) begin
+                @(posedge clk);
+                s_axis_tdata  <= 32'hBEEF_0000 + w_idx;
+                s_axis_tkeep  <= 4'hF;
+                s_axis_tvalid <= 1'b1;
+                s_axis_tlast  <= (w_idx == 1023);
+                #1; while (!s_axis_tready) begin @(posedge clk); #1; end
+            end
+            @(posedge clk);
+            s_axis_tvalid <= 1'b0;
+            s_axis_tlast  <= 1'b0;
+
+            // Wait for Small TX IRQ (STATUS[0]) and check that Large TX 0 is STILL active (preempted!)
+            saw_small_preempt = 0;
+            sim_timeout = 0;
+            while (sim_timeout < 20000 && !saw_small_preempt) begin
+                @(posedge clk);
+                if (ip_done_irq) begin
+                    axi_read(12'h004, st_val);
+                    axi_read(12'h1C8, l_irq);
+                    if (st_val[0] && ((l_irq & 32'h0000_0001) == 32'd0)) begin
+                        saw_small_preempt = 1;
+                        axi_write(12'h004, 32'h0000_0001); // ACK small TX IRQ
+                    end
+                end
+                sim_timeout = sim_timeout + 1;
+            end
+
+            // Now wait for Large TX 0 + Large RX 0 to complete
+            sim_timeout = 0;
+            l_irq = 32'd0;
+            while (((l_irq & 32'h0000_0011) != 32'h0000_0011) && sim_timeout < 100000) begin
+                @(posedge clk);
+                if (ip_done_irq) axi_read(12'h1C8, l_irq);
+                sim_timeout = sim_timeout + 1;
+            end
+            axi_read(12'h414, r_bytes);
+            axi_write(12'h1C8, 32'h0000_0011);
+            axi_write(12'h410, 32'd1);
+
+            if (!saw_small_preempt || (l_irq & 32'h0000_0011) !== 32'h0000_0011 || r_bytes !== 32'd32768) begin
+                $display("[-] FAIL TEST 24: saw_small_preempt=%0d l_irq=0x%08X r_bytes=%0d",
+                         saw_small_preempt, l_irq, r_bytes);
+                errors = errors + 1;
+            end else begin
+                $display("[+] PASS: 4 KB Small Pub 1 preempted 32 KB Large Pub 0 at fragment boundary and both completed cleanly!");
+            end
         end
 
         $display("\n==================================================================");
