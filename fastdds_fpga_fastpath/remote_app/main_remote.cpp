@@ -43,6 +43,7 @@
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
 #include <fastdds/rtps/common/LocatorWithMask.hpp>
+#include <fastdds/rtps/transport/TransportInterface.hpp>
 #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
 
 #include "FastSample.hpp"
@@ -57,6 +58,145 @@ static std::atomic<bool> g_running{true};
 static void sigint_handler(int) {
     g_running = false;
 }
+
+// Transport wrapper that redirects user-data packets destined for the PYNQ-Z2 PS IP
+// (e.g. 192.168.2.20:7411) to the FPGA PL RMII IP:port (e.g. 192.168.2.201:7511),
+// while leaving SPDP/SEDP metatraffic (even ports like 7400/7410) on PS eth0.
+class FpgaRedirectTransport : public eprosima::fastdds::rtps::TransportInterface {
+public:
+    using Locator = eprosima::fastdds::rtps::Locator;
+    using LocatorList = eprosima::fastdds::rtps::LocatorList;
+    using LocatorSelector = eprosima::fastdds::rtps::LocatorSelector;
+    using LocatorSelectorEntry = eprosima::fastdds::rtps::LocatorSelectorEntry;
+    using PortParameters = eprosima::fastdds::rtps::PortParameters;
+    using PropertyPolicy = eprosima::fastdds::rtps::PropertyPolicy;
+    using SendResourceList = eprosima::fastdds::rtps::SendResourceList;
+    using TransportDescriptorInterface = eprosima::fastdds::rtps::TransportDescriptorInterface;
+    using TransportReceiverInterface = eprosima::fastdds::rtps::TransportReceiverInterface;
+    using NetmaskFilterInfo = eprosima::fastdds::rtps::NetmaskFilterInfo;
+
+    FpgaRedirectTransport(
+            std::unique_ptr<TransportInterface> inner,
+            uint32_t ps_ip,
+            uint32_t pl_ip,
+            uint16_t pl_port)
+        : TransportInterface(LOCATOR_KIND_UDPv4),
+          inner_(std::move(inner)),
+          ps_ip_(ps_ip),
+          pl_ip_(pl_ip),
+          pl_port_(pl_port) {}
+
+    bool init(const PropertyPolicy* properties = nullptr, const uint32_t& max_msg_size_no_frag = 0) override {
+        return inner_->init(properties, max_msg_size_no_frag);
+    }
+    bool IsInputChannelOpen(const Locator& loc) const override { return inner_->IsInputChannelOpen(loc); }
+    bool IsLocatorSupported(const Locator& loc) const override { return inner_->IsLocatorSupported(loc); }
+    bool is_locator_allowed(const Locator& loc) const override { return inner_->is_locator_allowed(loc); }
+    bool is_locator_reachable(const eprosima::fastdds::rtps::Locator_t& loc) override {
+        return inner_->is_locator_reachable(loc);
+    }
+    Locator RemoteToMainLocal(const Locator& remote) const override { return inner_->RemoteToMainLocal(remote); }
+
+    bool transform_remote_locator(const Locator& remote_locator, Locator& result_locator) const override {
+        if (maybe_redirect(remote_locator, result_locator)) return true;
+        return inner_->transform_remote_locator(remote_locator, result_locator);
+    }
+    bool transform_remote_locator(
+            const Locator& remote_locator,
+            Locator& result_locator,
+            bool allowed_remote_localhost,
+            bool allowed_local_localhost) const override {
+        if (maybe_redirect(remote_locator, result_locator)) return true;
+        return inner_->transform_remote_locator(
+            remote_locator, result_locator, allowed_remote_localhost, allowed_local_localhost);
+    }
+
+    bool OpenOutputChannel(SendResourceList& srl, const Locator& loc) override {
+        return inner_->OpenOutputChannel(srl, loc);
+    }
+    bool OpenOutputChannels(SendResourceList& srl, const LocatorSelectorEntry& entry) override {
+        return inner_->OpenOutputChannels(srl, entry);
+    }
+    void CloseOutputChannels(SendResourceList& srl, const LocatorSelectorEntry& entry) override {
+        inner_->CloseOutputChannels(srl, entry);
+    }
+    bool OpenInputChannel(const Locator& loc, TransportReceiverInterface* rcv, uint32_t max_msg) override {
+        return inner_->OpenInputChannel(loc, rcv, max_msg);
+    }
+    bool CloseInputChannel(const Locator& loc) override { return inner_->CloseInputChannel(loc); }
+    bool DoInputLocatorsMatch(const Locator& a, const Locator& b) const override {
+        return inner_->DoInputLocatorsMatch(a, b);
+    }
+    LocatorList NormalizeLocator(const Locator& loc) override { return inner_->NormalizeLocator(loc); }
+    void select_locators(LocatorSelector& selector) const override { inner_->select_locators(selector); }
+    bool is_local_locator(const Locator& loc) const override { return inner_->is_local_locator(loc); }
+    TransportDescriptorInterface* get_configuration() override { return inner_->get_configuration(); }
+    void AddDefaultOutputLocator(LocatorList& list) override { inner_->AddDefaultOutputLocator(list); }
+    bool getDefaultMetatrafficMulticastLocators(LocatorList& locs, uint32_t port) const override {
+        return inner_->getDefaultMetatrafficMulticastLocators(locs, port);
+    }
+    bool getDefaultMetatrafficUnicastLocators(LocatorList& locs, uint32_t port) const override {
+        return inner_->getDefaultMetatrafficUnicastLocators(locs, port);
+    }
+    bool getDefaultUnicastLocators(LocatorList& locs, uint32_t port) const override {
+        return inner_->getDefaultUnicastLocators(locs, port);
+    }
+    bool fillMetatrafficMulticastLocator(Locator& loc, uint32_t port) const override {
+        return inner_->fillMetatrafficMulticastLocator(loc, port);
+    }
+    bool fillMetatrafficUnicastLocator(Locator& loc, uint32_t port) const override {
+        return inner_->fillMetatrafficUnicastLocator(loc, port);
+    }
+    bool configureInitialPeerLocator(
+            Locator& loc, const PortParameters& pp, uint32_t dom, LocatorList& list) const override {
+        return inner_->configureInitialPeerLocator(loc, pp, dom, list);
+    }
+    bool fillUnicastLocator(Locator& loc, uint32_t port) const override {
+        return inner_->fillUnicastLocator(loc, port);
+    }
+    uint32_t max_recv_buffer_size() const override { return inner_->max_recv_buffer_size(); }
+    void shutdown() override { inner_->shutdown(); }
+    void update_network_interfaces() override { inner_->update_network_interfaces(); }
+    bool is_localhost_allowed() const override { return inner_->is_localhost_allowed(); }
+    NetmaskFilterInfo netmask_filter_info() const override { return inner_->netmask_filter_info(); }
+
+private:
+    bool maybe_redirect(const Locator& remote_locator, Locator& result_locator) const {
+        if (remote_locator.kind != LOCATOR_KIND_UDPv4 || pl_ip_ == 0) return false;
+        uint32_t rip = (static_cast<uint32_t>(remote_locator.address[12]) << 24) |
+                       (static_cast<uint32_t>(remote_locator.address[13]) << 16) |
+                       (static_cast<uint32_t>(remote_locator.address[14]) << 8)  |
+                       static_cast<uint32_t>(remote_locator.address[15]);
+        // RTPS user unicast ports are odd (e.g. 7411); metatraffic ports are even (7400, 7410).
+        if ((ps_ip_ == 0 || rip == ps_ip_) && (remote_locator.port & 1) == 1) {
+            result_locator = remote_locator;
+            result_locator.address[12] = static_cast<uint8_t>((pl_ip_ >> 24) & 0xFF);
+            result_locator.address[13] = static_cast<uint8_t>((pl_ip_ >> 16) & 0xFF);
+            result_locator.address[14] = static_cast<uint8_t>((pl_ip_ >> 8) & 0xFF);
+            result_locator.address[15] = static_cast<uint8_t>(pl_ip_ & 0xFF);
+            result_locator.port = pl_port_;
+            return true;
+        }
+        return false;
+    }
+
+    std::unique_ptr<TransportInterface> inner_;
+    uint32_t ps_ip_;
+    uint32_t pl_ip_;
+    uint16_t pl_port_;
+};
+
+struct FpgaRedirectTransportDescriptor : public eprosima::fastdds::rtps::UDPv4TransportDescriptor {
+    uint32_t ps_ip{0};
+    uint32_t pl_ip{0};
+    uint16_t pl_port{7511};
+
+    eprosima::fastdds::rtps::TransportInterface* create_transport() const override {
+        std::unique_ptr<eprosima::fastdds::rtps::TransportInterface> inner(
+            UDPv4TransportDescriptor::create_transport());
+        return new FpgaRedirectTransport(std::move(inner), ps_ip, pl_ip, pl_port);
+    }
+};
 
 class RemoteNode {
 public:
@@ -78,16 +218,29 @@ public:
         DomainParticipantQos pqos = PARTICIPANT_QOS_DEFAULT;
         pqos.name("Remote_Workstation_FastDDS_Node");
 
-        if (!interface_ip_.empty()) {
+        if (!interface_ip_.empty() || !pl_ip_.empty()) {
             pqos.transport().use_builtin_transports = false;
-            auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
-            udp_transport->interfaceWhiteList.push_back(interface_ip_);
+            auto udp_transport = std::make_shared<FpgaRedirectTransportDescriptor>();
+            if (!interface_ip_.empty()) {
+                udp_transport->interfaceWhiteList.push_back(interface_ip_);
+                std::cout << "[RemoteNode] Bound Fast DDS to interface: " << interface_ip_ << "\n";
+            }
             // 4 KB samples at 1 kHz (or 5 MB DATA_FRAG bursts) need larger socket buffers; capped by net.core.rmem_max.
             udp_transport->receiveBufferSize = large_5mb_ ? (16 * 1024 * 1024) : (4 * 1024 * 1024);
             // Match the FPGA's 1468 B limit so echoes use DATA_FRAG instead of IP fragmentation.
             udp_transport->maxMessageSize = 1468;
+            if (!pl_ip_.empty()) {
+                struct in_addr addr;
+                if (inet_pton(AF_INET, pl_ip_.c_str(), &addr) == 1) {
+                    udp_transport->pl_ip = ntohl(addr.s_addr);
+                }
+                if (!peer_ip_.empty() && inet_pton(AF_INET, peer_ip_.c_str(), &addr) == 1) {
+                    udp_transport->ps_ip = ntohl(addr.s_addr);
+                }
+                udp_transport->pl_port = 7511;
+                std::cout << "[RemoteNode] Redirecting user-data TX to FPGA PL: " << pl_ip_ << ":7511\n";
+            }
             pqos.transport().user_transports.push_back(udp_transport);
-            std::cout << "[RemoteNode] Bound Fast DDS to interface: " << interface_ip_ << "\n";
         }
 
         if (!peer_ip_.empty()) {
@@ -142,23 +295,6 @@ public:
 
             DataWriterQos wqos = DATAWRITER_QOS_DEFAULT;
             wqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
-            if (!pl_ip_.empty()) {
-                struct in_addr pl_addr;
-                if (inet_pton(AF_INET, pl_ip_.c_str(), &pl_addr) == 1) {
-                    uint32_t plip = ntohl(pl_addr.s_addr);
-                    eprosima::fastdds::rtps::LocatorWithMask pl_loc;
-                    pl_loc.kind = 1; // LOCATOR_KIND_UDPv4
-                    pl_loc.port = 0;
-                    pl_loc.address[12] = static_cast<uint8_t>((plip >> 24) & 0xFF);
-                    pl_loc.address[13] = static_cast<uint8_t>((plip >> 16) & 0xFF);
-                    pl_loc.address[14] = static_cast<uint8_t>((plip >> 8) & 0xFF);
-                    pl_loc.address[15] = static_cast<uint8_t>(plip & 0xFF);
-                    pl_loc.mask(32);
-                    wqos.endpoint().external_unicast_locators[1][0].push_back(pl_loc);
-                    wqos.endpoint().ignore_non_matching_locators = true;
-                    std::cout << "[RemoteNode] Filtering DataWriter destination to FPGA PL IP: " << pl_ip_ << "\n";
-                }
-            }
             writer_ = publisher_->create_datawriter(topic_, wqos, &writer_listener_);
             if (!writer_) return false;
             if (echo_mode_) echo_thread_ = std::thread(&RemoteNode::echo_loop, this);
