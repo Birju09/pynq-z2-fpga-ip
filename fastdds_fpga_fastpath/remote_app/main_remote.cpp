@@ -297,7 +297,9 @@ public:
                 std::cout << "[RemoteNode] Bound Fast DDS to interface: " << interface_ip_ << "\n";
             }
             // 4 KB samples at 1 kHz (or 5 MB DATA_FRAG bursts) need larger socket buffers; capped by net.core.rmem_max.
-            udp_transport->receiveBufferSize = large_5mb_ ? (16 * 1024 * 1024) : (4 * 1024 * 1024);
+            uint32_t sock_sz = large_5mb_ ? (16 * 1024 * 1024) : (4 * 1024 * 1024);
+            udp_transport->receiveBufferSize = sock_sz;
+            udp_transport->sendBufferSize = sock_sz;
             // Match the FPGA's 1468 B limit so echoes use DATA_FRAG instead of IP fragmentation.
             udp_transport->maxMessageSize = 1468;
             if (!pl_ip_.empty()) {
@@ -355,6 +357,15 @@ public:
 
         DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
         rqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
+        if (large_5mb_) {
+            rqos.history().kind = KEEP_LAST_HISTORY_QOS;
+            rqos.history().depth = 16;
+            rqos.resource_limits().max_samples = 32;
+            rqos.resource_limits().allocated_samples = 4;
+            rqos.resource_limits().max_instances = 1;
+            rqos.resource_limits().max_samples_per_instance = 32;
+            rqos.endpoint().history_memory_policy = eprosima::fastdds::rtps::DYNAMIC_RESERVE_MEMORY_MODE;
+        }
         reader_ = subscriber_->create_datareader(topic_, rqos, &reader_listener_);
         if (!reader_) return false;
 
