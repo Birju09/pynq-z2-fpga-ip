@@ -18,7 +18,7 @@ public:
     uint32_t m_cycle_id{0};
     uint32_t m_flags{0};
     uint64_t m_tx_timestamp_ns{0};
-    std::array<uint32_t, 1310716> m_payload{};
+    std::array<uint32_t, 65532> m_payload{};
 
     LargeSample5MB() = default;
     ~LargeSample5MB() = default;
@@ -39,10 +39,10 @@ public:
     inline uint64_t tx_timestamp_ns() const { return m_tx_timestamp_ns; }
     inline uint64_t& tx_timestamp_ns() { return m_tx_timestamp_ns; }
 
-    inline void payload(const std::array<uint32_t, 1310716>& _payload) { m_payload = _payload; }
-    inline void payload(std::array<uint32_t, 1310716>&& _payload) { m_payload = std::move(_payload); }
-    inline const std::array<uint32_t, 1310716>& payload() const { return m_payload; }
-    inline std::array<uint32_t, 1310716>& payload() { return m_payload; }
+    inline void payload(const std::array<uint32_t, 65532>& _payload) { m_payload = _payload; }
+    inline void payload(std::array<uint32_t, 65532>&& _payload) { m_payload = std::move(_payload); }
+    inline const std::array<uint32_t, 65532>& payload() const { return m_payload; }
+    inline std::array<uint32_t, 65532>& payload() { return m_payload; }
 
     inline uint8_t* raw_data() { return reinterpret_cast<uint8_t*>(this); }
     inline const uint8_t* raw_data() const { return reinterpret_cast<const uint8_t*>(this); }
@@ -50,6 +50,6 @@ public:
 };
 #pragma pack(pop)
 
-static_assert(sizeof(LargeSample5MB) == 5242880, "LargeSample5MB must be exactly 5,242,880 bytes (5 MiB)");
+static_assert(sizeof(LargeSample5MB) == 262144, "LargeSample5MB must be exactly 262,144 bytes (256 KiB)");
 
 #endif // _LARGESAMPLE5MB_HPP_

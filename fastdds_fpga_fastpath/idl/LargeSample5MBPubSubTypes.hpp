@@ -44,9 +44,9 @@ public:
         eprosima::fastdds::rtps::InstanceHandle_t& ihandle,
         bool force_md5 = false) override;
 
-    static constexpr size_t PAYLOAD_SIZE = 5242880;
+    static constexpr size_t PAYLOAD_SIZE = 262144;
     static constexpr size_t CDR_HEADER_SIZE = 4;
-    static constexpr size_t TOTAL_SERIALIZED_SIZE = CDR_HEADER_SIZE + PAYLOAD_SIZE; // 5,242,884 B
+    static constexpr size_t TOTAL_SERIALIZED_SIZE = CDR_HEADER_SIZE + PAYLOAD_SIZE; // 262,148 B
 };
 
 #endif // _LARGESAMPLE5MB_PUBSUBTYPES_HPP_

@@ -9,5 +9,5 @@ struct LargeSample5MB {
     unsigned long cycle_id;
     unsigned long flags;
     unsigned long long tx_timestamp_ns;
-    unsigned long payload[1310716];
+    unsigned long payload[65532];
 };
