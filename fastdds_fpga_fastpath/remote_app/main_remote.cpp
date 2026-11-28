@@ -619,6 +619,14 @@ private:
                 std::cout << "[RemoteNode] Matched FPGA Publisher! Ready to receive.\n";
             }
         }
+        void on_sample_lost(DataReader*, const SampleLostStatus& status) override {
+            std::cout << "[RemoteNode] SampleLost! total=" << status.total_count
+                      << " delta=" << status.total_count_change << "\n";
+        }
+        void on_sample_rejected(DataReader*, const SampleRejectedStatus& status) override {
+            std::cout << "[RemoteNode] SampleRejected! total=" << status.total_count
+                      << " reason=" << status.last_reason << "\n";
+        }
     private:
         RemoteNode* parent_;
     };
