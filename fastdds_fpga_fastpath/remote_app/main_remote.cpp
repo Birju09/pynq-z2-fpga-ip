@@ -43,6 +43,7 @@
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
 #include <fastdds/rtps/common/LocatorWithMask.hpp>
+#include <fastdds/rtps/transport/SenderResource.hpp>
 #include <fastdds/rtps/transport/TransportInterface.hpp>
 #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
 
@@ -98,7 +99,6 @@ public:
     Locator RemoteToMainLocal(const Locator& remote) const override { return inner_->RemoteToMainLocal(remote); }
 
     bool transform_remote_locator(const Locator& remote_locator, Locator& result_locator) const override {
-        if (maybe_redirect(remote_locator, result_locator)) return true;
         return inner_->transform_remote_locator(remote_locator, result_locator);
     }
     bool transform_remote_locator(
@@ -106,16 +106,21 @@ public:
             Locator& result_locator,
             bool allowed_remote_localhost,
             bool allowed_local_localhost) const override {
-        if (maybe_redirect(remote_locator, result_locator)) return true;
         return inner_->transform_remote_locator(
             remote_locator, result_locator, allowed_remote_localhost, allowed_local_localhost);
     }
 
     bool OpenOutputChannel(SendResourceList& srl, const Locator& loc) override {
-        return inner_->OpenOutputChannel(srl, loc);
+        size_t before = srl.size();
+        if (!inner_->OpenOutputChannel(srl, loc)) return false;
+        wrap_new_sender_resources(srl, before);
+        return true;
     }
     bool OpenOutputChannels(SendResourceList& srl, const LocatorSelectorEntry& entry) override {
-        return inner_->OpenOutputChannels(srl, entry);
+        size_t before = srl.size();
+        if (!inner_->OpenOutputChannels(srl, entry)) return false;
+        wrap_new_sender_resources(srl, before);
+        return true;
     }
     void CloseOutputChannels(SendResourceList& srl, const LocatorSelectorEntry& entry) override {
         inner_->CloseOutputChannels(srl, entry);
@@ -161,6 +166,92 @@ public:
     NetmaskFilterInfo netmask_filter_info() const override { return inner_->netmask_filter_info(); }
 
 private:
+    struct VecLocatorsIterator : public eprosima::fastdds::rtps::LocatorsIterator {
+        using Iter = std::vector<Locator>::const_iterator;
+        explicit VecLocatorsIterator(Iter it) : it_(it) {}
+        LocatorsIterator& operator++() override { ++it_; return *this; }
+        bool operator==(const LocatorsIterator& other) const override {
+            return it_ == static_cast<const VecLocatorsIterator&>(other).it_;
+        }
+        bool operator!=(const LocatorsIterator& other) const override {
+            return it_ != static_cast<const VecLocatorsIterator&>(other).it_;
+        }
+        const Locator& operator*() const override { return *it_; }
+        Iter it_;
+    };
+
+    class RedirectSenderResource : public eprosima::fastdds::rtps::SenderResource {
+    public:
+        RedirectSenderResource(
+                std::unique_ptr<SenderResource> inner_sr,
+                uint32_t ps_ip,
+                uint32_t pl_ip,
+                uint16_t pl_port)
+            : SenderResource(inner_sr->kind()),
+              inner_sr_(std::move(inner_sr)),
+              ps_ip_(ps_ip),
+              pl_ip_(pl_ip),
+              pl_port_(pl_port) {
+            send_buffers_lambda_ = [this](
+                    const std::vector<NetworkBuffer>& buffers,
+                    uint32_t total_bytes,
+                    eprosima::fastdds::rtps::LocatorsIterator* begin,
+                    eprosima::fastdds::rtps::LocatorsIterator* end,
+                    const std::chrono::steady_clock::time_point& max_blocking_time_point) -> bool {
+                std::vector<Locator> locs;
+                for (auto* it = begin; *it != *end; ++(*it)) {
+                    Locator loc = *(*it);
+                    if (loc.kind == LOCATOR_KIND_UDPv4 && pl_ip_ != 0 && (loc.port & 1) == 1) {
+                        uint32_t rip = (static_cast<uint32_t>(loc.address[12]) << 24) |
+                                       (static_cast<uint32_t>(loc.address[13]) << 16) |
+                                       (static_cast<uint32_t>(loc.address[14]) << 8)  |
+                                       static_cast<uint32_t>(loc.address[15]);
+                        if (ps_ip_ == 0 || rip == ps_ip_) {
+                            if (!logged_.exchange(true)) {
+                                std::cout << "[RemoteNode] Redirecting UDP TX "
+                                          << static_cast<int>(loc.address[12]) << "."
+                                          << static_cast<int>(loc.address[13]) << "."
+                                          << static_cast<int>(loc.address[14]) << "."
+                                          << static_cast<int>(loc.address[15]) << ":" << loc.port
+                                          << " -> "
+                                          << ((pl_ip_ >> 24) & 0xFF) << "."
+                                          << ((pl_ip_ >> 16) & 0xFF) << "."
+                                          << ((pl_ip_ >> 8) & 0xFF) << "."
+                                          << (pl_ip_ & 0xFF) << ":" << pl_port_ << "\n";
+                            }
+                            loc.address[12] = static_cast<uint8_t>((pl_ip_ >> 24) & 0xFF);
+                            loc.address[13] = static_cast<uint8_t>((pl_ip_ >> 16) & 0xFF);
+                            loc.address[14] = static_cast<uint8_t>((pl_ip_ >> 8) & 0xFF);
+                            loc.address[15] = static_cast<uint8_t>(pl_ip_ & 0xFF);
+                            loc.port = pl_port_;
+                        }
+                    }
+                    locs.push_back(loc);
+                }
+                VecLocatorsIterator vbegin(locs.begin()), vend(locs.end());
+                return inner_sr_->send(buffers, total_bytes, &vbegin, &vend, max_blocking_time_point);
+            };
+        }
+
+        void add_locators_to_list(eprosima::fastdds::rtps::LocatorList_t& locators) const override {
+            inner_sr_->add_locators_to_list(locators);
+        }
+
+    private:
+        std::unique_ptr<SenderResource> inner_sr_;
+        uint32_t ps_ip_;
+        uint32_t pl_ip_;
+        uint16_t pl_port_;
+        std::atomic<bool> logged_{false};
+    };
+
+    void wrap_new_sender_resources(SendResourceList& srl, size_t before) {
+        for (size_t i = before; i < srl.size(); ++i) {
+            srl[i] = std::unique_ptr<eprosima::fastdds::rtps::SenderResource>(
+                new RedirectSenderResource(std::move(srl[i]), ps_ip_, pl_ip_, pl_port_));
+        }
+    }
+
     bool maybe_redirect(const Locator& remote_locator, Locator& result_locator) const {
         if (remote_locator.kind != LOCATOR_KIND_UDPv4 || pl_ip_ == 0) return false;
         uint32_t rip = (static_cast<uint32_t>(remote_locator.address[12]) << 24) |
