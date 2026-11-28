@@ -504,6 +504,18 @@ private:
 
         reader_ = subscriber_->create_datareader(topic_, rqos);
         if (!reader_) return false;
+        {
+            eprosima::fastdds::rtps::LocatorList_t locs;
+            reader_->get_listening_locators(locs);
+            std::cout << "[FpgaBridge] DataReader listening locators:";
+            for (const auto& loc : locs) {
+                std::cout << " " << static_cast<int>(loc.address[12]) << "."
+                          << static_cast<int>(loc.address[13]) << "."
+                          << static_cast<int>(loc.address[14]) << "."
+                          << static_cast<int>(loc.address[15]) << ":" << loc.port;
+            }
+            std::cout << "\n";
+        }
 
         // Replay endpoints discovered while the writer/reader were still being created.
         PendingMatches pending;
